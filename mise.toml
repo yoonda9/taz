@@ -1,2 +1,3 @@
 [tools]
 uv = "latest"
+prek = "0.3.13"

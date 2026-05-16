@@ -30,7 +30,7 @@ Protobufs will be used for the RPC message format.
 * Supports many languages including C and Python
 * Provides consistency and single source of truth for procedure definitions by requiring schemas
     * Allows backwards/forwards compatibility and version control thereof
-    
+
 ### Tasking
 
 #### Concurrency
