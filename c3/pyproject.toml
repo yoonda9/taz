@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "David Yoon", email = "" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = []
 
 [tool.hatch.version]
