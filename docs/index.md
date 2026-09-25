@@ -4,32 +4,36 @@ TAZER is intended to be a well defined API such that both the agent and client c
 
 The TAZER reference agent is written in C in order to be able to support *any* test host without requiring redesigning the API or communication protocol.
 
+For detailed requirements see [Requirements](requirements.md). For the wire protocol specification see [Protocol Design](protocol.md).
+
 ## Agent Characteristics and Requirements
 
 * Must be able to be ported to run on most platforms from the last decade.
 * Must be stable and reliable
-* Must not have runtime dependencies aside from the platform's C standard library and C runtime.
-* Handle asyncronous tasking
+* Must not have runtime dependencies aside from the platform's C standard library, C runtime, and [libuv](https://libuv.org/) (MIT-licensed cross-platform async I/O).
+* Handle asynchronous tasking
+* All dependencies must be permissively licensed (MIT, BSD, Apache-2.0)
 
 ## Client-Agent Communication
 
-The command and control client (c3) communicates with the agent via RPC over HTTP.
+The command and control client (c3) communicates with the agent via a custom binary framing protocol over TCP.
 
 ### Communication Protocol
 
-* HTTP >= 1.1 provides request/response semantics, status codes, chunking, paths, etc
-* HTTP does not require persistent connections *but can* be upgraded to provide full duplex bidirectional persistent connections via Websockets.
-* HTTP v1.x C libraries are widely available and HTTP/2 reliable implementations do exist
-* HTTP connections can be upgraded to Websockets where available for full duplex when required.
+* Custom binary framing with a fixed 6-byte header (type, flags, length) — see [Protocol Design](protocol.md)
+* Persistent TCP connections with request-response correlation via request IDs
+* Designed for implementation on both full-OS platforms (via libuv) and constrained environments (RTOS, bare-metal) as separate implementations sharing the same wire format
+* Capability handshake at connection time — the agent advertises its supported operations so the client adapts dynamically
 
 ### Message Format / Serialization
 
-Protobufs will be used for the RPC message format.
+Protocol Buffers are used for the RPC message format.
 
-* Widely used with popular C library available (nanopb)
+* Widely used with popular C library available (nanopb) for embedded/constrained targets
 * Supports many languages including C and Python
 * Provides consistency and single source of truth for procedure definitions by requiring schemas
     * Allows backwards/forwards compatibility and version control thereof
+* `.proto` schemas define `max_size` constraints per message type, enabling static buffer allocation on embedded targets
 
 ### Tasking
 
