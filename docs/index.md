@@ -20,10 +20,10 @@ The command and control client (c3) communicates with the agent via a custom bin
 
 ### Communication Protocol
 
-* Custom binary framing with a fixed 6-byte header (type, flags, length) — see [Protocol Design](protocol.md)
-* Persistent TCP connections with request-response correlation via request IDs
-* Designed for implementation on both full-OS platforms (via libuv) and constrained environments (RTOS, bare-metal) as separate implementations sharing the same wire format
-* Capability handshake at connection time — the agent advertises its supported operations so the client adapts dynamically
+* Custom binary framing with a fixed 12-byte header (type, flags, opcode, length, stream_id) — see [Protocol Design](protocol.md)
+* Persistent TCP connections with request-response correlation via a header-level `stream_id`
+* Designed for implementation on both full-OS platforms (via libuv, in the reference agent only — libuv is not mandated by the protocol) and constrained environments (RTOS, bare-metal) as separate implementations sharing the same wire format
+* Capability handshake at connection time — the agent advertises its supported opcodes so the client adapts dynamically
 
 ### Message Format / Serialization
 
@@ -40,9 +40,9 @@ Protocol Buffers are used for the RPC message format.
 #### Concurrency
 
 There should be *no* requirement for the client to handle concurrency. Requiring any form of concurrency may be detrimental for test writers to create simple and easily understandable tests.
-This is not to say that concurrency should not be a feature on the client side, but simply that *all* functionality needs to be able to be exercised without concurrency enabled.
+This is not to say that concurrency should not be a feature on the client side, but simply that *all* functionality — with the sole exception of the Interactive Shell — needs to be able to be exercised without concurrency enabled.
 
-The agent *may* recieve asyncronous tasking even though the client does *not* handle asynchronous operations.
+The agent *may* receive asynchronous tasking even though the client does *not* handle asynchronous operations.
 For example, the agent may need to start a process and monitor its status while also being tasked to upload a file.
 In terms of a synchronous test framework, the client should be able to mark each task as able to raise failures globally.
 If so, a failure caught in task a, can send an error response back on the channel reserved for the response for task b.
