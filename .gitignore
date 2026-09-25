@@ -4,6 +4,11 @@ out/**
 venv/**
 .venv/**
 
+# Override global gitignore for planning artifacts
+!.agents/
+.agents/*
+!.agents/planning/
+
 ################################################################################
 # C https://github.com/github/gitignore/blob/main/C.gitignore
 ################################################################################
