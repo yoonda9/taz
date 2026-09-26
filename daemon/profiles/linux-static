@@ -3,5 +3,9 @@
 # detection cannot: every dependency is built as a static library.
 #
 # The fully static (musl) release build arrives in Step 13.
+[settings]
+# Match the Windows profile so dependency package ids agree across platforms.
+compiler.cppstd=17
+
 [options]
 *:shared=False

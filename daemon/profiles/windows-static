@@ -6,6 +6,8 @@
 # CMakeLists.txt. All dependencies are built as static libraries.
 [settings]
 compiler.runtime=static
+# gtest >= 1.17 requires C++17; Conan's Windows detection defaults to 14.
+compiler.cppstd=17
 
 [options]
 *:shared=False
