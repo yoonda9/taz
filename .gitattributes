@@ -1,0 +1,22 @@
+# Check out text files with LF everywhere, including Windows, so formatters
+# (buf, prettier, clang-format) and the generated-code freshness check see the
+# same bytes on every platform. Matches .editorconfig (end_of_line = lf).
+* text=auto eol=lf
+
+# Windows-only scripts need CRLF to run.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+
+# Generated code: keep out of language statistics and collapse in diffs.
+daemon/generated/** linguist-generated=true
+c3/src/tazer/v1/*_pb2.py linguist-generated=true
+c3/src/tazer/v1/*_pb2.pyi linguist-generated=true
