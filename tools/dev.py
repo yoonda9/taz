@@ -144,8 +144,11 @@ def ensure_msvc_env(*, required: bool = True) -> bool:
         print(f"warning: {message}")
         return False
     arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
+    # Hand cmd.exe one command string: passing a list makes Python escape the
+    # inner quotes (\"...\") and cmd.exe then cannot find the batch file. With
+    # /s, cmd strips the outermost pair of quotes and runs what is inside.
     dump = subprocess.run(
-        ["cmd.exe", "/s", "/c", f'"{vcvars}" {arch} >nul && set'],
+        f'cmd.exe /s /c ""{vcvars}" {arch} >nul && set"',
         capture_output=True,
         text=True,
         check=False,
@@ -294,8 +297,13 @@ def cmd_cppcheck() -> None:
             "--inline-suppr",
             "--quiet",
             "--suppress=missingIncludeSystem",
+            # Report only on first-party code; headers pulled in from these
+            # trees are parsed for context but their findings are not ours.
+            "--suppress=*:*/daemon/generated/*",
+            "--suppress=*:*/daemon/third_party/*",
             f"-I{ROOT / 'daemon' / 'include'}",
             f"-I{C_OUT}",
+            f"-I{ROOT / 'daemon' / 'third_party' / 'nanopb'}",
             *DAEMON_C_DIRS,
         ]
     )
