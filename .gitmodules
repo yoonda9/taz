@@ -1,4 +1,4 @@
-[submodule "agent/CMake/cmake-conan"]
-	path = agent/CMake/cmake-conan
+[submodule "daemon/CMake/cmake-conan"]
+	path = daemon/CMake/cmake-conan
 	url = https://github.com/conan-io/cmake-conan.git
 	branch = develop2

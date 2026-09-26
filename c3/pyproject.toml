@@ -1,7 +1,7 @@
 [project]
 name = "tazer"
 version = "0.1.0"
-description = "Command & Control Client for the TAZER RAT"
+description = "Python client for the TAZER test-orchestration daemon"
 readme = "README.md"
 authors = [
     { name = "David Yoon", email = "" }

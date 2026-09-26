@@ -5,7 +5,7 @@
 exclude: |
   (?x)^(
     third_party/|
-    agent/CMake/cmake-conan/|
+    daemon/CMake/cmake-conan/|
     \.venv/
   )
 
