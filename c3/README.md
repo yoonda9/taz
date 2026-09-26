@@ -5,7 +5,7 @@ protocol over TCP (see `docs/protocol.md`) with payloads generated from the
 schemas in `rpc/`.
 
 ```python
-from tazer import TazerClient  # arrives in Step 3
+from tazer import TazerClient
 
 with TazerClient("10.0.0.1", 5555) as t:
     print(t.version())
