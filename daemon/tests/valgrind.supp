@@ -1,0 +1,6 @@
+# Valgrind memcheck suppressions for `just test-valgrind`.
+#
+# Keep this file empty unless a report is provably outside our code (for
+# example a known glibc or libstdc++ pattern). Each entry needs a comment
+# saying what it suppresses and why; `--gen-suppressions=all` in the recipe
+# prints ready-to-paste blocks in the CI log.

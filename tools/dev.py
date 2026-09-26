@@ -13,6 +13,9 @@ Subcommands:
     clang-tidy --build-dir DIR
     cppcheck
     cmake-format [--check]
+    proto-breaking       buf breaking against main (skips if main has no schemas)
+    valgrind --build-dir DIR   run the C unit tests under Valgrind memcheck
+    coverage --build-dir DIR   gcovr report for a coverage-instrumented build
     doctor               report tools mise cannot provide / missing pinned tools
     clean                remove daemon build directories
     verify-static BINARY check a built daemon has no unexpected dynamic deps
@@ -320,6 +323,105 @@ def cmd_cmake_format(check: bool) -> None:
     run([tool("cmake-format"), *args, *CMAKE_FILES])
 
 
+def test_binary(build_dir: Path) -> Path:
+    exe = build_dir / "tests" / ("tazer_tests.exe" if IS_WINDOWS else "tazer_tests")
+    if not exe.exists():
+        sys.exit(f"error: {exe} not found. Run `just build` first.")
+    return exe
+
+
+def cmd_valgrind(build_dir: Path) -> None:
+    valgrind = shutil.which("valgrind")
+    if valgrind is None:
+        message = "valgrind not found on PATH (system package; see `just doctor`)"
+        if IN_CI:
+            sys.exit(f"error: {message}")
+        print(f"warning: {message}; skipping")
+        return
+    if (
+        build_dir / "CMakeCache.txt"
+    ).exists() and "TAZER_SANITIZER:STRING=none" not in (
+        build_dir / "CMakeCache.txt"
+    ).read_text():
+        sys.exit("error: run valgrind on a plain build, not a sanitizer build")
+    run(
+        [
+            valgrind,
+            "--tool=memcheck",
+            "--error-exitcode=1",
+            "--leak-check=full",
+            "--show-leak-kinds=definite,indirect",
+            "--errors-for-leak-kinds=definite,indirect",
+            "--track-origins=yes",
+            "--gen-suppressions=all",
+            f"--suppressions={ROOT / 'daemon' / 'tests' / 'valgrind.supp'}",
+            test_binary(build_dir),
+        ]
+    )
+
+
+def cmd_coverage(build_dir: Path) -> None:
+    out = ROOT / "out" / "coverage" / "c"
+    out.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            tool("gcovr"),
+            "--root",
+            ROOT,
+            "--filter",
+            "daemon/src/",
+            "--filter",
+            "daemon/include/",
+            "--exclude-unreachable-branches",
+            "--print-summary",
+            "--html-details",
+            out / "index.html",
+            "--xml",
+            out / "coverage.xml",
+            build_dir,
+        ]
+    )
+    print(f"C coverage report: {out / 'index.html'}")
+
+
+# ---------------------------------------------------------------------------
+# proto breaking-change check
+# ---------------------------------------------------------------------------
+def git_ok(*args: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", *args], cwd=ROOT, capture_output=True, check=False
+        ).returncode
+        == 0
+    )
+
+
+def cmd_proto_breaking() -> None:
+    against = next(
+        (
+            ref
+            for ref in ("refs/heads/main", "refs/remotes/origin/main")
+            if git_ok("rev-parse", "--verify", "--quiet", ref)
+        ),
+        None,
+    )
+    if against is None:
+        print("warning: no main ref found; skipping buf breaking")
+        return
+    if not git_ok("cat-file", "-e", f"{against}:rpc/buf.yaml"):
+        print(f"note: {against} has no rpc/buf.yaml yet; skipping buf breaking")
+        return
+    run(
+        [
+            tool("buf"),
+            "breaking",
+            RPC_DIR,
+            "--against",
+            f"{ROOT / '.git'}#ref={against},subdir=rpc",
+        ]
+    )
+
+
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
@@ -339,13 +441,18 @@ def sanitizer_available(flag: str) -> bool:
 
 def cmd_doctor() -> None:
     mise_tools = ["uv", "prek", "just", "cmake", "ninja", "buf", "prettier", "conan"]
-    uv_tools = ["ruff", "mypy", "clang-format", "clang-tidy", "cmake-format"]
+    uv_tools = ["ruff", "mypy", "clang-format", "clang-tidy", "cmake-format", "gcovr"]
     if IS_WINDOWS:
         ensure_msvc_env(required=False)
         system_tools = {"cl": "MSVC (Visual Studio Build Tools, C++ workload)"}
+        optional_tools = {"cppcheck": "cppcheck (winget; required in CI)"}
     else:
         system_tools = {"cc": "C compiler (gcc or clang)"}
-    optional_tools = {"cppcheck": "cppcheck (winget/apt/dnf; required in CI)"}
+        optional_tools = {
+            "cppcheck": "cppcheck (apt/dnf; required in CI)",
+            "valgrind": "valgrind (apt/dnf; `just test-valgrind`, required in CI)",
+            "clang": "clang (apt/dnf; `just build linux-clang-debug`)",
+        }
 
     problems: list[str] = []
     warnings: list[str] = []
@@ -478,6 +585,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub.add_parser("cppcheck")
     p = sub.add_parser("cmake-format")
     p.add_argument("--check", action="store_true")
+    sub.add_parser("proto-breaking")
+    p = sub.add_parser("valgrind")
+    p.add_argument("--build-dir", type=Path, required=True)
+    p = sub.add_parser("coverage")
+    p.add_argument("--build-dir", type=Path, required=True)
     sub.add_parser("doctor")
     sub.add_parser("clean")
     p = sub.add_parser("verify-static")
@@ -502,6 +614,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             cmd_cppcheck()
         case "cmake-format":
             cmd_cmake_format(args.check)
+        case "proto-breaking":
+            cmd_proto_breaking()
+        case "valgrind":
+            cmd_valgrind(args.build_dir.resolve())
+        case "coverage":
+            cmd_coverage(args.build_dir.resolve())
         case "doctor":
             cmd_doctor()
         case "clean":

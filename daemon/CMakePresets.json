@@ -53,6 +53,36 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
+      "name": "linux-clang-debug",
+      "displayName": "Linux Debug (Clang)",
+      "description": "Second compiler: different diagnostics, and the toolchain libFuzzer and the musl (zig cc) release build use.",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "linux-analyze",
+      "displayName": "Linux Debug + GCC -fanalyzer",
+      "description": "Build-only check: GCC's static analyzer over first-party code, findings are errors.",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "TAZER_STATIC_ANALYSIS": "ON"
+      }
+    },
+    {
+      "name": "linux-coverage",
+      "displayName": "Linux Debug + gcov coverage",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "TAZER_COVERAGE": "ON"
+      }
+    },
+    {
       "name": "linux-asan",
       "displayName": "Linux Debug + AddressSanitizer + UBSan",
       "inherits": "linux-base",
@@ -83,6 +113,16 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
+      "name": "windows-analyze",
+      "displayName": "Windows Debug + MSVC /analyze",
+      "description": "Build-only check: MSVC Code Analysis over first-party code (Win32 API contracts via SAL), findings are errors.",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "TAZER_STATIC_ANALYSIS": "ON"
+      }
+    },
+    {
       "name": "windows-asan",
       "displayName": "Windows Debug + AddressSanitizer (MSVC)",
       "description": "The ASan runtime is a DLL in the MSVC bin directory, so run tests through `just test-c windows-asan` (dev.py loads the MSVC environment).",
@@ -96,6 +136,10 @@
   "buildPresets": [
     { "name": "linux-debug", "configurePreset": "linux-debug" },
     { "name": "linux-release", "configurePreset": "linux-release" },
+    { "name": "linux-clang-debug", "configurePreset": "linux-clang-debug" },
+    { "name": "linux-analyze", "configurePreset": "linux-analyze" },
+    { "name": "linux-coverage", "configurePreset": "linux-coverage" },
+    { "name": "windows-analyze", "configurePreset": "windows-analyze" },
     { "name": "linux-asan", "configurePreset": "linux-asan" },
     { "name": "linux-tsan", "configurePreset": "linux-tsan" },
     { "name": "windows-debug", "configurePreset": "windows-debug" },
@@ -111,6 +155,16 @@
     {
       "name": "linux-release",
       "configurePreset": "linux-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-clang-debug",
+      "configurePreset": "linux-clang-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-coverage",
+      "configurePreset": "linux-coverage",
       "output": { "outputOnFailure": true }
     },
     {

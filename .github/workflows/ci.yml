@@ -2,6 +2,9 @@ name: CI
 
 # Runs on every branch push (checks appear on PRs via the head commit) and on
 # demand. No separate pull_request trigger, which would double-run same-repo PRs.
+#
+# Every step is a `just` recipe, so a red job reproduces locally with the same
+# command. The matrix jobs each select one CMake preset (daemon/CMakePresets.json).
 on:
   push:
   workflow_dispatch:
@@ -36,7 +39,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.conan2/p
-          key: conan-${{ runner.os }}-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
+          key: conan-${{ runner.os }}-gcc-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
+          restore-keys: conan-${{ runner.os }}-
 
       - run: just setup
       - run: just doctor
@@ -49,13 +53,27 @@ jobs:
           name: tazer-linux-x64-debug
           path: daemon/build/linux-debug/tazer
 
-  sanitizers:
-    name: Linux ${{ matrix.preset }}
+  linux-checks:
+    name: Linux ${{ matrix.check }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        preset: [linux-asan, linux-tsan]
+        include:
+          - check: asan
+            run: just test-c linux-asan
+          - check: tsan
+            run: just test-c linux-tsan
+          - check: valgrind
+            packages: valgrind
+            run: just test-valgrind
+          - check: analyze
+            run: just build linux-analyze
+          - check: clang
+            packages: clang
+            run: just test-c linux-clang-debug
+          - check: coverage
+            run: just coverage
     steps:
       - uses: actions/checkout@v4
         with:
@@ -68,15 +86,25 @@ jobs:
           install: true
           cache: true
 
+      - name: Install system tools not managed by mise
+        if: matrix.packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
+
       - name: Cache Conan packages
         uses: actions/cache@v4
         with:
           path: ~/.conan2/p
-          key: conan-${{ runner.os }}-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
+          key: conan-${{ runner.os }}-${{ matrix.check }}-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
+          restore-keys: conan-${{ runner.os }}-
 
       - run: just setup
-      # Same preset a developer runs locally: `just test-c linux-asan`.
-      - run: just test-c ${{ matrix.preset }}
+      - run: ${{ matrix.run }}
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.check == 'coverage'
+        with:
+          name: coverage-report
+          path: out/coverage
 
   windows:
     name: Windows (build, test, lint)
@@ -102,7 +130,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.conan2/p
-          key: conan-${{ runner.os }}-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
+          key: conan-${{ runner.os }}-msvc-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
+          restore-keys: conan-${{ runner.os }}-
 
       # No msvc-dev-cmd step on purpose: `just configure` must find MSVC by
       # itself (tools/dev.py loads vcvarsall via vswhere), exactly as on a
@@ -118,9 +147,17 @@ jobs:
           name: tazer-windows-x64-debug
           path: daemon/build/windows-debug/tazer.exe
 
-  windows-asan:
-    name: Windows windows-asan
+  windows-checks:
+    name: Windows ${{ matrix.check }}
     runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: asan
+            run: just test-c windows-asan
+          - check: analyze
+            run: just build windows-analyze
     steps:
       - uses: actions/checkout@v4
         with:
@@ -137,8 +174,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.conan2/p
-          key: conan-${{ runner.os }}-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
+          key: conan-${{ runner.os }}-msvc-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
+          restore-keys: conan-${{ runner.os }}-
 
       - run: just setup
-      # Same preset a developer runs locally: `just test-c windows-asan`.
-      - run: just test-c windows-asan
+      - run: ${{ matrix.run }}

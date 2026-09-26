@@ -21,6 +21,12 @@ set(TAZER_SANITIZER
     "none"
     CACHE STRING "Sanitizer: none, address (ASan[+UBSan]) or thread (TSan)")
 set_property(CACHE TAZER_SANITIZER PROPERTY STRINGS none address thread)
+# Selected by the linux-analyze / windows-analyze presets: the compiler's own
+# static analyzer (GCC -fanalyzer, MSVC /analyze) on first-party code, with
+# findings promoted to errors by TAZER_WARNINGS_AS_ERRORS.
+option(TAZER_STATIC_ANALYSIS "Enable the compiler's static analyzer" OFF)
+# Selected by the linux-coverage preset (GCC/Clang gcov instrumentation).
+option(TAZER_COVERAGE "Instrument first-party code for coverage" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -70,6 +76,37 @@ else()
     if(TAZER_WARNINGS_AS_ERRORS)
         target_compile_options(tazer_warnings INTERFACE -Werror)
     endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Compiler static analysis and coverage (first-party targets only, via the
+# tazer_warnings interface target)
+# ---------------------------------------------------------------------------
+if(TAZER_STATIC_ANALYSIS)
+    if(MSVC)
+        # /analyze:external- keeps SDK and dependency headers out of the report
+        # (CMake passes SYSTEM includes as /external:I on MSVC >= 19.29).
+        target_compile_options(tazer_warnings INTERFACE /analyze
+                                                        /analyze:external-)
+        message(STATUS "TAZER: MSVC /analyze enabled")
+    elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(tazer_warnings INTERFACE -fanalyzer)
+        message(STATUS "TAZER: GCC -fanalyzer enabled")
+    else()
+        message(
+            WARNING
+                "TAZER_STATIC_ANALYSIS: no analyzer flags for ${CMAKE_C_COMPILER_ID}; "
+                "clang-tidy (just lint-c) covers the Clang analyzer")
+    endif()
+endif()
+
+if(TAZER_COVERAGE)
+    if(MSVC)
+        message(FATAL_ERROR "TAZER_COVERAGE requires GCC or Clang (gcov)")
+    endif()
+    target_compile_options(tazer_warnings INTERFACE --coverage -O0)
+    target_link_options(tazer_warnings INTERFACE --coverage)
+    message(STATUS "TAZER: coverage instrumentation enabled")
 endif()
 
 # ---------------------------------------------------------------------------

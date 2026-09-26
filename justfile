@@ -82,6 +82,24 @@ test-sanitizers: (test-c "linux-asan") (test-c "linux-tsan")
 [windows]
 test-sanitizers: (test-c "windows-asan")
 
+# Run the C unit tests under Valgrind memcheck (plain debug build, not ASan)
+test-valgrind preset=preset: (build preset)
+    {{ dev }} valgrind --build-dir daemon/build/{{ preset }}
+
+# Build with the compiler's static analyzer (GCC -fanalyzer); findings are errors
+[unix]
+analyze: (build "linux-analyze")
+
+# Build with MSVC /analyze; findings are errors
+[windows]
+analyze: (build "windows-analyze")
+
+# Coverage: gcov-instrumented C tests + pytest-cov, reports under out/coverage
+[unix]
+coverage: (test-c "linux-coverage")
+    {{ dev }} coverage --build-dir daemon/build/linux-coverage
+    uv run pytest --cov=tazer --cov-report=term --cov-report=html:out/coverage/python --cov-report=xml:out/coverage/python.xml
+
 # --- formatting -------------------------------------------------------------
 
 # Format everything
@@ -136,6 +154,7 @@ lint-py:
     uv run ruff check
     uv run mypy
 
-# buf lint
+# buf lint, then buf breaking against main (skipped when main has no schemas yet)
 lint-proto:
     buf lint rpc
+    {{ dev }} proto-breaking

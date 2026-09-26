@@ -30,6 +30,8 @@ dev = [
     "clang-tidy>=22,<23",
     "grpcio-tools>=1.84.0",
     "protobuf>=7",
+    "gcovr>=8.6",
+    "pytest-cov>=7.1",
 ]
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,13 @@ dev = [
 testpaths = ["tests", "c3/tests"]
 # importlib mode lets tests/ and c3/tests/ coexist without package name clashes.
 addopts = "-ra --import-mode=importlib"
+
+# ---------------------------------------------------------------------------
+# coverage (pytest-cov, used by `just coverage`)
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+branch = true
+omit = ["*/tazer/v1/*"] # generated protobuf modules
 
 # ---------------------------------------------------------------------------
 # ruff (formatter + linter)
@@ -53,10 +62,15 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "N", "UP", "B", "A", "SIM", "RUF"]
+select = ["E", "W", "F", "I", "N", "UP", "B", "A", "SIM", "S", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
+# assert is the test idiom
 "tests/**" = ["S101"]
+"c3/tests/**" = ["S101"]
+# tools/dev.py exists to run developer tools; its subprocess arguments are
+# constants and PATH lookups, never user input.
+"tools/**" = ["S603", "S607"]
 
 # ---------------------------------------------------------------------------
 # mypy

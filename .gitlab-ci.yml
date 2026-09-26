@@ -1,4 +1,5 @@
-# Mirrors .github/workflows/ci.yml: every step is a `just` recipe.
+# Mirrors .github/workflows/ci.yml: every step is a `just` recipe, and each
+# extra check selects one CMake preset from daemon/CMakePresets.json.
 stages:
   - verify
 
@@ -9,7 +10,7 @@ variables:
   MISE_YES: "1"
   MISE_TRUSTED_CONFIG_PATHS: $CI_PROJECT_DIR
 
-linux:
+.linux:
   stage: verify
   image: ubuntu:24.04
   cache:
@@ -18,13 +19,17 @@ linux:
       - .conan2/p
   variables:
     CONAN_HOME: $CI_PROJECT_DIR/.conan2
+    EXTRA_PACKAGES: ""
   before_script:
-    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git build-essential cppcheck
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git build-essential cppcheck $EXTRA_PACKAGES
     - curl -fsSL https://mise.run | sh
     - export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
     - mise install
-  script:
     - just setup
+
+linux:
+  extends: .linux
+  script:
     - just doctor
     - just build
     - just test
@@ -34,40 +39,42 @@ linux:
       - daemon/build/linux-debug/tazer
     expire_in: 1 week
 
-# Sanitizer builds of the C unit tests. Same presets as `just test-c linux-asan`
-# / `just test-c linux-tsan` locally.
-.sanitizer:
-  stage: verify
-  image: ubuntu:24.04
-  cache:
-    key: conan-$CI_COMMIT_REF_SLUG
-    paths:
-      - .conan2/p
-  variables:
-    CONAN_HOME: $CI_PROJECT_DIR/.conan2
-  before_script:
-    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git build-essential
-    - curl -fsSL https://mise.run | sh
-    - export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
-    - mise install
-    - just setup
-  script:
-    - just test-c $PRESET
-
 linux-asan:
-  extends: .sanitizer
-  variables:
-    PRESET: linux-asan
+  extends: .linux
+  script: [just test-c linux-asan]
 
 linux-tsan:
-  extends: .sanitizer
-  variables:
-    PRESET: linux-tsan
+  extends: .linux
+  script: [just test-c linux-tsan]
 
-# Needs a Windows runner with Visual Studio Build Tools (C++ workload) and
+linux-valgrind:
+  extends: .linux
+  variables:
+    EXTRA_PACKAGES: valgrind
+  script: [just test-valgrind]
+
+linux-analyze:
+  extends: .linux
+  script: [just build linux-analyze]
+
+linux-clang:
+  extends: .linux
+  variables:
+    EXTRA_PACKAGES: clang
+  script: [just test-c linux-clang-debug]
+
+linux-coverage:
+  extends: .linux
+  script: [just coverage]
+  artifacts:
+    paths:
+      - out/coverage
+    expire_in: 1 week
+
+# Windows jobs need a runner with Visual Studio Build Tools (C++ workload) and
 # mise on PATH. Enabled by setting TAZER_WINDOWS_RUNNER=true in the project's
 # CI variables so pipelines without such a runner do not hang.
-windows:
+.windows:
   stage: verify
   tags: [windows, msvc]
   rules:
@@ -76,8 +83,11 @@ windows:
     - choco install cppcheck --no-progress -y
     - $env:PATH = "C:\Program Files\Cppcheck;$env:PATH"
     - mise install
-  script:
     - just setup
+
+windows:
+  extends: .windows
+  script:
     - just doctor
     - just build
     - just test
@@ -88,12 +98,9 @@ windows:
     expire_in: 1 week
 
 windows-asan:
-  stage: verify
-  tags: [windows, msvc]
-  rules:
-    - if: $TAZER_WINDOWS_RUNNER == "true"
-  before_script:
-    - mise install
-    - just setup
-  script:
-    - just test-c windows-asan
+  extends: .windows
+  script: [just test-c windows-asan]
+
+windows-analyze:
+  extends: .windows
+  script: [just build windows-analyze]
