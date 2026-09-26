@@ -86,3 +86,14 @@ windows:
     paths:
       - daemon/build/windows-debug/tazer.exe
     expire_in: 1 week
+
+windows-asan:
+  stage: verify
+  tags: [windows, msvc]
+  rules:
+    - if: $TAZER_WINDOWS_RUNNER == "true"
+  before_script:
+    - mise install
+    - just setup
+  script:
+    - just test-c windows-asan

@@ -81,6 +81,16 @@
       "displayName": "Windows Release (static CRT)",
       "inherits": "windows-base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "windows-asan",
+      "displayName": "Windows Debug + AddressSanitizer (MSVC)",
+      "description": "The ASan runtime is a DLL in the MSVC bin directory, so run tests through `just test-c windows-asan` (dev.py loads the MSVC environment).",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "TAZER_SANITIZER": "address"
+      }
     }
   ],
   "buildPresets": [
@@ -89,7 +99,8 @@
     { "name": "linux-asan", "configurePreset": "linux-asan" },
     { "name": "linux-tsan", "configurePreset": "linux-tsan" },
     { "name": "windows-debug", "configurePreset": "windows-debug" },
-    { "name": "windows-release", "configurePreset": "windows-release" }
+    { "name": "windows-release", "configurePreset": "windows-release" },
+    { "name": "windows-asan", "configurePreset": "windows-asan" }
   ],
   "testPresets": [
     {
@@ -128,6 +139,14 @@
       "name": "windows-release",
       "configurePreset": "windows-release",
       "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-asan",
+      "configurePreset": "windows-asan",
+      "output": { "outputOnFailure": true },
+      "environment": {
+        "ASAN_OPTIONS": "detect_stack_use_after_return=1:abort_on_error=1"
+      }
     }
   ]
 }

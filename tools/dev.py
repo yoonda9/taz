@@ -7,6 +7,7 @@ read identically on Linux, macOS and Windows.
 
 Subcommands:
     cmake ARGS...        run cmake; on Windows, load the MSVC environment first
+    ctest ARGS...        run ctest; same MSVC environment handling
     proto [--check]      regenerate Python + C protobuf code (or verify no diff)
     clang-format [--check]
     clang-tidy --build-dir DIR
@@ -163,9 +164,14 @@ def ensure_msvc_env(*, required: bool = True) -> bool:
     return True
 
 
-def cmd_cmake(args: Sequence[str]) -> None:
+def cmd_passthrough(program: str, args: Sequence[str]) -> None:
+    """Run cmake/ctest with the MSVC environment loaded on Windows.
+
+    ctest needs it too: MSVC's AddressSanitizer runtime is a DLL that lives in
+    the MSVC bin directory, which only vcvarsall puts on PATH.
+    """
     ensure_msvc_env()
-    run([tool("cmake"), *args])
+    run([tool(program), *args])
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +468,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("cmake", help="run cmake ARGS... (handled before argparse)")
+    sub.add_parser("ctest", help="run ctest ARGS... (handled before argparse)")
     p = sub.add_parser("proto")
     p.add_argument("--check", action="store_true")
     p = sub.add_parser("clang-format")
@@ -479,8 +486,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     raw = list(sys.argv[1:] if argv is None else argv)
     # `cmake` forwards everything verbatim; argparse's REMAINDER would swallow
     # leading options such as `-S`, so dispatch it before parsing.
-    if raw and raw[0] == "cmake":
-        cmd_cmake(raw[1:])
+    if raw and raw[0] in {"cmake", "ctest"}:
+        cmd_passthrough(raw[0], raw[1:])
         return
 
     args = parser.parse_args(raw)

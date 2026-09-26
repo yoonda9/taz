@@ -117,3 +117,28 @@ jobs:
         with:
           name: tazer-windows-x64-debug
           path: daemon/build/windows-debug/tazer.exe
+
+  windows-asan:
+    name: Windows windows-asan
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install pinned tools
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ runner.os }}-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
+
+      - run: just setup
+      # Same preset a developer runs locally: `just test-c windows-asan`.
+      - run: just test-c windows-asan

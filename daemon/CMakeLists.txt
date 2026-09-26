@@ -12,12 +12,14 @@ project(
 option(TAZER_BUILD_TESTS
        "Build the daemon unit tests (requires a C++ compiler)" ON)
 option(TAZER_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
-# Selected by the linux-asan / linux-tsan presets. Instruments every target
-# built by this project (daemon, generated protos, nanopb runtime, tests);
-# Conan-built dependencies are not instrumented.
+# Selected by the linux-asan / linux-tsan / windows-asan presets. Instruments
+# every target built by this project (daemon, generated protos, nanopb runtime,
+# tests); Conan-built dependencies are not instrumented. "address" means
+# ASan+UBSan with GCC/Clang and ASan alone with MSVC (which has no UBSan or
+# TSan).
 set(TAZER_SANITIZER
     "none"
-    CACHE STRING "Sanitizer: none, address (ASan+UBSan) or thread (TSan)")
+    CACHE STRING "Sanitizer: none, address (ASan[+UBSan]) or thread (TSan)")
 set_property(CACHE TAZER_SANITIZER PROPERTY STRINGS none address thread)
 
 set(CMAKE_C_STANDARD 11)
@@ -71,23 +73,43 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Sanitizers (GCC/Clang only; MSVC's /fsanitize=address is a later addition)
+# Sanitizers
 # ---------------------------------------------------------------------------
 if(NOT TAZER_SANITIZER STREQUAL "none")
     if(MSVC)
-        message(FATAL_ERROR "TAZER_SANITIZER is not supported with MSVC yet")
-    endif()
-    if(TAZER_SANITIZER STREQUAL "address")
-        set(_tazer_san_flags -fsanitize=address,undefined
-                             -fno-sanitize-recover=undefined)
-    elseif(TAZER_SANITIZER STREQUAL "thread")
-        set(_tazer_san_flags -fsanitize=thread)
+        if(NOT TAZER_SANITIZER STREQUAL "address")
+            message(
+                FATAL_ERROR
+                    "MSVC supports only TAZER_SANITIZER=address (no TSan/UBSan)"
+            )
+        endif()
+        # /fsanitize=address is incompatible with the /RTC1 runtime checks that
+        # CMake puts in the default Debug flags, and with incremental linking.
+        foreach(_lang C CXX)
+            string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_${_lang}_FLAGS_DEBUG
+                                 "${CMAKE_${_lang}_FLAGS_DEBUG}")
+        endforeach()
+        add_compile_options(/fsanitize=address /Zi)
+        add_link_options(/INCREMENTAL:NO)
+        # gtest is Conan-built without ASan; disable the STL container
+        # annotations so std::string/std::vector crossing that boundary do not
+        # raise false container-overflow reports (per Microsoft's guidance).
+        add_compile_definitions(_DISABLE_VECTOR_ANNOTATION
+                                _DISABLE_STRING_ANNOTATION)
+        message(STATUS "TAZER: building with /fsanitize=address")
     else()
-        message(FATAL_ERROR "Unknown TAZER_SANITIZER '${TAZER_SANITIZER}'")
+        if(TAZER_SANITIZER STREQUAL "address")
+            set(_tazer_san_flags -fsanitize=address,undefined
+                                 -fno-sanitize-recover=undefined)
+        elseif(TAZER_SANITIZER STREQUAL "thread")
+            set(_tazer_san_flags -fsanitize=thread)
+        else()
+            message(FATAL_ERROR "Unknown TAZER_SANITIZER '${TAZER_SANITIZER}'")
+        endif()
+        add_compile_options(${_tazer_san_flags} -fno-omit-frame-pointer -g)
+        add_link_options(${_tazer_san_flags})
+        message(STATUS "TAZER: building with -fsanitize=${TAZER_SANITIZER}")
     endif()
-    add_compile_options(${_tazer_san_flags} -fno-omit-frame-pointer -g)
-    add_link_options(${_tazer_san_flags})
-    message(STATUS "TAZER: building with -fsanitize=${TAZER_SANITIZER}")
 endif()
 
 # ---------------------------------------------------------------------------

@@ -62,9 +62,10 @@ verify-static preset="linux-release":
 
 # --- tests ------------------------------------------------------------------
 
-# Run C unit tests (GoogleTest via ctest)
+# Run C unit tests (GoogleTest via ctest). Goes through dev.py so MSVC ASan
+# builds find the sanitizer runtime DLL in the MSVC bin directory.
 test-c preset=preset: (build preset)
-    ctest --test-dir daemon/build/{{ preset }} --output-on-failure
+    {{ dev }} ctest --test-dir daemon/build/{{ preset }} --output-on-failure
 
 # Run Python unit + integration tests (extra args go to pytest)
 test-py *args:
@@ -73,8 +74,13 @@ test-py *args:
 # Run all tests
 test: test-c test-py
 
-# Run the C unit tests under AddressSanitizer+UBSan and ThreadSanitizer (Linux)
+# Run the C unit tests under every sanitizer this OS supports
+[unix]
 test-sanitizers: (test-c "linux-asan") (test-c "linux-tsan")
+
+# Run the C unit tests under MSVC AddressSanitizer (no TSan/UBSan on MSVC)
+[windows]
+test-sanitizers: (test-c "windows-asan")
 
 # --- formatting -------------------------------------------------------------
 
