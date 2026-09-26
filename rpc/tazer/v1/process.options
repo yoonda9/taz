@@ -1,0 +1,13 @@
+# nanopb size limits for process.proto (reference C daemon only).
+tazer.v1.ProcessInfo.name                 max_size:256
+tazer.v1.ProcessInfo.user                 max_size:64
+tazer.v1.ProcessInfo.state                max_size:32
+
+tazer.v1.ProcessListRequest.filter        max_size:256
+# ~370 B per entry; 128 entries stay well under the 64 KiB RESPONSE cap.
+tazer.v1.ProcessListResponse.processes    max_count:128
+
+tazer.v1.ProcessInfoResponse.command_line max_size:4096
+tazer.v1.ProcessInfoResponse.open_files   max_count:32 max_size:1024
+
+tazer.v1.ProcessMonitorResponse.reason    max_size:16

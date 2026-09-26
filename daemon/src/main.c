@@ -1,26 +1,32 @@
-#include "mongoose/mongoose.h"
+/**
+ * @file main.c
+ * @brief TAZER reference daemon entry point.
+ *
+ * Step 1 scaffold: proves that libuv and the nanopb-generated protocol
+ * messages link into a single binary. The TCP server arrives in Step 3.
+ */
 
-// Connection event handler function
-static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
-  if (ev == MG_EV_HTTP_MSG) { // New HTTP request received
-    struct mg_http_message *hm =
-        (struct mg_http_message *)ev_data;               // Parsed HTTP request
-    if (mg_match(hm->uri, mg_str("/api/hello"), NULL)) { // REST API call?
-      mg_http_reply(c, 200, "", "{%m:%d}\n", MG_ESC("status"),
-                    1); // Yes. Respond JSON
-    } else {
-      struct mg_http_serve_opts opts = {.root_dir = ".", .fs = &mg_fs_posix};
-      mg_http_serve_dir(c, hm, &opts); // For all other URLs, Serve static files
-    }
-  }
-}
+#include <stdio.h>
+#include <stdlib.h>
 
-int main(int argc, char **argv) {
-  struct mg_mgr mgr; // Mongoose event manager. Holds all connections
-  mg_mgr_init(&mgr); // Initialise event manager
-  mg_http_listen(&mgr, "http://0.0.0.0:8000", ev_handler, NULL);
-  for (;;) {
-    mg_mgr_poll(&mgr, 1000); // Infinite event loop
-  }
-  return 0;
+#include <pb.h>
+#include <uv.h>
+
+#include "tazer/v1/common.pb.h"
+
+#ifndef TAZER_VERSION
+#define TAZER_VERSION "0.0.0"
+#endif
+
+#ifndef TAZER_BUILD_ID
+#define TAZER_BUILD_ID "unknown"
+#endif
+
+int main(void)
+{
+    (void)printf("tazer %s (%s) libuv %s %s\n", TAZER_VERSION, TAZER_BUILD_ID,
+                 uv_version_string(), NANOPB_VERSION);
+    (void)printf("protocol opcode range: 0x0001..0x%04x\n",
+                 (unsigned)tazer_v1_Opcode_OPCODE_PIPELINE);
+    return EXIT_SUCCESS;
 }

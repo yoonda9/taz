@@ -1,0 +1,15 @@
+# nanopb size limits for common.proto (reference C daemon only).
+# ERROR frames are capped at 4 KiB on the wire.
+tazer.v1.ErrorInfo.message   max_size:256
+tazer.v1.ErrorInfo.detail    max_size:1024
+
+tazer.v1.KeyValue.key        max_size:128
+tazer.v1.KeyValue.value      max_size:512
+
+# Enums are packed into a single byte where possible.
+tazer.v1.Opcode              packed_enum:true
+tazer.v1.FrameType           packed_enum:true
+tazer.v1.FrameFlag           packed_enum:true
+tazer.v1.ErrorCode           packed_enum:true
+tazer.v1.ErrorPriority       packed_enum:true
+tazer.v1.Kind                packed_enum:true

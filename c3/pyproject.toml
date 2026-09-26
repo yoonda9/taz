@@ -1,28 +1,23 @@
 [project]
 name = "tazer"
-version = "0.1.0"
-description = "Python client for the TAZER test-orchestration daemon"
+dynamic = ["version"]
+description = "Python client (c3) for the TAZER test-orchestration daemon"
 readme = "README.md"
 authors = [
     { name = "David Yoon", email = "" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "protobuf>=7",
+]
 
 [tool.hatch.version]
 source = "vcs"
+raw-options = { root = ".." }
 
 [tool.hatch.build.targets.wheel]
-packages = ["tazer"]
+packages = ["src/tazer"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
-
-[dependency-groups]
-dev = [
-    "ruff>=0.14.10",
-]
-test = [
-    "pytest>=9.0.2",
-]

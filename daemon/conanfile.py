@@ -1,41 +1,20 @@
+"""Conan consumer recipe for the TAZER daemon.
+
+Invoked automatically by the cmake-conan dependency provider
+(CMake/cmake-conan/conan_provider.cmake) during `cmake --preset ...`, so a
+plain `just configure` resolves libuv and GoogleTest without a separate
+`conan install` step. nanopb is a git submodule, not a Conan package.
+"""
+
 from conan import ConanFile
-from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 
 
-class TazerRecipe(ConanFile):
-    name = "tazer"
-    version = "0.0.1"
-    exports_sources = "CMakeLists.txt", "src/*", "include/*"
-
+class TazerDaemon(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
-    options = {
-        "fPIC": [True, False],
-    }
-    default_options = {
-        "fPIC": True,
-    }
+    generators = "CMakeDeps"
 
-    requires = "mongoose/[>7.2]"
+    def requirements(self) -> None:
+        self.requires("libuv/1.51.0")
 
-    def config_options(self) -> None:
-        if self.settings.os == "Windows":
-            del self.options.fPIC
-
-    def layout(self):
-        cmake_layout(self)
-
-    def generate(self) -> None:
-        tc = CMakeToolchain(self)
-        tc.generate()
-
-        deps = CMakeDeps(self)
-        deps.generate()
-
-    def build(self) -> None:
-        cmake = CMake(self)
-        cmake.configure()
-        cmake.build()
-
-    def package(self) -> None:
-        cmake = CMake(self)
-        cmake.install()
+    def build_requirements(self) -> None:
+        self.test_requires("gtest/1.17.0")

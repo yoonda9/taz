@@ -1,0 +1,35 @@
+// TAZER protocol: command execution (docs/api.md §2.1).
+
+syntax = "proto3";
+
+package tazer.v1;
+
+import "tazer/v1/common.proto";
+
+// COMMAND_EXEC (0x0010)
+message CommandExecRequest {
+  string command = 1;
+  repeated string args = 2;
+  // Additional environment variables (map<string, string>).
+  repeated KeyValue env = 3;
+  // Working directory; empty means the daemon's current directory.
+  string working_dir = 4;
+  // 0 falls back to the connection default set via TIMEOUT_SET.
+  uint32 timeout_ms = 5;
+  // Run as this user for this command only; empty uses the connection's
+  // current identity (RUN_AS).
+  string as_user = 6;
+}
+
+// Large outputs may be delivered as several RESPONSE frames with the
+// CONTINUATION flag: receivers concatenate `stdout`/`stderr` across frames and
+// read the scalar fields from the final frame.
+message CommandExecResponse {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+  // The command was killed because it exceeded its timeout.
+  bool timed_out = 4;
+  // Output exceeded the daemon's `exec.max_output_bytes` limit and was cut.
+  bool truncated = 5;
+}

@@ -1,12 +1,75 @@
+# uv workspace root. The installable client package lives in ./c3 (project
+# name "tazer"). This root is a virtual project that holds the shared dev
+# tooling and the integration test suite in ./tests.
 [project]
-name = "tazer"
-version = "0.1.0"
-description = "Add your description here"
+name = "tazer-workspace"
+version = "0.0.0"
+description = "Workspace root for TAZER (daemon, client, protocol)"
 requires-python = ">=3.12"
 dependencies = []
 
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["c3"]
+
+[tool.uv.sources]
+tazer = { workspace = true }
+
 [dependency-groups]
 dev = [
-    "conan>=2.28.1",
+    "tazer",
     "pytest>=9.0.3",
+    "ruff>=0.16.9",
+    "mypy>=2.3.1",
+    "types-protobuf>=6",
+    "cmakelang>=0.6.13",
+    "pyyaml>=6",  # cmakelang reads .cmake-format.yaml through PyYAML
+    "clang-format>=23,<24",
+    "clang-tidy>=22,<23",
+    "grpcio-tools>=1.84.0",
+    "protobuf>=7",
 ]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests", "c3/tests"]
+# importlib mode lets tests/ and c3/tests/ coexist without package name clashes.
+addopts = "-ra --import-mode=importlib"
+
+# ---------------------------------------------------------------------------
+# ruff (formatter + linter)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+extend-exclude = [
+    "c3/src/tazer/v1",        # generated protobuf code
+    "daemon/third_party",
+    "daemon/CMake",
+]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "A", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["c3/src", "c3/tests", "tests", "tools"]
+exclude = ["c3/src/tazer/v1/"]
+
+[[tool.mypy.overrides]]
+module = ["tazer.v1.*"]
+# protoc's generated .pyi stubs use bare `Mapping`; use them for typing our
+# code but do not hold generated files to --strict.
+follow_imports = "silent"
+disallow_any_generics = false

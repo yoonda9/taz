@@ -1,0 +1,24 @@
+# nanopb size limits for file.proto (reference C daemon only).
+# Paths: 1024 bytes covers POSIX PATH_MAX-style limits and Windows long paths
+# used in practice.
+tazer.v1.FilePutRequest.dest               max_size:1024
+tazer.v1.FilePutResponse.Confirmation.checksum max_size:4
+tazer.v1.FileGetRequest.src                max_size:1024
+tazer.v1.FileGetResponse.checksum          max_size:4
+
+tazer.v1.FileCreateRequest.path            max_size:1024
+# Inline content is written straight to disk from a decode callback.
+tazer.v1.FileCreateRequest.content         type:FT_CALLBACK
+
+tazer.v1.FileDeleteRequest.path            max_size:1024
+tazer.v1.FileStatRequest.path              max_size:1024
+tazer.v1.FileStatResponse.owner            max_size:64
+tazer.v1.FileStatResponse.link_target      max_size:1024
+tazer.v1.FileChmodRequest.path             max_size:1024
+tazer.v1.DirMakeRequest.path               max_size:1024
+tazer.v1.DirListRequest.path               max_size:1024
+# NAME_MAX is 255 on every supported filesystem.
+tazer.v1.DirEntry.name                     max_size:256
+# ~270 B per entry; 64 entries per frame stay well under the 64 KiB cap.
+tazer.v1.DirListResponse.entries           max_count:64
+tazer.v1.DirRemoveRequest.path             max_size:1024

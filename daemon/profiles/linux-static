@@ -1,0 +1,7 @@
+# Partial Conan host profile for Linux. Composed after `default` and before the
+# provider's auto-detected CMake settings, so it only pins what the compiler
+# detection cannot: every dependency is built as a static library.
+#
+# The fully static (musl) release build arrives in Step 13.
+[options]
+*:shared=False

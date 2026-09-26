@@ -1,0 +1,46 @@
+# C/C++ formatting for the TAZER daemon, aligned with the Barr Group Embedded C
+# Coding Standard: braces on their own line, 4-space indent, 80 columns,
+# pointer star bound to the name. Applies to daemon/src, daemon/include and
+# daemon/tests; generated and third-party code is excluded by `just fmt-c`.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++17
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 80
+
+BreakBeforeBraces: Allman
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+IndentCaseLabels: true
+IndentPPDirectives: None
+AlignConsecutiveMacros: Consecutive
+AlignTrailingComments: true
+AlignAfterOpenBracket: Align
+
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive
+IncludeCategories:
+  # C standard library headers and C++ <cxxx> / <vector>-style headers
+  - Regex: '^<(assert|complex|ctype|errno|fenv|float|inttypes|iso646|limits|locale|math|setjmp|signal|stdalign|stdarg|stdatomic|stdbool|stddef|stdint|stdio|stdlib|stdnoreturn|string|tgmath|threads|time|uchar|wchar|wctype)\.h>$|^<c[a-z]+>$|^<[a-z_]+>$'
+    Priority: 1
+  # Third-party (libuv, nanopb, gtest)
+  - Regex: "^<.*>$"
+    Priority: 2
+  # Project headers
+  - Regex: '^".*"$'
+    Priority: 3
+
+InsertNewlineAtEOF: true
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1

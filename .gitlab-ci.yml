@@ -1,0 +1,88 @@
+# Mirrors .github/workflows/ci.yml: every step is a `just` recipe.
+stages:
+  - verify
+
+variables:
+  CI: "1"
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_DEPTH: 0 # hatch-vcs derives the client version from tags
+  MISE_YES: "1"
+  MISE_TRUSTED_CONFIG_PATHS: $CI_PROJECT_DIR
+
+linux:
+  stage: verify
+  image: ubuntu:24.04
+  cache:
+    key: conan-$CI_COMMIT_REF_SLUG
+    paths:
+      - .conan2/p
+  variables:
+    CONAN_HOME: $CI_PROJECT_DIR/.conan2
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git build-essential cppcheck
+    - curl -fsSL https://mise.run | sh
+    - export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+    - mise install
+  script:
+    - just setup
+    - just doctor
+    - just build
+    - just test
+    - just lint
+  artifacts:
+    paths:
+      - daemon/build/linux-debug/tazer
+    expire_in: 1 week
+
+# Sanitizer builds of the C unit tests. Same presets as `just test-c linux-asan`
+# / `just test-c linux-tsan` locally.
+.sanitizer:
+  stage: verify
+  image: ubuntu:24.04
+  cache:
+    key: conan-$CI_COMMIT_REF_SLUG
+    paths:
+      - .conan2/p
+  variables:
+    CONAN_HOME: $CI_PROJECT_DIR/.conan2
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git build-essential
+    - curl -fsSL https://mise.run | sh
+    - export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+    - mise install
+    - just setup
+  script:
+    - just test-c $PRESET
+
+linux-asan:
+  extends: .sanitizer
+  variables:
+    PRESET: linux-asan
+
+linux-tsan:
+  extends: .sanitizer
+  variables:
+    PRESET: linux-tsan
+
+# Needs a Windows runner with Visual Studio Build Tools (C++ workload) and
+# mise on PATH. Enabled by setting TAZER_WINDOWS_RUNNER=true in the project's
+# CI variables so pipelines without such a runner do not hang.
+windows:
+  stage: verify
+  tags: [windows, msvc]
+  rules:
+    - if: $TAZER_WINDOWS_RUNNER == "true"
+  before_script:
+    - choco install cppcheck --no-progress -y
+    - $env:PATH = "C:\Program Files\Cppcheck;$env:PATH"
+    - mise install
+  script:
+    - just setup
+    - just doctor
+    - just build
+    - just test
+    - just lint
+  artifacts:
+    paths:
+      - daemon/build/windows-debug/tazer.exe
+    expire_in: 1 week

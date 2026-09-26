@@ -1,0 +1,134 @@
+// TAZER protocol: shared enums and messages.
+//
+// The frame header (type, flags, opcode, length, stream_id) is NOT a protobuf
+// message; see docs/protocol.md. The enums below are the single source of truth
+// for the integer constants that appear in that header and in payloads.
+//
+// Size limits for the nanopb (C) build live in the sidecar `common.options`
+// file so that these schemas remain plain protobuf for every other consumer.
+
+syntax = "proto3";
+
+package tazer.v1;
+
+// RPC operation identifiers carried in the frame header (docs/api.md, Opcodes).
+// Every assigned opcode is listed, including operations not implemented by the
+// reference daemon in the first milestone. 0 is reserved and never used.
+enum Opcode {
+  OPCODE_UNSPECIFIED = 0;
+
+  // Daemon control
+  OPCODE_PING = 0x0001;
+  OPCODE_VERSION = 0x0002;
+  OPCODE_CONFIGURATION_GET = 0x0003;
+  OPCODE_CONFIGURATION_UPDATE = 0x0004;
+  OPCODE_RESTART = 0x0005;
+  OPCODE_UPDATE = 0x0006;
+
+  // Command execution
+  OPCODE_COMMAND_EXEC = 0x0010;
+  OPCODE_SHELL_OPEN = 0x0011;
+  OPCODE_SHELL_INPUT = 0x0012;
+  OPCODE_SHELL_CLOSE = 0x0013;
+
+  // Process management
+  OPCODE_PROCESS_LIST = 0x0020;
+  OPCODE_PROCESS_KILL = 0x0021;
+  OPCODE_PROCESS_INFO = 0x0022;
+  OPCODE_PROCESS_MONITOR = 0x0023;
+
+  // File operations
+  OPCODE_FILE_PUT = 0x0030;
+  OPCODE_FILE_GET = 0x0031;
+  OPCODE_FILE_CREATE = 0x0032;
+  OPCODE_FILE_DELETE = 0x0033;
+  OPCODE_FILE_STAT = 0x0034;
+  OPCODE_FILE_CHMOD = 0x0035;
+  OPCODE_DIR_MAKE = 0x0036;
+  OPCODE_DIR_LIST = 0x0037;
+  OPCODE_DIR_REMOVE = 0x0038;
+
+  // Advanced
+  OPCODE_RUN_AS = 0x0040;
+  OPCODE_TIMEOUT_SET = 0x0041;
+  OPCODE_LOG = 0x0042;
+  OPCODE_DETACH = 0x0043;
+  OPCODE_TASK_STATUS = 0x0044;
+  OPCODE_TASK_CANCEL = 0x0045;
+  OPCODE_CANCEL = 0x0046;
+
+  // Pipelines
+  OPCODE_PIPELINE = 0x0050;
+}
+
+// Frame header byte 0 (docs/protocol.md §4.2).
+enum FrameType {
+  FRAME_TYPE_UNSPECIFIED = 0;
+  FRAME_TYPE_REQUEST = 0x01;
+  FRAME_TYPE_RESPONSE = 0x02;
+  FRAME_TYPE_FILE_CHUNK = 0x03;
+  FRAME_TYPE_ERROR = 0x04;
+  FRAME_TYPE_PING = 0x05;
+  FRAME_TYPE_PONG = 0x06;
+  FRAME_TYPE_CAPABILITY = 0x07;
+}
+
+// Frame header byte 1 bit masks (docs/protocol.md §4.3). Combine with OR.
+enum FrameFlag {
+  FRAME_FLAG_NONE = 0;
+  FRAME_FLAG_CONTINUATION = 0x01;
+  FRAME_FLAG_COMPRESSED = 0x02;
+  FRAME_FLAG_PRIORITY = 0x04;
+}
+
+// Error codes carried in ERROR frames (docs/api.md §6). Numbering is part of
+// the specification; UNKNOWN is deliberately 0.
+enum ErrorCode {
+  ERROR_CODE_UNKNOWN = 0;
+  ERROR_CODE_NOT_FOUND = 1;
+  ERROR_CODE_PERMISSION_DENIED = 2;
+  ERROR_CODE_ALREADY_EXISTS = 3;
+  ERROR_CODE_TIMEOUT = 4;
+  ERROR_CODE_NOT_SUPPORTED = 5;
+  ERROR_CODE_INVALID_REQUEST = 6;
+  ERROR_CODE_INTERNAL = 7;
+  ERROR_CODE_BUSY = 8;
+  ERROR_CODE_CANCELLED = 9;
+  ERROR_CODE_CONNECTION_LOST = 10;
+}
+
+// Cross-task error escalation level for detached tasks (docs/api.md §5.4).
+enum ErrorPriority {
+  ERROR_PRIORITY_NONE = 0;
+  ERROR_PRIORITY_CRITICAL = 1;
+}
+
+// Filesystem entry kind (docs/api.md §4.5, §4.8).
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_FILE = 1;
+  KIND_DIR = 2;
+  KIND_SYMLINK = 3;
+  KIND_OTHER = 4;
+}
+
+// Payload of every ERROR frame.
+message ErrorInfo {
+  ErrorCode code = 1;
+  string message = 2;
+  string detail = 3;
+}
+
+// String map entry. Used wherever the API describes a map<string, string>;
+// wire-identical to a protobuf map field.
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+// Integer map entry. Used wherever the API describes a map<uint32, uint32>;
+// wire-identical to a protobuf map field.
+message UInt32Pair {
+  uint32 key = 1;
+  uint32 value = 2;
+}
