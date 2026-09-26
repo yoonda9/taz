@@ -61,45 +61,45 @@ The daemon exposes the following functionality. RTOS daemons may implement a sub
 
 ### 5.1 Daemon Control
 
-| Operation | Description |
-|---|---|
-| Ping | Liveness check |
-| Version | Daemon version and build info |
-| Capabilities | What this daemon supports (returned at connection time) |
-| Configuration Get | Read daemon configuration |
-| Configuration Update | Modify daemon configuration |
-| Restart | Restart the daemon process |
-| Update | Update the daemon binary |
+| Operation            | Description                                             |
+| -------------------- | ------------------------------------------------------- |
+| Ping                 | Liveness check                                          |
+| Version              | Daemon version and build info                           |
+| Capabilities         | What this daemon supports (returned at connection time) |
+| Configuration Get    | Read daemon configuration                               |
+| Configuration Update | Modify daemon configuration                             |
+| Restart              | Restart the daemon process                              |
+| Update               | Update the daemon binary                                |
 
 ### 5.2 Command Execution
 
-| Operation | Description |
-|---|---|
-| Execute Command | Run a command and return output |
+| Operation         | Description                                                  |
+| ----------------- | ------------------------------------------------------------ |
+| Execute Command   | Run a command and return output                              |
 | Interactive Shell | Bidirectional shell session (requires persistent connection) |
 
 ### 5.3 Process Management
 
-| Operation | Description |
-|---|---|
-| Process List | Enumerate running processes |
-| Process Kill | Terminate a process |
-| Process Info | Detailed info on a specific process |
+| Operation       | Description                            |
+| --------------- | -------------------------------------- |
+| Process List    | Enumerate running processes            |
+| Process Kill    | Terminate a process                    |
+| Process Info    | Detailed info on a specific process    |
 | Process Monitor | Ongoing status reporting for a process |
 
 ### 5.4 File Operations
 
-| Operation | Description |
-|---|---|
-| Put File | Transfer file from client to daemon (upload) |
-| Get File | Transfer file from daemon to client (download) |
-| Create File | Create an empty file or file with content |
-| Delete File | Remove a file |
-| Stat File | File or directory metadata (size, permissions, timestamps, kind) |
-| Modify Permissions | Change file permissions |
-| Make Directory | Create a directory (with `-p` semantics available) |
-| List Directory | Enumerate directory entries |
-| Remove Directory | Remove a directory (optionally recursive) |
+| Operation          | Description                                                      |
+| ------------------ | ---------------------------------------------------------------- |
+| Put File           | Transfer file from client to daemon (upload)                     |
+| Get File           | Transfer file from daemon to client (download)                   |
+| Create File        | Create an empty file or file with content                        |
+| Delete File        | Remove a file                                                    |
+| Stat File          | File or directory metadata (size, permissions, timestamps, kind) |
+| Modify Permissions | Change file permissions                                          |
+| Make Directory     | Create a directory (with `-p` semantics available)               |
+| List Directory     | Enumerate directory entries                                      |
+| Remove Directory   | Remove a directory (optionally recursive)                        |
 
 Must support **large file transfers** — files that exceed available memory must stream in chunks without requiring the full file in memory on either side.
 
@@ -107,12 +107,12 @@ File integrity is verified with CRC32C checksums returned in the transfer metada
 
 ### 5.5 Advanced
 
-| Operation | Description |
-|---|---|
-| Run As | Execute subsequent operations as a different user |
-| Timeout | Set/get operation timeout |
-| Log | Retrieve daemon logs |
-| Detach | Fire-and-forget task execution with optional monitoring |
+| Operation | Description                                             |
+| --------- | ------------------------------------------------------- |
+| Run As    | Execute subsequent operations as a different user       |
+| Timeout   | Set/get operation timeout                               |
+| Log       | Retrieve daemon logs                                    |
+| Detach    | Fire-and-forget task execution with optional monitoring |
 
 ## 6. Tasking Model
 

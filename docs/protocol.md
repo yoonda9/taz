@@ -1,6 +1,6 @@
 # TAZER Protocol Design
 
-> Living document. Last updated: 2026-09-25
+> Living document. Last updated: 2026-09-26
 
 ## 1. Overview
 
@@ -65,16 +65,16 @@ Rationale for putting `opcode` and `stream_id` in the header instead of the payl
 
 Identifies the kind of message. Dispatch is an integer switch, not string matching.
 
-| Value | Name | Description |
-|---|---|---|
-| `0x01` | `REQUEST` | Client-to-daemon RPC request |
-| `0x02` | `RESPONSE` | Daemon-to-client RPC response |
-| `0x03` | `FILE_CHUNK` | A chunk of file data (upload or download) |
-| `0x04` | `ERROR` | Error response |
-| `0x05` | `PING` | Keepalive / liveness probe |
-| `0x06` | `PONG` | Keepalive response |
-| `0x07` | `CAPABILITY` | Capability advertisement (sent by daemon on connect) |
-| `0x08`–`0xFF` | Reserved | Available for future use |
+| Value         | Name         | Description                                          |
+| ------------- | ------------ | ---------------------------------------------------- |
+| `0x01`        | `REQUEST`    | Client-to-daemon RPC request                         |
+| `0x02`        | `RESPONSE`   | Daemon-to-client RPC response                        |
+| `0x03`        | `FILE_CHUNK` | A chunk of file data (upload or download)            |
+| `0x04`        | `ERROR`      | Error response                                       |
+| `0x05`        | `PING`       | Keepalive / liveness probe                           |
+| `0x06`        | `PONG`       | Keepalive response                                   |
+| `0x07`        | `CAPABILITY` | Capability advertisement (sent by daemon on connect) |
+| `0x08`–`0xFF` | Reserved     | Available for future use                             |
 
 Streams (file transfers, Process Monitor, Interactive Shell) terminate by clearing the `CONTINUATION` flag on the final frame (see §4.3). There is no separate stream-end frame type.
 
@@ -95,10 +95,11 @@ Bit:  7  6  5  4  3  2  1  0
       └─────────────── (reserved)
 ```
 
-- **CONTINUATION (bit 0):** When set, indicates more frames belong to the same `stream_id`. Cleared on the last frame of the stream. Applies to both:
+- **CONTINUATION (bit 0):** When set, indicates more frames belong to the same `stream_id`. Cleared on the last frame of the stream. Applies to:
   - **Chunked payloads** — a single logical message split across multiple frames (e.g., successive `FILE_CHUNK` frames of one file transfer).
+  - **Chunked responses** — a single logical `RESPONSE` whose serialized payload would exceed the `RESPONSE` size limit is delivered as a sequence of `RESPONSE` frames, `CONTINUATION` set on all but the last. See §6.1 for the merge rule.
   - **Open streams** — an ongoing exchange whose end is signalled by the sender clearing the flag on the final frame (e.g., a Process Monitor subscription, an Interactive Shell session).
-  In either case, the receiver treats a cleared `CONTINUATION` as "no more frames coming on this `stream_id`."
+    In every case, the receiver treats a cleared `CONTINUATION` as "no more frames coming on this `stream_id`."
 - **COMPRESSED (bit 1):** When set, the payload is compressed using the algorithm negotiated during capability exchange (see §9). Never set on `FILE_CHUNK` frames whose stream carries an already-compressed transfer, and never set on `PING`/`PONG` (their payload is empty).
 - **PRIORITY (bit 2):** When set on an `ERROR` frame, this error should interrupt any in-flight response on the connection (cross-task error escalation). See §10.2 for `stream_id` semantics.
 - **Bits 3–7:** Reserved. Must be set to 0 by senders. Receivers must ignore unknown flags for forward compatibility.
@@ -187,16 +188,26 @@ Every message type defines a **maximum payload size** in the `.proto` schema opt
 
 Recommended defaults:
 
-| Message type | Max payload |
-|---|---|
-| `PING` / `PONG` | 0 bytes |
-| `CAPABILITY` | 1 KiB |
-| `REQUEST` | 64 KiB |
-| `RESPONSE` | 64 KiB |
-| `ERROR` | 4 KiB |
-| `FILE_CHUNK` | 64 KiB |
+| Message type    | Max payload |
+| --------------- | ----------- |
+| `PING` / `PONG` | 0 bytes     |
+| `CAPABILITY`    | 1 KiB       |
+| `REQUEST`       | 64 KiB      |
+| `RESPONSE`      | 64 KiB      |
+| `ERROR`         | 4 KiB       |
+| `FILE_CHUNK`    | 64 KiB      |
 
 The frame `length` field can encode payloads up to 4 GiB, but every receiver enforces its per-type maximum before allocating buffers or reading the payload. Implementations may negotiate different limits during capability exchange (see §9).
+
+### 6.1 Chunked Responses
+
+A single logical response whose serialized payload would exceed the `RESPONSE` limit MAY be split across several `RESPONSE` frames on the same `stream_id`, each individually within the limit, with `CONTINUATION` set on every frame except the last. Each frame carries a well-formed protobuf message of the response schema. The receiver merges them into one logical message:
+
+- `bytes` and `string` fields are **concatenated** in frame order.
+- `repeated` fields are **appended** in frame order.
+- Scalar fields (integers, bools, enums) are taken from the **final** frame; earlier frames SHOULD leave them at their default.
+
+Senders SHOULD split at natural boundaries (whole `repeated` elements, arbitrary `bytes` offsets). This rule applies to every RPC response and is what lets `COMMAND_EXEC` output, `DIR_LIST`, `PROCESS_LIST`, `PROCESS_INFO.open_files`, and `LOG` exceed 64 KiB without a separate paging API. It is distinct from _streamed_ responses (Process Monitor, subscribed Task Status), where each frame is a complete, independent message; the response schema for an opcode states which model it uses.
 
 ## 7. Connection Lifecycle
 
@@ -222,7 +233,9 @@ There is no client-side handshake message. The connection is ready for requests 
 
 ### 7.2 Keepalive
 
-Either side may send a `PING` frame at any time. The other side must respond with a `PONG` frame. A missing pong within a configurable timeout indicates a dead connection.
+Keepalive is **client-initiated only**. The client MAY send a `PING` frame at any time; the daemon MUST respond with a `PONG` frame. A missing `PONG` within a client-chosen timeout indicates a dead connection.
+
+The daemon MUST NOT initiate `PING` and MUST NOT close a connection because of client inactivity. Rationale: a purely synchronous client (requirements.md §4.1) reads its socket only while a request is in flight, so a daemon-originated `PING` sent during a long client-side pause would go unanswered even though the client is healthy. A daemon that needs a liveness signal treats **any** received frame as liveness and otherwise relies on TCP to report a dead peer.
 
 ### 7.3 Shutdown
 
@@ -267,6 +280,13 @@ Client                          Daemon
 - The `CONTINUATION` flag distinguishes intermediate chunks from the final one; the `stream_id` distinguishes concurrent transfers
 - Total file size is communicated in the initial request/response metadata so the receiver can pre-allocate or validate disk space
 - File integrity is verified with a checksum in the metadata exchange (see [api.md §Checksums](api.md#checksums))
+
+### 8.4 Failure and Cancellation
+
+- **Daemon-side failure during upload** (e.g. disk full): the daemon sends an `ERROR` frame on `S`, discards the partial file, and then **continues to consume and discard** `FILE_CHUNK` frames on `S` until it sees one with `CONTINUATION` cleared. It does not close the connection. A client that is mid-upload and not yet reading will observe the `ERROR` when it next reads on `S`.
+- **Client abort of an upload**: the client sends a `CANCEL` request (api.md §5.7) with `target_stream_id = S` on a fresh `stream_id`. The daemon discards the partial file, replies `cancelled = true`, and drops any further `FILE_CHUNK` frames on `S`. The client MAY stop sending chunks as soon as the `CANCEL` is sent.
+- **Client abort of a download**: the client sends `CANCEL` with `target_stream_id = S`. The daemon stops sending chunks after at most one more in-flight frame; the client discards any `FILE_CHUNK` frames on `S` that arrive after the `CANCEL` response.
+- **Atomicity**: a daemon SHOULD write an upload to a temporary file in the destination directory and rename it into place only after the final chunk is received and `bytes_written` equals the announced `size`. A failed or cancelled upload therefore never leaves a partial file at the destination path.
 
 ## 9. Capability Handshake
 
@@ -329,6 +349,11 @@ Client responsibilities:
 - Assign `stream_id`s that are unique per REQUEST within the connection's lifetime.
 - Wrap-around is acceptable for long-lived connections — collisions with completed streams are harmless as long as the client doesn't reuse a `stream_id` that still has frames in flight.
 - Reserved values: `stream_id = 0` is used for `PING`/`PONG`, `CAPABILITY`, and connection-level `ERROR` frames — clients MUST NOT assign `0` to a real request.
+
+Daemon responsibilities:
+
+- A `REQUEST` whose `stream_id` is already in use by an active (unfinished) stream on the same connection is rejected with an `ERROR` (`INVALID_REQUEST`) on that `stream_id`; the existing stream is unaffected.
+- Once a stream has ended (final frame sent with `CONTINUATION` cleared, or a discrete response sent), the daemon forgets the `stream_id` and it may be reused by the client after wrap-around.
 
 ## 12. Future Considerations
 
