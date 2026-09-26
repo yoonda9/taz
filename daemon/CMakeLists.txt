@@ -33,6 +33,19 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The daemon itself is pure C. GoogleTest is C++, so C++ is enabled only when
+# tests are built. This must precede the FIRST find_package() call of any kind
+# (the cmake-conan provider runs `conan install` there and derives the host
+# profile, including compiler.cppstd, from the languages and standards known
+# at that moment). Conan drops sub-settings when a later profile changes the
+# compiler, so the auto-detected profile is the only reliable place for cppstd.
+if(TAZER_BUILD_TESTS)
+    enable_language(CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
+
 # Static MSVC runtime on Windows (/MT, /MTd). No-op elsewhere.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
@@ -151,21 +164,9 @@ if(NOT TAZER_SANITIZER STREQUAL "none")
 endif()
 
 # ---------------------------------------------------------------------------
-# Dependencies
+# Dependencies (resolved by the cmake-conan provider; see the note above the
+# enable_language(CXX) block about ordering)
 # ---------------------------------------------------------------------------
-# The daemon itself is pure C. GoogleTest is C++, so a C++ compiler is only
-# enabled when tests are built; doing it here (before the Conan provider runs)
-# lets Conan build gtest with the same compiler CMake selected.
-if(TAZER_BUILD_TESTS)
-    enable_language(CXX)
-    # Declared here, before the Conan provider runs, so the auto-detected host
-    # profile carries compiler.cppstd=17 for every compiler (Conan drops
-    # profile sub-settings when the compiler changes, e.g. gcc -> clang).
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    set(CMAKE_CXX_EXTENSIONS OFF)
-endif()
-
 find_package(libuv REQUIRED CONFIG)
 
 # nanopb runtime, vendored as a git submodule pinned to the same release as the
