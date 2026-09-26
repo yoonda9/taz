@@ -1,5 +1,5 @@
-# Partial Conan host profile for Windows (MSVC). Composed after `default` and
-# before the provider's auto-detected CMake settings.
+# Partial Conan host profile for Windows (MSVC), composed after the detected
+# `default` profile (created by `just setup`; Conan finds MSVC via vswhere).
 #
 # compiler.runtime=static selects /MT (Release) or /MTd (Debug) via the
 # auto-derived runtime_type, matching CMAKE_MSVC_RUNTIME_LIBRARY in

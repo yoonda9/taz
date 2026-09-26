@@ -20,11 +20,11 @@ default:
 
 # --- setup ------------------------------------------------------------------
 
-# One-time setup after `mise install`: Python env, submodules, Conan profile, hooks
+# One-time setup after `mise install`: Python env, submodules, Conan profiles, hooks
 setup:
     uv sync --group dev
     git submodule update --init --recursive
-    conan profile detect --exist-ok
+    {{ dev }} conan-profiles
     prek install --hook-type pre-push
 
 # Report missing tools (system compiler, cppcheck, unpinned mise/uv tools)
@@ -43,10 +43,10 @@ proto-check:
 
 # --- daemon build -----------------------------------------------------------
 
-# Configure the daemon (Conan runs via the cmake-conan provider). On Windows,
-# `dev.py cmake` loads the MSVC environment first if cl.exe is not on PATH.
+# Configure the daemon: `conan install` with the preset's host profiles, then
+# `cmake --preset`. On Windows the MSVC environment is loaded first if needed.
 configure preset=preset:
-    {{ dev }} cmake -S daemon --preset {{ preset }}
+    {{ dev }} configure {{ preset }}
 
 # Build the daemon and its unit tests
 build preset=preset: (configure preset)

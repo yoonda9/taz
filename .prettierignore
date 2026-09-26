@@ -1,7 +1,6 @@
 # Generated, vendored, and tool-owned paths.
 daemon/generated/
 daemon/third_party/
-daemon/CMake/cmake-conan/
 daemon/build/
 c3/src/tazer/v1/
 .venv/

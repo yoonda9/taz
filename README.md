@@ -27,14 +27,14 @@ Tool versions are pinned with [mise](https://mise.jdx.dev) and every task is a
 
 ```sh
 mise install     # pinned tools: uv, just, cmake, ninja, buf, prettier, conan, prek
-just setup       # Python env, git submodules, Conan profile, pre-push hook
+just setup       # Python env, git submodules, Conan profiles, pre-push hook
 just doctor      # reports anything mise cannot install (C compiler, cppcheck)
 ```
 
 Then:
 
 ```sh
-just build       # configure (Conan runs automatically) and build the daemon
+just build       # conan install + cmake --preset, then build the daemon
 just test        # C unit tests (GoogleTest) + Python tests (pytest)
 just lint        # every formatter check, clang-tidy, cppcheck, ruff, mypy, buf
 just fmt         # apply all formatters

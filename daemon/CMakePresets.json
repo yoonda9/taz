@@ -5,12 +5,12 @@
     {
       "name": "base",
       "hidden": true,
+      "description": "Configure with `just configure <preset>`: it runs `conan install` (host profiles chosen from the preset name, output under build/<preset>/conan) and then `cmake --preset <preset>`, which consumes the generated toolchain file below.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "${sourceDir}/build/${presetName}/conan/conan_toolchain.cmake",
       "cacheVariables": {
-        "CMAKE_PROJECT_TOP_LEVEL_INCLUDES": "${sourceDir}/CMake/cmake-conan/conan_provider.cmake",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CONAN_INSTALL_ARGS": "--build=missing"
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
     },
     {
@@ -21,23 +21,17 @@
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Linux"
-      },
-      "cacheVariables": {
-        "CONAN_HOST_PROFILE": "default;${sourceDir}/profiles/linux-static;auto-cmake"
       }
     },
     {
       "name": "windows-base",
       "hidden": true,
       "inherits": "base",
-      "description": "Ninja + MSVC. `just configure` (tools/dev.py cmake) loads the MSVC environment via vswhere/vcvarsall when cl.exe is not already on PATH, so no Developer Command Prompt is needed and compile_commands.json is produced for clang-tidy.",
+      "description": "Ninja + MSVC. tools/dev.py loads the MSVC environment via vswhere/vcvarsall when cl.exe is not already on PATH, so no Developer Command Prompt is needed and compile_commands.json is produced for clang-tidy.",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
-      },
-      "cacheVariables": {
-        "CONAN_HOST_PROFILE": "default;${sourceDir}/profiles/windows-static;auto-cmake"
       }
     },
     {

@@ -6,6 +6,8 @@ than one line lives here so the justfile stays a flat list of commands that
 read identically on Linux, macOS and Windows.
 
 Subcommands:
+    conan-profiles       create the detected Conan base profiles (default, clang)
+    configure PRESET     conan install (profiles from the preset name) + cmake --preset
     cmake ARGS...        run cmake; on Windows, load the MSVC environment first
     ctest ARGS...        run ctest; same MSVC environment handling
     proto [--check]      regenerate Python + C protobuf code (or verify no diff)
@@ -165,6 +167,60 @@ def ensure_msvc_env(*, required: bool = True) -> bool:
             os.environ[key] = value
     print(f"loaded MSVC environment from {install_path} ({arch})")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Conan + CMake configure
+# ---------------------------------------------------------------------------
+PROFILES_DIR = ROOT / "daemon" / "profiles"
+
+
+def cmd_conan_profiles() -> None:
+    """Create the detected base profiles that the presets compose with.
+
+    `default` is the user's own detected profile (never overwritten). `clang`
+    is ours, detected with CC/CXX pointed at clang, and refreshed each time so
+    it tracks the installed compiler; it is only created when clang exists.
+    """
+    conan = tool("conan")
+    run([conan, "profile", "detect", "--exist-ok"])
+    if not IS_WINDOWS and shutil.which("clang") and shutil.which("clang++"):
+        env = {**os.environ, "CC": "clang", "CXX": "clang++"}
+        print("$ CC=clang CXX=clang++ conan profile detect --name clang --force")
+        subprocess.run(
+            [conan, "profile", "detect", "--name", "clang", "--force"],
+            cwd=ROOT,
+            env=env,
+            check=True,
+        )
+
+
+def host_profiles_for(preset: str) -> list[str]:
+    """Host profile chain for a preset: detected base first, then our partial."""
+    if preset.startswith("windows-"):
+        return ["default", str(PROFILES_DIR / "windows-static")]
+    if preset.startswith("linux-clang"):
+        return ["clang", str(PROFILES_DIR / "linux-static")]
+    return ["default", str(PROFILES_DIR / "linux-static")]
+
+
+def cmd_configure(preset: str) -> None:
+    ensure_msvc_env()
+    build_type = "Release" if preset.endswith("-release") else "Debug"
+    output = ROOT / "daemon" / "build" / preset / "conan"
+    cmd: list[str | Path] = [
+        tool("conan"),
+        "install",
+        ROOT / "daemon",
+        f"--output-folder={output}",
+        "--build=missing",
+        "-s",
+        f"build_type={build_type}",
+    ]
+    for profile in host_profiles_for(preset):
+        cmd += ["--profile:host", profile]
+    run(cmd)
+    run([tool("cmake"), "-S", ROOT / "daemon", "--preset", preset])
 
 
 def cmd_passthrough(program: str, args: Sequence[str]) -> None:
@@ -496,10 +552,7 @@ def cmd_doctor() -> None:
                 print(f"  missing  -fsanitize={flag}  <- {hint}")
                 warnings.append(flag)
 
-    submodules = [
-        ROOT / "daemon" / "third_party" / "nanopb" / "pb.h",
-        ROOT / "daemon" / "CMake" / "cmake-conan" / "conan_provider.cmake",
-    ]
+    submodules = [ROOT / "daemon" / "third_party" / "nanopb" / "pb.h"]
     print("submodules:")
     for path in submodules:
         if path.exists():
@@ -578,6 +631,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     sub.add_parser("cmake", help="run cmake ARGS... (handled before argparse)")
     sub.add_parser("ctest", help="run ctest ARGS... (handled before argparse)")
+    sub.add_parser("conan-profiles")
+    p = sub.add_parser("configure")
+    p.add_argument("preset")
     p = sub.add_parser("proto")
     p.add_argument("--check", action="store_true")
     p = sub.add_parser("clang-format")
@@ -606,6 +662,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     args = parser.parse_args(raw)
     match args.command:
+        case "conan-profiles":
+            cmd_conan_profiles()
+        case "configure":
+            cmd_configure(args.preset)
         case "proto":
             cmd_proto(args.check)
         case "clang-format":

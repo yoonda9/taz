@@ -6,7 +6,6 @@
 exclude: |
   (?x)^(
     daemon/third_party/|
-    daemon/CMake/cmake-conan/|
     daemon/generated/|
     c3/src/tazer/v1/|
     \.venv/

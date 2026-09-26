@@ -1,6 +1,7 @@
-# Partial Conan host profile for Linux. Composed after `default` and before the
-# provider's auto-detected CMake settings, so it only pins what the compiler
-# detection cannot: every dependency is built as a static library.
+# Partial Conan host profile for Linux, composed after a detected base profile
+# (`default`, or `clang` for the linux-clang-* presets; both created by
+# `just setup`). It pins only what detection cannot: every dependency is built
+# as a static library, and the C++ standard used for gtest.
 #
 # The fully static (musl) release build arrives in Step 13.
 [settings]

@@ -58,7 +58,6 @@ line-length = 88
 extend-exclude = [
     "c3/src/tazer/v1",        # generated protobuf code
     "daemon/third_party",
-    "daemon/CMake",
 ]
 
 [tool.ruff.lint]

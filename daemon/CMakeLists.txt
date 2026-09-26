@@ -34,11 +34,8 @@ set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # The daemon itself is pure C. GoogleTest is C++, so C++ is enabled only when
-# tests are built. This must precede the FIRST find_package() call of any kind
-# (the cmake-conan provider runs `conan install` there and derives the host
-# profile, including compiler.cppstd, from the languages and standards known
-# at that moment). Conan drops sub-settings when a later profile changes the
-# compiler, so the auto-detected profile is the only reliable place for cppstd.
+# tests are built. The C++ standard here must agree with compiler.cppstd in
+# the Conan profiles (daemon/profiles/*), which is what gtest is built with.
 if(TAZER_BUILD_TESTS)
     enable_language(CXX)
     set(CMAKE_CXX_STANDARD 17)
@@ -164,8 +161,9 @@ if(NOT TAZER_SANITIZER STREQUAL "none")
 endif()
 
 # ---------------------------------------------------------------------------
-# Dependencies (resolved by the cmake-conan provider; see the note above the
-# enable_language(CXX) block about ordering)
+# Dependencies (Conan-generated config packages; `just configure` runs
+# `conan install` before cmake and the preset's toolchain file adds the
+# generators folder to CMAKE_PREFIX_PATH)
 # ---------------------------------------------------------------------------
 find_package(libuv REQUIRED CONFIG)
 
