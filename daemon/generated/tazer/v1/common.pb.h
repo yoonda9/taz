@@ -11,8 +11,7 @@
 
 /* Enum definitions */
 /* RPC operation identifiers carried in the frame header (docs/api.md, Opcodes).
- Every assigned opcode is listed, including operations not implemented by the
- reference daemon in the first milestone. 0 is reserved and never used. */
+ 0 is reserved and never used. */
 typedef enum _tazer_v1_Opcode {
     tazer_v1_Opcode_OPCODE_UNSPECIFIED = 0,
     /* Daemon control */

@@ -1,9 +1,6 @@
 /**
  * @file main.c
  * @brief TAZER reference daemon entry point.
- *
- * Step 1 scaffold: proves that libuv and the nanopb-generated protocol
- * messages link into a single binary. The TCP server arrives in Step 3.
  */
 
 #include <stdio.h>

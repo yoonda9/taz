@@ -12,8 +12,7 @@ syntax = "proto3";
 package tazer.v1;
 
 // RPC operation identifiers carried in the frame header (docs/api.md, Opcodes).
-// Every assigned opcode is listed, including operations not implemented by the
-// reference daemon in the first milestone. 0 is reserved and never used.
+// 0 is reserved and never used.
 enum Opcode {
   OPCODE_UNSPECIFIED = 0;
 

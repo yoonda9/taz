@@ -1,9 +1,6 @@
 """Integration test fixtures.
 
-The daemon fixture (launch with ``--port 0``, read ``LISTENING port=<N>`` from
-stdout, yield a connected client) lands in Step 3 together with the TCP
-server. Until then, integration tests are skipped unless a daemon binary is
-supplied explicitly.
+Integration tests are skipped unless a daemon binary is supplied explicitly.
 """
 
 from __future__ import annotations
