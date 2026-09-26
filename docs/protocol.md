@@ -23,19 +23,19 @@ This document defines the wire protocol. Message payload schemas are defined sep
      TAZER protocol          TAZER protocol
            │                       │
 ┌──────────▼──────────┐  ┌────────▼────────────────┐
-│   Full OS Agent      │  │   Embedded Agent         │
+│   Full OS Daemon      │  │   Embedded Daemon         │
 │   libuv + full API   │  │   LWIP + API subset      │
 │   Linux/macOS/Win    │  │   RTOS / bare-metal      │
 └─────────────────────┘  └─────────────────────────┘
 ```
 
-The protocol is the portability layer. Agents on different platforms are separate implementations that share the same wire format and message schemas.
+The protocol is the portability layer. Daemons on different platforms are separate implementations that share the same wire format and message schemas.
 
 ## 3. Transport
 
 - **TCP** over IPv4 or IPv6
 - No TLS — TAZER operates in trusted test environments
-- The agent listens on a configurable port (default TBD)
+- The daemon listens on a configurable port (default TBD)
 - Connections are persistent — a client connects once and issues multiple requests over the same connection
 - Either side may close the connection at any time; the other side must handle this gracefully
 
@@ -67,13 +67,13 @@ Identifies the kind of message. Dispatch is an integer switch, not string matchi
 
 | Value | Name | Description |
 |---|---|---|
-| `0x01` | `REQUEST` | Client-to-agent RPC request |
-| `0x02` | `RESPONSE` | Agent-to-client RPC response |
+| `0x01` | `REQUEST` | Client-to-daemon RPC request |
+| `0x02` | `RESPONSE` | Daemon-to-client RPC response |
 | `0x03` | `FILE_CHUNK` | A chunk of file data (upload or download) |
 | `0x04` | `ERROR` | Error response |
 | `0x05` | `PING` | Keepalive / liveness probe |
 | `0x06` | `PONG` | Keepalive response |
-| `0x07` | `CAPABILITY` | Capability advertisement (sent by agent on connect) |
+| `0x07` | `CAPABILITY` | Capability advertisement (sent by daemon on connect) |
 | `0x08`–`0xFF` | Reserved | Available for future use |
 
 Streams (file transfers, Process Monitor, Interactive Shell) terminate by clearing the `CONTINUATION` flag on the final frame (see §4.3). There is no separate stream-end frame type.
@@ -107,7 +107,7 @@ Bit:  7  6  5  4  3  2  1  0
 
 Identifies the RPC operation, encoded as a **16-bit unsigned little-endian** integer.
 
-- Only meaningful on `REQUEST` frames — routes the payload to the correct handler on the agent.
+- Only meaningful on `REQUEST` frames — routes the payload to the correct handler on the daemon.
 - On `RESPONSE` and `ERROR` frames, senders MUST echo the opcode of the originating request (aids debugging and lets the client validate schema before parsing).
 - On `FILE_CHUNK`, `PING`, `PONG`, and `CAPABILITY` frames, `opcode` MUST be `0`.
 - The full set of assigned opcodes is defined in the `.proto` schema and mirrored in the `CAPABILITY` frame's `operations` list (see [api.md](api.md)).
@@ -132,7 +132,7 @@ Correlation identifier, encoded as a **32-bit unsigned little-endian** integer.
 - Assigned by the **client** on every `REQUEST` and MUST be unique per REQUEST within the connection's lifetime. A given `stream_id` never carries more than one REQUEST frame (wrapping at 2³² is acceptable for long-lived connections — collisions with completed streams are harmless as long as no frames for the old stream are still in flight).
 - One `stream_id` may carry many `RESPONSE`, `ERROR`, and `FILE_CHUNK` frames — this is how streamed responses (Process Monitor), chunked transfers (FILE_PUT / FILE_GET), and long-lived output streams (Interactive Shell stdout) work. The rule is REQUEST-side: one stream_id, one REQUEST.
 - Operations that carry multi-directional client input, like Interactive Shell, use a distinct fresh `stream_id` per client REQUEST and pass a `session_id` (equal to the opening REQUEST's `stream_id`) in the payload to associate them with the session.
-- Echoed by the agent on the matching `RESPONSE`, `ERROR`, and (for chunked or streaming operations) `FILE_CHUNK` frames.
+- Echoed by the daemon on the matching `RESPONSE`, `ERROR`, and (for chunked or streaming operations) `FILE_CHUNK` frames.
 - `PING`/`PONG` MAY use `stream_id = 0` (they are stateless keepalives).
 - `CAPABILITY` uses `stream_id = 0` (there is no originating request).
 - `ERROR` frames with the `PRIORITY` flag set use the `stream_id` of the originating background task if known; `stream_id = 0` denotes a connection-level error not tied to any specific request (see §10.2).
@@ -182,7 +182,7 @@ No parser. No state machine. No string scanning. Array indexing and bit shifts �
 
 Every message type defines a **maximum payload size** in the `.proto` schema options. This serves two purposes:
 
-1. **Static allocation** — embedded agents allocate fixed buffers at compile time
+1. **Static allocation** — embedded daemons allocate fixed buffers at compile time
 2. **Safety** — receivers reject oversized frames before reading the payload
 
 Recommended defaults:
@@ -203,19 +203,19 @@ The frame `length` field can encode payloads up to 4 GiB, but every receiver enf
 ### 7.1 Handshake
 
 ```
-Client                          Agent
+Client                          Daemon
   │                               │
   │──── TCP connect ─────────────▶│
   │                               │
-  │◀─── CAPABILITY frame ────────│  (agent advertises supported features)
+  │◀─── CAPABILITY frame ────────│  (daemon advertises supported features)
   │                               │
   │──── REQUEST / FILE_CHUNK ───▶│  (normal operation begins)
   │◀─── RESPONSE ────────────────│
   │         ...                   │
 ```
 
-1. Client opens a TCP connection to the agent
-2. Agent immediately sends a `CAPABILITY` frame listing its supported API operations, protocol version, and any negotiable parameters (compression, chunk sizes)
+1. Client opens a TCP connection to the daemon
+2. Daemon immediately sends a `CAPABILITY` frame listing its supported API operations, protocol version, and any negotiable parameters (compression, chunk sizes)
 3. Client may now send requests
 
 There is no client-side handshake message. The connection is ready for requests as soon as the client has received the capability frame.
@@ -232,13 +232,13 @@ Either side may close the TCP connection. The other side detects this as a read 
 
 Large files are transferred as a sequence of `FILE_CHUNK` frames. All frames in a single transfer share the `stream_id` of the originating `FILE_PUT` or `FILE_GET` request, so multiple transfers may be in flight concurrently on one connection without ambiguity.
 
-### 8.1 Upload (client → agent)
+### 8.1 Upload (client → daemon)
 
 ```
-Client                          Agent
+Client                          Daemon
   │                               │
   │──── REQUEST FILE_PUT ───────▶│   stream_id=S; metadata: path, size, perms
-  │◀─── RESPONSE ───────────────│   stream_id=S; agent ready
+  │◀─── RESPONSE ───────────────│   stream_id=S; daemon ready
   │                               │
   │──── FILE_CHUNK [CONT] ─────▶│   stream_id=S; first chunk
   │──── FILE_CHUNK [CONT] ─────▶│   stream_id=S; ...
@@ -247,10 +247,10 @@ Client                          Agent
   │◀─── RESPONSE ───────────────│   stream_id=S; bytes_written, checksum
 ```
 
-### 8.2 Download (agent → client)
+### 8.2 Download (daemon → client)
 
 ```
-Client                          Agent
+Client                          Daemon
   │                               │
   │──── REQUEST FILE_GET ───────▶│   stream_id=S; request: path
   │                               │
@@ -272,14 +272,14 @@ Client                          Agent
 
 The `CAPABILITY` frame payload is a protobuf message containing:
 
-- **Protocol version** — `major`/`minor`, for compatibility gating. Clients MUST refuse to speak to an agent with a different `major`; different `minor` is compatible.
-- **Supported opcodes** — list of RPC opcodes this agent implements (e.g., `[PING, VERSION, FILE_PUT, FILE_GET, COMMAND_EXEC, …]`). Values match the `opcode` field in the frame header (§4.4).
+- **Protocol version** — `major`/`minor`, for compatibility gating. Clients MUST refuse to speak to a daemon with a different `major`; different `minor` is compatible.
+- **Supported opcodes** — list of RPC opcodes this daemon implements (e.g., `[PING, VERSION, FILE_PUT, FILE_GET, COMMAND_EXEC, …]`). Values match the `opcode` field in the frame header (§4.4).
 - **Max payload sizes** — `map<uint32, uint32>` keyed by frame `type` byte (§4.2), giving per-type overrides for the defaults in §6. Keyed by integer, not string, so `FILE_CHUNK` (which has no protobuf schema name) can appear.
-- **Compression algorithms** — ordered list of algorithms this agent supports (e.g., `[NONE, LZ4]`). The client picks one from the list (or `NONE`) and MUST send its selection in a `CONFIGURATION_UPDATE` request under key `compression` before setting the `COMPRESSED` flag on any frame. Until a selection is made, `COMPRESSED` MUST NOT be set. Agents that advertise only `NONE` need not implement compression at all.
+- **Compression algorithms** — ordered list of algorithms this daemon supports (e.g., `[NONE, LZ4]`). The client picks one from the list (or `NONE`) and MUST send its selection in a `CONFIGURATION_UPDATE` request under key `compression` before setting the `COMPRESSED` flag on any frame. Until a selection is made, `COMPRESSED` MUST NOT be set. Daemons that advertise only `NONE` need not implement compression at all.
 
 Future extension: if per-frame algorithm selection is ever needed, it will be carried in currently-reserved flag bits or in an extended header — not by overloading `COMPRESSED`.
 
-This lets the client adapt to agents with different capability levels — a full Linux agent exposes the complete API, while an RTOS agent advertises only the subset it supports. The client can query capabilities programmatically and fail fast (with a clear `NOT_SUPPORTED` error) if it tries an unadvertised opcode, rather than sending a request and getting an opaque error.
+This lets the client adapt to daemons with different capability levels — a full Linux daemon exposes the complete API, while an RTOS daemon advertises only the subset it supports. The client can query capabilities programmatically and fail fast (with a clear `NOT_SUPPORTED` error) if it tries an unadvertised opcode, rather than sending a request and getting an opaque error.
 
 There is no client-side capability message. The connection is ready for requests as soon as the client has received and parsed the `CAPABILITY` frame.
 
@@ -287,7 +287,7 @@ There is no client-side capability message. The connection is ready for requests
 
 ### 10.1 Frame-Level Errors
 
-- **Oversized frame:** receiver reads the 12-byte header, sees `length` exceeds its maximum for that `type`, and (a) on a full-OS agent SHOULD send an `ERROR` frame with `INVALID_REQUEST` and then close the connection; (b) on a constrained agent MAY simply close the connection with no ERROR frame.
+- **Oversized frame:** receiver reads the 12-byte header, sees `length` exceeds its maximum for that `type`, and (a) on a full-OS daemon SHOULD send an `ERROR` frame with `INVALID_REQUEST` and then close the connection; (b) on a constrained daemon MAY simply close the connection with no ERROR frame.
 - **Unknown type:** receiver sends an `ERROR` frame with `NOT_SUPPORTED` and continues (forward compatibility).
 - **Unknown opcode:** receiver sends an `ERROR` frame with `NOT_SUPPORTED` echoing the request's `stream_id` and continues.
 - **Unknown flags:** receiver ignores unknown flag bits (forward compatibility).
@@ -318,7 +318,7 @@ This supports:
 - Pipelined requests (multiple in-flight requests on one connection)
 - Concurrent file transfers (each transfer's `FILE_CHUNK` frames carry the originating request's `stream_id`)
 - Detached-task errors arriving while a different request is in flight (§10.2)
-- Long-lived agent-to-client streams like Process Monitor and Interactive Shell stdout, where many RESPONSE frames flow on one `stream_id` originated by a single REQUEST
+- Long-lived daemon-to-client streams like Process Monitor and Interactive Shell stdout, where many RESPONSE frames flow on one `stream_id` originated by a single REQUEST
 
 For operations where the client also sends multiple messages over the life of a "session" (Interactive Shell stdin), each such REQUEST uses its **own fresh `stream_id`** and carries a `session_id` field in its payload — because the "one REQUEST per stream_id" rule is what keeps the receiver's routing table unambiguous. See [api.md §2.2](api.md#22-interactive-shell) for the shell's concrete mapping.
 
@@ -336,6 +336,6 @@ These are not part of the current protocol but the design explicitly does not pr
 
 - **Compression algorithms:** the `COMPRESSED` flag and capability negotiation are defined; specific algorithms beyond `NONE` (e.g., LZ4) may be added by advertising them in the `CAPABILITY` frame's `compression` list. Per-frame algorithm selection can be introduced later via currently-reserved flag bits.
 - **Multiplexing:** `stream_id` in the header already supports interleaved streams natively. No further additions needed unless per-stream flow control is introduced.
-- **Protocol version negotiation:** the current design has the client accept-or-reject the agent's advertised version. A future minor-version bump could add a client-side counter-offer (a `CLIENT_HELLO` frame after `CAPABILITY`), if downgrading proves useful. Not needed for v1.
+- **Protocol version negotiation:** the current design has the client accept-or-reject the daemon's advertised version. A future minor-version bump could add a client-side counter-offer (a `CLIENT_HELLO` frame after `CAPABILITY`), if downgrading proves useful. Not needed for v1.
 - **UDP transport:** the framing format is transport-agnostic; a UDP variant could use the same frames with an added sequence number for reordering.
 - **Encryption:** a TLS wrapper around the TCP connection would require no protocol changes.

@@ -6,12 +6,12 @@
 
 ## Overview
 
-The TAZER API is a set of RPC operations exposed by the agent over the [TAZER binary protocol](protocol.md).
+The TAZER API is a set of RPC operations exposed by the daemon over the [TAZER binary protocol](protocol.md).
 
-- Every operation has a stable **opcode** (see §Opcodes below). The opcode travels in the frame header (`protocol.md` §4.4), not in the payload. Dispatch on the agent is a single integer lookup — no envelope message to parse.
+- Every operation has a stable **opcode** (see §Opcodes below). The opcode travels in the frame header (`protocol.md` §4.4), not in the payload. Dispatch on the daemon is a single integer lookup — no envelope message to parse.
 - Requests and responses are serialized as Protocol Buffers. Each operation defines its own request and response message directly; there is no wrapper.
 - Correlation is by `stream_id` in the frame header (`protocol.md` §4.6). Response and error frames echo the client's `stream_id`, so response schemas do not carry a `request_id` field.
-- Not all agents implement every operation. On connection, the agent sends a `CAPABILITY` frame advertising which opcodes it supports. The client MUST check capabilities before calling an operation, or handle a `NOT_SUPPORTED` error gracefully.
+- Not all daemons implement every operation. On connection, the daemon sends a `CAPABILITY` frame advertising which opcodes it supports. The client MUST check capabilities before calling an operation, or handle a `NOT_SUPPORTED` error gracefully.
 
 ## Opcodes
 
@@ -63,9 +63,9 @@ Where the API refers to `checksum`, the algorithm is **CRC32C** (Castagnoli poly
 
 CRC32C is an integrity check, not an authentication check. If cryptographic verification is ever needed, it will be added as a separate optional field.
 
-## 1. Agent Control
+## 1. Daemon Control
 
-Operations for managing the agent itself.
+Operations for managing the daemon itself.
 
 ### 1.1 Ping
 
@@ -79,7 +79,7 @@ Liveness check. Uses the protocol-level `PING`/`PONG` frames (no protobuf payloa
 
 ### 1.2 Version
 
-Returns the agent's version, build info, and platform.
+Returns the daemon's version, build info, and platform.
 
 **Request (`VERSION`):**
 
@@ -97,7 +97,7 @@ Returns the agent's version, build info, and platform.
 
 ### 1.3 Capabilities
 
-Sent by the agent immediately on connection as a `CAPABILITY` frame (`stream_id = 0`). Not a request/response — the client receives it passively.
+Sent by the daemon immediately on connection as a `CAPABILITY` frame (`stream_id = 0`). Not a request/response — the client receives it passively.
 
 **Payload:**
 
@@ -105,7 +105,7 @@ Sent by the agent immediately on connection as a `CAPABILITY` frame (`stream_id 
 |---|---|---|
 | `protocol_major` | uint32 | Major protocol version. Client MUST refuse to speak if it disagrees. |
 | `protocol_minor` | uint32 | Minor protocol version. Different minor is compatible. |
-| `operations` | repeated uint32 | Opcodes this agent implements |
+| `operations` | repeated uint32 | Opcodes this daemon implements |
 | `max_payload_sizes` | map<uint32, uint32> | Per-frame-type payload maximums, keyed by the `type` byte (see `protocol.md` §4.2). Overrides the defaults in `protocol.md` §6. |
 | `compression` | repeated string | Supported compression algorithms in preferred order (e.g. `["NONE", "LZ4"]`) |
 
@@ -113,7 +113,7 @@ The client selects a compression algorithm by sending `CONFIGURATION_UPDATE` wit
 
 ### 1.4 Configuration Get
 
-Retrieve the agent's current configuration.
+Retrieve the daemon's current configuration.
 
 **Request (`CONFIGURATION_GET`):**
 
@@ -127,11 +127,11 @@ Retrieve the agent's current configuration.
 |---|---|---|
 | `config` | map<string, string> | Key-value configuration pairs |
 
-Values are strings; the agreed convention for structured values is dotted-path keys (e.g. `net.port = "5555"`, `log.level = "INFO"`). Boolean values use `"true"` / `"false"`; numbers are decimal strings. Agents SHOULD reject values they cannot parse.
+Values are strings; the agreed convention for structured values is dotted-path keys (e.g. `net.port = "5555"`, `log.level = "INFO"`). Boolean values use `"true"` / `"false"`; numbers are decimal strings. Daemons SHOULD reject values they cannot parse.
 
 ### 1.5 Configuration Update
 
-Modify the agent's configuration at runtime.
+Modify the daemon's configuration at runtime.
 
 **Request (`CONFIGURATION_UPDATE`):**
 
@@ -155,32 +155,32 @@ Modify the agent's configuration at runtime.
 
 ### 1.6 Restart
 
-Restart the agent process. The TCP connection will be dropped and the client must reconnect.
+Restart the daemon process. The TCP connection will be dropped and the client must reconnect.
 
 **Request (`RESTART`):**
 
 | Field | Type | Description |
 |---|---|---|
-| `delay_ms` | uint32 | Delay before restart. Minimum enforced value: `100` (agent clamps `0` up to `100` to ensure the response can flush). |
+| `delay_ms` | uint32 | Delay before restart. Minimum enforced value: `100` (daemon clamps `0` up to `100` to ensure the response can flush). |
 
 **Response:**
 
 | Field | Type | Description |
 |---|---|---|
-| `acknowledged` | bool | Agent accepted the restart request |
-| `effective_delay_ms` | uint32 | The actual delay the agent will use before restarting |
+| `acknowledged` | bool | Daemon accepted the restart request |
+| `effective_delay_ms` | uint32 | The actual delay the daemon will use before restarting |
 
-The agent MUST fully write the response (including a `shutdown(SHUT_WR)` and drain) before terminating the process. Clients should treat the TCP FIN that follows as the signal to reconnect.
+The daemon MUST fully write the response (including a `shutdown(SHUT_WR)` and drain) before terminating the process. Clients should treat the TCP FIN that follows as the signal to reconnect.
 
 ### 1.7 Update
 
-Replace the agent binary with a new version. The client uploads the new binary via `FILE_PUT` (§4.1) first — the checksum returned by `FILE_PUT` is authoritative — then issues this command to swap and restart.
+Replace the daemon binary with a new version. The client uploads the new binary via `FILE_PUT` (§4.1) first — the checksum returned by `FILE_PUT` is authoritative — then issues this command to swap and restart.
 
 **Request (`UPDATE`):**
 
 | Field | Type | Description |
 |---|---|---|
-| `binary_path` | string | Path to the uploaded binary on the agent's filesystem |
+| `binary_path` | string | Path to the uploaded binary on the daemon's filesystem |
 | `restart` | bool | Whether to restart immediately after update |
 
 **Response:**
@@ -205,7 +205,7 @@ Run a command on the host and return its output.
 | `command` | string | The command to execute |
 | `args` | repeated string | Arguments |
 | `env` | map<string, string> | Additional environment variables |
-| `working_dir` | string | Working directory (default: agent's cwd) |
+| `working_dir` | string | Working directory (default: daemon's cwd) |
 | `timeout_ms` | uint32 | Timeout in milliseconds (0 = fall back to the connection default from §5.2) |
 | `as_user` | string | Optional. Run as this user for this command only. If empty, uses the connection's current identity (see §5.1). |
 
@@ -222,9 +222,9 @@ Run a command on the host and return its output.
 
 Opens a bidirectional shell session. Requires a persistent connection.
 
-> **Note:** Interactive Shell is the one operation that is inherently bidirectional-streaming. Purely-synchronous clients MAY choose not to implement it; agents SHOULD NOT require it (see [requirements.md §4.1](requirements.md#41-reference-implementation)).
+> **Note:** Interactive Shell is the one operation that is inherently bidirectional-streaming. Purely-synchronous clients MAY choose not to implement it; daemons SHOULD NOT require it (see [requirements.md §4.1](requirements.md#41-reference-implementation)).
 
-The session is opened with `SHELL_OPEN`. That request's `stream_id` (call it `S`) is reserved for the agent's stdout/stderr stream: the agent sends `RESPONSE` frames on `S` with `CONTINUATION` set for the life of the session. The client sends stdin and close as ordinary discrete REQUESTs, each with its own unique `stream_id` and a `session_id = S` field in the payload to route it to the correct session. This preserves the protocol rule that a `stream_id` is never reused across REQUEST frames.
+The session is opened with `SHELL_OPEN`. That request's `stream_id` (call it `S`) is reserved for the daemon's stdout/stderr stream: the daemon sends `RESPONSE` frames on `S` with `CONTINUATION` set for the life of the session. The client sends stdin and close as ordinary discrete REQUESTs, each with its own unique `stream_id` and a `session_id = S` field in the payload to route it to the correct session. This preserves the protocol rule that a `stream_id` is never reused across REQUEST frames.
 
 **Request (`SHELL_OPEN`):**
 
@@ -241,7 +241,7 @@ The session is opened with `SHELL_OPEN`. That request's `stream_id` (call it `S`
 | `session_id` | uint32 | The session ID (equals `S`; returned explicitly so clients can treat it as an opaque handle) |
 | `pty` | bool | Whether a PTY was allocated |
 
-**Agent stdout/stderr — subsequent RESPONSE frames on `S`, `CONTINUATION` set:**
+**Daemon stdout/stderr — subsequent RESPONSE frames on `S`, `CONTINUATION` set:**
 
 | Field | Type | Description |
 |---|---|---|
@@ -249,7 +249,7 @@ The session is opened with `SHELL_OPEN`. That request's `stream_id` (call it `S`
 | `stderr` | bytes | Stderr bytes (may be empty) |
 | `exit_code` | int32 | Shell exit code (set only on the final frame) |
 
-When the shell exits (or `SHELL_CLOSE` is honored), the agent sends one final RESPONSE frame on `S` with `CONTINUATION` cleared and `exit_code` set.
+When the shell exits (or `SHELL_CLOSE` is honored), the daemon sends one final RESPONSE frame on `S` with `CONTINUATION` cleared and `exit_code` set.
 
 **Request (`SHELL_INPUT`) — one REQUEST per input burst, each with a fresh unique `stream_id`:**
 
@@ -343,7 +343,7 @@ Detailed information about a specific process.
 
 ### 3.4 Process Monitor
 
-Subscribe to ongoing status updates for an OS process. The agent sends periodic `RESPONSE` frames with `CONTINUATION` set until the process exits or the client cancels via `CANCEL` (§5.7).
+Subscribe to ongoing status updates for an OS process. The daemon sends periodic `RESPONSE` frames with `CONTINUATION` set until the process exits or the client cancels via `CANCEL` (§5.7).
 
 **Request (`PROCESS_MONITOR`):**
 
@@ -369,13 +369,13 @@ All file transfers use the chunked `FILE_CHUNK` frame mechanism described in [Pr
 
 ### 4.1 Put File
 
-Transfer a file from client to agent.
+Transfer a file from client to daemon.
 
 **Request (`FILE_PUT`):**
 
 | Field | Type | Description |
 |---|---|---|
-| `dest` | string | Destination path on the agent |
+| `dest` | string | Destination path on the daemon |
 | `size` | uint64 | Total file size in bytes |
 | `permissions` | uint32 | File permissions (POSIX mode bits) |
 | `overwrite` | bool | Whether to overwrite an existing file |
@@ -393,7 +393,7 @@ message FilePutResponse {
     Confirmation confirm = 2;   // sent after the final FILE_CHUNK
   }
   message Ack {
-    bool ready = 1;             // agent is ready to receive chunks
+    bool ready = 1;             // daemon is ready to receive chunks
   }
   message Confirmation {
     uint64 bytes_written = 1;
@@ -406,13 +406,13 @@ Client receives the two RESPONSEs in order and dispatches on the `phase` discrim
 
 ### 4.2 Get File
 
-Transfer a file from agent to client.
+Transfer a file from daemon to client.
 
 **Request (`FILE_GET`):**
 
 | Field | Type | Description |
 |---|---|---|
-| `src` | string | Source path on the agent |
+| `src` | string | Source path on the daemon |
 
 **Response (metadata):**
 
@@ -444,7 +444,7 @@ Create an empty file or a file with inline content (for small files that don't w
 
 ### 4.4 Delete File
 
-Remove a file from the agent's filesystem.
+Remove a file from the daemon's filesystem.
 
 **Request (`FILE_DELETE`):**
 
@@ -569,7 +569,7 @@ Per-request `as_user` on `COMMAND_EXEC` and `SHELL_OPEN` overrides this for a si
 
 | Field | Type | Description |
 |---|---|---|
-| `user` | string | Username to assume. Empty string resets to the agent's original identity. |
+| `user` | string | Username to assume. Empty string resets to the daemon's original identity. |
 
 **Response:**
 
@@ -596,7 +596,7 @@ Set the default timeout for operations on this connection. Per-operation `timeou
 
 ### 5.3 Log
 
-Retrieve agent log entries.
+Retrieve daemon log entries.
 
 **Request (`LOG`):**
 
@@ -622,7 +622,7 @@ Retrieve agent log entries.
 
 ### 5.4 Detach
 
-Execute a task in the background. The agent runs it asynchronously and the client can optionally monitor it (via `TASK_STATUS`) or set an error priority for cross-task escalation.
+Execute a task in the background. The daemon runs it asynchronously and the client can optionally monitor it (via `TASK_STATUS`) or set an error priority for cross-task escalation.
 
 The detached task is a full operation, not just a shell command — any of `COMMAND_EXEC`, `PIPELINE`, `FILE_PUT`, or `FILE_GET` may be detached. The task's request body is passed inline.
 
@@ -631,7 +631,7 @@ The detached task is a full operation, not just a shell command — any of `COMM
 | Field | Type | Description |
 |---|---|---|
 | `task` | oneof Task | The operation to run in the background (see below) |
-| `monitor` | bool | Whether the agent should retain status for later polling via `TASK_STATUS` |
+| `monitor` | bool | Whether the daemon should retain status for later polling via `TASK_STATUS` |
 | `error_priority` | ErrorPriority | `NONE` or `CRITICAL` (enum) |
 
 **Task (oneof):**
@@ -650,7 +650,7 @@ The detached task is a full operation, not just a shell command — any of `COMM
 | `task_id` | uint32 | Identifier for the detached task, valid for the connection's lifetime |
 | `pid` | uint32 | Underlying OS process ID, if applicable (e.g. for `exec`); `0` otherwise |
 
-`error_priority = CRITICAL` means: if the task fails, the agent sends an `ERROR` frame with the `PRIORITY` flag set (see `protocol.md` §10.2), using this task's `stream_id` (the same value the client sent as `stream_id` on the `DETACH` request).
+`error_priority = CRITICAL` means: if the task fails, the daemon sends an `ERROR` frame with the `PRIORITY` flag set (see `protocol.md` §10.2), using this task's `stream_id` (the same value the client sent as `stream_id` on the `DETACH` request).
 
 Only two priorities exist on the wire: `NONE` and `CRITICAL`, matching the single `PRIORITY` flag bit.
 
@@ -663,7 +663,7 @@ Query the status of a detached task by `task_id`, or subscribe to periodic statu
 | Field | Type | Description |
 |---|---|---|
 | `task_id` | uint32 | Task to query |
-| `subscribe` | bool | If true, agent streams updates (with `CONTINUATION` set) until the task ends or the client cancels via `CANCEL` |
+| `subscribe` | bool | If true, daemon streams updates (with `CONTINUATION` set) until the task ends or the client cancels via `CANCEL` |
 | `interval_ms` | uint32 | Update interval when `subscribe` is true |
 
 **Response (single or streamed):**
@@ -725,10 +725,10 @@ All `ERROR` frames carry a protobuf payload with a code, message, and optional d
 | `2` | `PERMISSION_DENIED` | Insufficient permissions |
 | `3` | `ALREADY_EXISTS` | File or resource already exists |
 | `4` | `TIMEOUT` | Operation timed out |
-| `5` | `NOT_SUPPORTED` | Operation not supported by this agent |
+| `5` | `NOT_SUPPORTED` | Operation not supported by this daemon |
 | `6` | `INVALID_REQUEST` | Malformed or invalid request |
-| `7` | `INTERNAL` | Agent internal error |
-| `8` | `BUSY` | Agent is too busy to accept the request |
+| `7` | `INTERNAL` | Daemon internal error |
+| `8` | `BUSY` | Daemon is too busy to accept the request |
 | `9` | `CANCELLED` | Operation was cancelled |
 | `10` | `CONNECTION_LOST` | Downstream connection was lost |
 
@@ -744,7 +744,7 @@ All `ERROR` frames carry a protobuf payload with a code, message, and optional d
 
 ### 7.1 Synchronous (default)
 
-The client sends a `REQUEST`, the agent processes it, and sends a `RESPONSE`. The client blocks until the response arrives. All operations except Interactive Shell (§2.2) are exercisable with purely synchronous code — see [requirements.md §4.1](requirements.md#41-reference-implementation).
+The client sends a `REQUEST`, the daemon processes it, and sends a `RESPONSE`. The client blocks until the response arrives. All operations except Interactive Shell (§2.2) are exercisable with purely synchronous code — see [requirements.md §4.1](requirements.md#41-reference-implementation).
 
 ### 7.2 Detached Tasks
 
@@ -778,7 +778,7 @@ A chain of operations where each takes the output of the previous as input. Exec
 | Value | Meaning | Allowed when previous → current is |
 |---|---|---|
 | `NONE` | Step ignores previous output | any |
-| `STDIN` | Previous step's `stdout` (bytes, scalar) becomes this step's stdin (via a pipe on the agent) | `COMMAND_EXEC` → `COMMAND_EXEC` |
+| `STDIN` | Previous step's `stdout` (bytes, scalar) becomes this step's stdin (via a pipe on the daemon) | `COMMAND_EXEC` → `COMMAND_EXEC` |
 | `PATH` | Previous step's output file path (string, scalar) becomes this step's `path`/`src`/`dest` field | `FILE_*` → `FILE_*` |
 | `PID` | Previous step's scalar `pid` (uint32) becomes this step's `pid` field | `COMMAND_EXEC` → `PROCESS_*` |
 | `BYTES` | Previous step's response bytes (scalar) are placed in this step's `content` field | `FILE_GET` → `FILE_CREATE`, etc. |
@@ -790,7 +790,7 @@ Explicitly disallowed:
 
 All bindings are validated statically at pipeline submission time and rejected with `INVALID_REQUEST` before any step runs. This keeps pipelines simple to implement (no runtime type conversion, no expression evaluator, no fan-out) and simple to debug.
 
-`FILE_PUT` and `FILE_GET` in pipelines: the file bytes are held on the agent's side between steps as a temporary file; the pipeline does not stream `FILE_CHUNK` frames to the client. Use `DETACH` if you need a background file transfer, not a pipeline.
+`FILE_PUT` and `FILE_GET` in pipelines: the file bytes are held on the daemon's side between steps as a temporary file; the pipeline does not stream `FILE_CHUNK` frames to the client. Use `DETACH` if you need a background file transfer, not a pipeline.
 
 **Response:**
 

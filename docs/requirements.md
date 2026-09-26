@@ -4,13 +4,13 @@
 
 ## 1. Purpose
 
-TAZER is a test orchestration tool whose primary purpose is to facilitate tests running on remote hosts. It covers all three stages of a test run:
+TAZER is a remote test daemon whose primary purpose is to facilitate tests running on remote hosts. It covers all three stages of a test run:
 
 - **Before:** Prepare the host for the test
 - **During:** Monitor the host and processes
 - **After:** Validate the state of the host
 
-TAZER is defined as a **protocol and API specification** such that both the agent and client can be implemented in any language.
+TAZER is defined as a **protocol and API specification** such that both the daemon and client can be implemented in any language.
 
 ## 2. Guiding Principles
 
@@ -19,7 +19,7 @@ TAZER is defined as a **protocol and API specification** such that both the agen
 3. **No security mechanisms** — TAZER operates in trusted test environments. Authentication, encryption, and authorization are out of scope.
 4. **Schema-first** — The protocol is the contract. Implementations are interchangeable as long as they speak the protocol correctly.
 
-## 3. Agent Requirements
+## 3. Daemon Requirements
 
 ### 3.1 Reference Implementation
 
@@ -33,8 +33,8 @@ TAZER is defined as a **protocol and API specification** such that both the agen
 ### 3.2 Portability
 
 - The protocol must be feasible to implement on RTOS and bare-metal targets (FreeRTOS, Zephyr, bare ARM Cortex-M, etc.) as a **separate implementation** sharing the same protocol
-- RTOS/embedded agents implement a **subset** of the API surface appropriate to the target's capabilities
-- A **capability handshake** at connection time advertises what the agent supports, so the client adapts dynamically
+- RTOS/embedded daemons implement a **subset** of the API surface appropriate to the target's capabilities
+- A **capability handshake** at connection time advertises what the daemon supports, so the client adapts dynamically
 
 ### 3.3 Licensing
 
@@ -47,29 +47,29 @@ All dependencies must use **permissive licenses** (MIT, BSD, Apache-2.0, or equi
 - Written in **Python** (≥ 3.12)
 - No concurrency requirement — all functionality except Interactive Shell must be exercisable with purely synchronous code
 - Concurrency is an optional enhancement, never a prerequisite
-- **Exception:** Interactive Shell (`SHELL_OPEN`/`SHELL_INPUT`/`SHELL_CLOSE`) is inherently bidirectional-streaming and cannot be exercised synchronously. It is an optional capability — the reference client MAY implement it under a concurrent submodule, and agents MAY omit it. All other operations exposed by an agent MUST be usable from a purely synchronous client.
+- **Exception:** Interactive Shell (`SHELL_OPEN`/`SHELL_INPUT`/`SHELL_CLOSE`) is inherently bidirectional-streaming and cannot be exercised synchronously. It is an optional capability — the reference client MAY implement it under a concurrent submodule, and daemons MAY omit it. All other operations exposed by a daemon MUST be usable from a purely synchronous client.
 
 ### 4.2 Error Handling
 
-- A failure in a detached/background task on the agent can propagate to the client's current synchronous call
+- A failure in a detached/background task on the daemon can propagate to the client's current synchronous call
 - Tasks with elevated error priority can interrupt unrelated in-flight responses (cross-task error escalation)
 - On the wire, error priority is a single bit (`CRITICAL` vs `NONE`); intermediate priorities are not representable
 
 ## 5. API Surface
 
-The agent exposes the following functionality. RTOS agents may implement a subset, declared via capability handshake.
+The daemon exposes the following functionality. RTOS daemons may implement a subset, declared via capability handshake.
 
-### 5.1 Agent Control
+### 5.1 Daemon Control
 
 | Operation | Description |
 |---|---|
 | Ping | Liveness check |
-| Version | Agent version and build info |
-| Capabilities | What this agent supports (returned at connection time) |
-| Configuration Get | Read agent configuration |
-| Configuration Update | Modify agent configuration |
-| Restart | Restart the agent process |
-| Update | Update the agent binary |
+| Version | Daemon version and build info |
+| Capabilities | What this daemon supports (returned at connection time) |
+| Configuration Get | Read daemon configuration |
+| Configuration Update | Modify daemon configuration |
+| Restart | Restart the daemon process |
+| Update | Update the daemon binary |
 
 ### 5.2 Command Execution
 
@@ -91,8 +91,8 @@ The agent exposes the following functionality. RTOS agents may implement a subse
 
 | Operation | Description |
 |---|---|
-| Put File | Transfer file from client to agent (upload) |
-| Get File | Transfer file from agent to client (download) |
+| Put File | Transfer file from client to daemon (upload) |
+| Get File | Transfer file from daemon to client (download) |
 | Create File | Create an empty file or file with content |
 | Delete File | Remove a file |
 | Stat File | File or directory metadata (size, permissions, timestamps, kind) |
@@ -111,7 +111,7 @@ File integrity is verified with CRC32C checksums returned in the transfer metada
 |---|---|
 | Run As | Execute subsequent operations as a different user |
 | Timeout | Set/get operation timeout |
-| Log | Retrieve agent logs |
+| Log | Retrieve daemon logs |
 | Detach | Fire-and-forget task execution with optional monitoring |
 
 ## 6. Tasking Model
@@ -122,7 +122,7 @@ Client sends a request, blocks until the response arrives.
 
 ### 6.2 Detached Tasks
 
-Client marks a task as detached. The agent runs it in the background. The client receives a `task_id` and can poll for status, cancel it, or register for error escalation. Any operation (command, file transfer, or pipeline) may be detached — not just command execution.
+Client marks a task as detached. The daemon runs it in the background. The client receives a `task_id` and can poll for status, cancel it, or register for error escalation. Any operation (command, file transfer, or pipeline) may be detached — not just command execution.
 
 ### 6.3 Error Priority
 
@@ -134,7 +134,7 @@ Streaming operations (Process Monitor, subscribed Task Status, Interactive Shell
 
 ### 6.5 Task Pipelines
 
-A chain of tasks where each takes the output of the previous as input, subject to a closed set of typed bindings (stdin, path, pid, bytes). No runtime expression language. The agent executes the full pipeline, reporting back only on error or successful completion of all tasks. Reduces client-agent round trips.
+A chain of tasks where each takes the output of the previous as input, subject to a closed set of typed bindings (stdin, path, pid, bytes). No runtime expression language. The daemon executes the full pipeline, reporting back only on error or successful completion of all tasks. Reduces client-daemon round trips.
 
 ## 7. Communication
 
@@ -170,7 +170,7 @@ The following are explicitly **out of scope**:
 
 - Authentication and authorization
 - Encryption (TLS/DTLS)
-- Agent discovery or registration protocols
-- Multi-agent orchestration (one client talks to one agent)
+- Daemon discovery or registration protocols
+- Multi-daemon orchestration (one client talks to one daemon)
 - Web browser interface
 - Backwards compatibility with any prior TAZER version (pre-1.0)

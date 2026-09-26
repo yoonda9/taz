@@ -1,6 +1,6 @@
-# TAZER the Test Agent RAT (Test Orchestration Tool)
+# TAZER — Test Daemon for Remote Hosts
 
-TAZER is a RAT (Test Orchestration Tool) whose primary purpose is to facilitate tests running on remote hosts.
+TAZER is a remote test daemon whose primary purpose is to facilitate tests running on remote hosts.
 
 It can be used for all three stages of a test run on a host:
 
