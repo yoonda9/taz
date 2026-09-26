@@ -1,6 +1,6 @@
-# rpc — TAZER protocol schemas
+# rpc — TAZ protocol schemas
 
-Protocol Buffers schemas for every TAZER message. These files are the
+Protocol Buffers schemas for every TAZ message. These files are the
 contract: any daemon or client implementation, in any language, is built from
 them. The wire framing around these payloads is defined in
 [`docs/protocol.md`](../docs/protocol.md); field semantics are in
@@ -9,7 +9,7 @@ them. The wire framing around these payloads is defined in
 ```
 rpc/
 ├── buf.yaml                  # buf lint / breaking-change config (module root)
-└── tazer/v1/
+└── taz/v1/
     ├── common.proto          # Opcode, FrameType, FrameFlag, ErrorCode, ErrorInfo, KeyValue, ...
     ├── daemon_control.proto  # Version, Capability, Configuration, Restart
     ├── command.proto         # CommandExec
@@ -21,7 +21,7 @@ rpc/
 
 ## Conventions
 
-- Package `tazer.v1`; one file per API group.
+- Package `taz.v1`; one file per API group.
 - Maps are modeled as `repeated KeyValue` / `repeated UInt32Pair`, which is
   wire-identical to protobuf `map<>` and keeps the schemas usable from nanopb.
 - The `.proto` files carry no nanopb annotations. Size limits for the C
@@ -32,10 +32,10 @@ rpc/
 
 Both generated outputs are checked in and regenerated with `just proto`:
 
-| Target        | Output                                       | Generator                                                       |
-| ------------- | -------------------------------------------- | --------------------------------------------------------------- |
-| Python client | `c3/src/tazer/v1/*_pb2.py`, `*_pb2.pyi`      | `protoc` from `grpcio-tools`                                    |
-| C daemon      | `daemon/generated/tazer/v1/*.pb.c`, `*.pb.h` | nanopb generator from the `daemon/third_party/nanopb` submodule |
+| Target        | Output                                     | Generator                                                       |
+| ------------- | ------------------------------------------ | --------------------------------------------------------------- |
+| Python client | `c3/src/taz/v1/*_pb2.py`, `*_pb2.pyi`      | `protoc` from `grpcio-tools`                                    |
+| C daemon      | `daemon/generated/taz/v1/*.pb.c`, `*.pb.h` | nanopb generator from the `daemon/third_party/nanopb` submodule |
 
 CI runs `just proto-check` and fails if regeneration produces a diff.
 

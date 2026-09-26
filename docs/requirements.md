@@ -1,22 +1,22 @@
-# TAZER Requirements
+# TAZ Requirements
 
 > Living document. Last updated: 2026-09-25
 
 ## 1. Purpose
 
-TAZER is a remote test daemon whose primary purpose is to facilitate tests running on remote hosts. It covers all three stages of a test run:
+TAZ (Test Agent Zero) is a remote test daemon whose primary purpose is to facilitate tests running on remote hosts. It covers all three stages of a test run:
 
 - **Before:** Prepare the host for the test
 - **During:** Monitor the host and processes
 - **After:** Validate the state of the host
 
-TAZER is defined as a **protocol and API specification** such that both the daemon and client can be implemented in any language.
+TAZ is defined as a **protocol and API specification** such that both the daemon and client can be implemented in any language.
 
 ## 2. Guiding Principles
 
 1. **Simplicity** — Fewer moving parts over maximum flexibility. The protocol and implementations should be straightforward to understand, implement, and debug.
 2. **Portability** — The protocol must be implementable on full-OS platforms (Linux, macOS, Windows) and have a clear path to constrained environments (RTOS, bare-metal).
-3. **No security mechanisms** — TAZER operates in trusted test environments. Authentication, encryption, and authorization are out of scope.
+3. **No security mechanisms** — TAZ operates in trusted test environments. Authentication, encryption, and authorization are out of scope.
 4. **Schema-first** — The protocol is the contract. Implementations are interchangeable as long as they speak the protocol correctly.
 
 ## 3. Daemon Requirements
@@ -173,4 +173,4 @@ The following are explicitly **out of scope**:
 - Daemon discovery or registration protocols
 - Multi-daemon orchestration (one client talks to one daemon)
 - Web browser interface
-- Backwards compatibility with any prior TAZER version (pre-1.0)
+- Backwards compatibility with any prior TAZ version (pre-1.0)

@@ -1,10 +1,10 @@
-# TAZER Protocol Design
+# TAZ Protocol Design
 
 > Living document. Last updated: 2026-09-26
 
 ## 1. Overview
 
-TAZER uses a custom binary framing protocol over TCP. The protocol is designed to be:
+TAZ uses a custom binary framing protocol over TCP. The protocol is designed to be:
 
 - **Simple** — a fixed 12-byte header, no string parsing, no state machines
 - **Embeddable** — implementable with static buffers and no heap allocation
@@ -17,10 +17,10 @@ This document defines the wire protocol. Message payload schemas are defined sep
 ```
 ┌──────────────────────────────────────────────────┐
 │              Python Client (c3)                   │
-│         speaks TAZER protocol                     │
+│         speaks TAZ protocol                     │
 └──────────┬───────────────────────┬───────────────┘
            │                       │
-     TAZER protocol          TAZER protocol
+     TAZ protocol          TAZ protocol
            │                       │
 ┌──────────▼──────────┐  ┌────────▼────────────────┐
 │   Full OS Daemon      │  │   Embedded Daemon         │
@@ -34,7 +34,7 @@ The protocol is the portability layer. Daemons on different platforms are separa
 ## 3. Transport
 
 - **TCP** over IPv4 or IPv6
-- No TLS — TAZER operates in trusted test environments
+- No TLS — TAZ operates in trusted test environments
 - The daemon listens on a configurable port (default TBD)
 - Connections are persistent — a client connects once and issues multiple requests over the same connection
 - Either side may close the connection at any time; the other side must handle this gracefully

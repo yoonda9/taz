@@ -1,10 +1,10 @@
-# uv workspace root. The installable client package lives in ./c3 (project
-# name "tazer"). This root is a virtual project that holds the shared dev
-# tooling and the integration test suite in ./tests.
+# uv workspace root. The installable client package lives in ./c3 (distribution
+# "test-agent-zero", import name "taz"). This root is a virtual project that
+# holds the shared dev tooling and the integration test suite in ./tests.
 [project]
-name = "tazer-workspace"
+name = "taz-workspace"
 version = "0.0.0"
-description = "Workspace root for TAZER (daemon, client, protocol)"
+description = "Workspace root for TAZ (daemon, client, protocol)"
 requires-python = ">=3.12"
 dependencies = []
 
@@ -15,11 +15,11 @@ package = false
 members = ["c3"]
 
 [tool.uv.sources]
-tazer = { workspace = true }
+test-agent-zero = { workspace = true }
 
 [dependency-groups]
 dev = [
-    "tazer",
+    "test-agent-zero",
     "pytest>=9.0.3",
     "ruff>=0.16.9",
     "mypy>=2.3.1",
@@ -47,7 +47,7 @@ addopts = "-ra --import-mode=importlib"
 # ---------------------------------------------------------------------------
 [tool.coverage.run]
 branch = true
-omit = ["*/tazer/v1/*"] # generated protobuf modules
+omit = ["*/taz/v1/*"] # generated protobuf modules
 
 # ---------------------------------------------------------------------------
 # ruff (formatter + linter)
@@ -56,7 +56,7 @@ omit = ["*/tazer/v1/*"] # generated protobuf modules
 target-version = "py312"
 line-length = 88
 extend-exclude = [
-    "c3/src/tazer/v1",        # generated protobuf code
+    "c3/src/taz/v1",        # generated protobuf code
     "daemon/third_party",
 ]
 
@@ -78,10 +78,10 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "A", "SIM", "S", "RUF"]
 python_version = "3.12"
 strict = true
 files = ["c3/src", "c3/tests", "tests", "tools"]
-exclude = ["c3/src/tazer/v1/"]
+exclude = ["c3/src/taz/v1/"]
 
 [[tool.mypy.overrides]]
-module = ["tazer.v1.*"]
+module = ["taz.v1.*"]
 # protoc's generated .pyi stubs use bare `Mapping`; use them for typing our
 # code but do not hold generated files to --strict.
 follow_imports = "silent"

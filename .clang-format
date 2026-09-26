@@ -1,4 +1,4 @@
-# C/C++ formatting for the TAZER daemon, aligned with the Barr Group Embedded C
+# C/C++ formatting for the TAZ daemon, aligned with the Barr Group Embedded C
 # Coding Standard: braces on their own line, 4-space indent, 80 columns,
 # pointer star bound to the name. Applies to daemon/src, daemon/include and
 # daemon/tests; generated and third-party code is excluded by `just fmt-c`.

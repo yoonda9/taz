@@ -8,7 +8,7 @@ lint:
     # ErrorCode numbering is specified by docs/api.md with UNKNOWN = 0, and
     # FrameFlag uses NONE = 0 because its values are bit masks.
     ENUM_ZERO_VALUE_SUFFIX:
-      - tazer/v1/common.proto
+      - taz/v1/common.proto
 breaking:
   use:
     - FILE

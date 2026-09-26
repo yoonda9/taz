@@ -1,6 +1,6 @@
 """Smoke tests for the generated protobuf modules (no daemon required)."""
 
-from tazer.v1 import advanced_pb2, command_pb2, common_pb2, daemon_control_pb2
+from taz.v1 import advanced_pb2, command_pb2, common_pb2, daemon_control_pb2
 
 
 def test_opcode_values_match_specification() -> None:

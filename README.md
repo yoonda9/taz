@@ -1,6 +1,6 @@
-# TAZER — Test Daemon for Remote Hosts
+# Test Agent Zero — TAZ, the Tasmanian daemonfish
 
-TAZER is a remote test daemon whose primary purpose is to facilitate tests running on remote hosts.
+TAZ is a remote test daemon whose primary purpose is to facilitate tests running on remote hosts.
 
 It can be used for all three stages of a test run on a host:
 
@@ -8,7 +8,7 @@ It can be used for all three stages of a test run on a host:
 - During the test : Monitor the host and processes on the host
 - After the test : Validate the state of the host
 
-TAZER is defined as a protocol and API first; this repository holds the
+TAZ is defined as a protocol and API first; this repository holds the
 specification and the reference implementations.
 
 | Directory | Contents                                                              |
@@ -16,7 +16,7 @@ specification and the reference implementations.
 | `docs/`   | Requirements, wire protocol, and API specification                    |
 | `rpc/`    | Protocol Buffers schemas (the contract) and nanopb size limits        |
 | `daemon/` | Reference daemon in C (libuv + nanopb), CMake + Conan build           |
-| `c3/`     | Reference client in Python (`tazer` package)                          |
+| `c3/`     | Reference client in Python (`import taz`, PyPI `test-agent-zero`)     |
 | `tests/`  | Integration tests that launch the daemon and drive it with the client |
 | `tools/`  | Cross-platform helpers behind the `just` recipes                      |
 
@@ -45,6 +45,9 @@ just --list      # everything else
 `just lint` is exactly what CI and the pre-push hook run, so a red CI job
 reproduces locally with the command shown in its log.
 
+The build produces the daemon binary `tazd`; the Python package installs the
+`taz` client CLI.
+
 ### Requirements not managed by mise
 
 - A C compiler: GCC or Clang on Linux; on Windows, Visual Studio Build Tools
@@ -64,7 +67,7 @@ and push again.
 ## Layout of the generated code
 
 Both protobuf outputs are checked in and regenerated with `just proto`:
-Python to `c3/src/tazer/v1/`, C (nanopb) to `daemon/generated/`. CI fails if
+Python to `c3/src/taz/v1/`, C (nanopb) to `daemon/generated/`. CI fails if
 regeneration would produce a diff. See [`rpc/README.md`](rpc/README.md).
 
 ## Planning artifacts

@@ -1,32 +1,32 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(
-    tazer
+    taz
     VERSION 0.1.0
-    DESCRIPTION "TAZER reference daemon"
+    DESCRIPTION "TAZ reference daemon"
     LANGUAGES C)
 
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
-option(TAZER_BUILD_TESTS
-       "Build the daemon unit tests (requires a C++ compiler)" ON)
-option(TAZER_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(TAZ_BUILD_TESTS "Build the daemon unit tests (requires a C++ compiler)"
+       ON)
+option(TAZ_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 # Selected by the linux-asan / linux-tsan / windows-asan presets. Instruments
 # every target built by this project (daemon, generated protos, nanopb runtime,
 # tests); Conan-built dependencies are not instrumented. "address" means
 # ASan+UBSan with GCC/Clang and ASan alone with MSVC (which has no UBSan or
 # TSan).
-set(TAZER_SANITIZER
+set(TAZ_SANITIZER
     "none"
     CACHE STRING "Sanitizer: none, address (ASan[+UBSan]) or thread (TSan)")
-set_property(CACHE TAZER_SANITIZER PROPERTY STRINGS none address thread)
+set_property(CACHE TAZ_SANITIZER PROPERTY STRINGS none address thread)
 # Selected by the linux-analyze / windows-analyze presets: the compiler's own
 # static analyzer (GCC -fanalyzer, MSVC /analyze) on first-party code, with
-# findings promoted to errors by TAZER_WARNINGS_AS_ERRORS.
-option(TAZER_STATIC_ANALYSIS "Enable the compiler's static analyzer" OFF)
+# findings promoted to errors by TAZ_WARNINGS_AS_ERRORS.
+option(TAZ_STATIC_ANALYSIS "Enable the compiler's static analyzer" OFF)
 # Selected by the linux-coverage preset (GCC/Clang gcov instrumentation).
-option(TAZER_COVERAGE "Instrument first-party code for coverage" OFF)
+option(TAZ_COVERAGE "Instrument first-party code for coverage" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -36,7 +36,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # The daemon itself is pure C. GoogleTest is C++, so C++ is enabled only when
 # tests are built. The C++ standard here must agree with compiler.cppstd in
 # the Conan profiles (daemon/profiles/*), which is what gtest is built with.
-if(TAZER_BUILD_TESTS)
+if(TAZ_BUILD_TESTS)
     enable_language(CXX)
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,31 +50,31 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # Build identifier (short git hash, "unknown" outside a checkout)
 # ---------------------------------------------------------------------------
 find_package(Git QUIET)
-set(TAZER_BUILD_ID "unknown")
+set(TAZ_BUILD_ID "unknown")
 if(GIT_FOUND)
     execute_process(
         COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        OUTPUT_VARIABLE _tazer_git_hash
+        OUTPUT_VARIABLE _taz_git_hash
         OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    if(_tazer_git_hash)
-        set(TAZER_BUILD_ID "${_tazer_git_hash}")
+    if(_taz_git_hash)
+        set(TAZ_BUILD_ID "${_taz_git_hash}")
     endif()
 endif()
 
 # ---------------------------------------------------------------------------
 # Warning flags shared by all first-party targets
 # ---------------------------------------------------------------------------
-add_library(tazer_warnings INTERFACE)
+add_library(taz_warnings INTERFACE)
 if(MSVC)
-    target_compile_options(tazer_warnings INTERFACE /W4 /permissive-)
-    if(TAZER_WARNINGS_AS_ERRORS)
-        target_compile_options(tazer_warnings INTERFACE /WX)
+    target_compile_options(taz_warnings INTERFACE /W4 /permissive-)
+    if(TAZ_WARNINGS_AS_ERRORS)
+        target_compile_options(taz_warnings INTERFACE /WX)
     endif()
-    target_compile_definitions(tazer_warnings INTERFACE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(taz_warnings INTERFACE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(
-        tazer_warnings
+        taz_warnings
         INTERFACE -Wall
                   -Wextra
                   -Wpedantic
@@ -83,52 +83,51 @@ else()
                   -Wsign-conversion
                   -Wstrict-prototypes
                   -Wmissing-prototypes)
-    if(TAZER_WARNINGS_AS_ERRORS)
-        target_compile_options(tazer_warnings INTERFACE -Werror)
+    if(TAZ_WARNINGS_AS_ERRORS)
+        target_compile_options(taz_warnings INTERFACE -Werror)
     endif()
 endif()
 
 # ---------------------------------------------------------------------------
 # Compiler static analysis and coverage (first-party targets only, via the
-# tazer_warnings interface target)
+# taz_warnings interface target)
 # ---------------------------------------------------------------------------
-if(TAZER_STATIC_ANALYSIS)
+if(TAZ_STATIC_ANALYSIS)
     if(MSVC)
         # /analyze:external- keeps SDK and dependency headers out of the report
         # (CMake passes SYSTEM includes as /external:I on MSVC >= 19.29).
-        target_compile_options(tazer_warnings INTERFACE /analyze
-                                                        /analyze:external-)
-        message(STATUS "TAZER: MSVC /analyze enabled")
+        target_compile_options(taz_warnings INTERFACE /analyze
+                                                      /analyze:external-)
+        message(STATUS "TAZ: MSVC /analyze enabled")
     elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(tazer_warnings INTERFACE -fanalyzer)
-        message(STATUS "TAZER: GCC -fanalyzer enabled")
+        target_compile_options(taz_warnings INTERFACE -fanalyzer)
+        message(STATUS "TAZ: GCC -fanalyzer enabled")
     else()
         message(
             WARNING
-                "TAZER_STATIC_ANALYSIS: no analyzer flags for ${CMAKE_C_COMPILER_ID}; "
+                "TAZ_STATIC_ANALYSIS: no analyzer flags for ${CMAKE_C_COMPILER_ID}; "
                 "clang-tidy (just lint-c) covers the Clang analyzer")
     endif()
 endif()
 
-if(TAZER_COVERAGE)
+if(TAZ_COVERAGE)
     if(MSVC)
-        message(FATAL_ERROR "TAZER_COVERAGE requires GCC or Clang (gcov)")
+        message(FATAL_ERROR "TAZ_COVERAGE requires GCC or Clang (gcov)")
     endif()
-    target_compile_options(tazer_warnings INTERFACE --coverage -O0)
-    target_link_options(tazer_warnings INTERFACE --coverage)
-    message(STATUS "TAZER: coverage instrumentation enabled")
+    target_compile_options(taz_warnings INTERFACE --coverage -O0)
+    target_link_options(taz_warnings INTERFACE --coverage)
+    message(STATUS "TAZ: coverage instrumentation enabled")
 endif()
 
 # ---------------------------------------------------------------------------
 # Sanitizers
 # ---------------------------------------------------------------------------
-if(NOT TAZER_SANITIZER STREQUAL "none")
+if(NOT TAZ_SANITIZER STREQUAL "none")
     if(MSVC)
-        if(NOT TAZER_SANITIZER STREQUAL "address")
+        if(NOT TAZ_SANITIZER STREQUAL "address")
             message(
                 FATAL_ERROR
-                    "MSVC supports only TAZER_SANITIZER=address (no TSan/UBSan)"
-            )
+                    "MSVC supports only TAZ_SANITIZER=address (no TSan/UBSan)")
         endif()
         # /fsanitize=address is incompatible with the /RTC1 runtime checks that
         # CMake puts in the default Debug flags, and with incremental linking.
@@ -144,19 +143,19 @@ if(NOT TAZER_SANITIZER STREQUAL "none")
         add_compile_definitions(
             _DISABLE_VECTOR_ANNOTATION _DISABLE_STRING_ANNOTATION
             _DISABLE_OPTIONAL_ANNOTATION) # optional: VS 2026 STL and later
-        message(STATUS "TAZER: building with /fsanitize=address")
+        message(STATUS "TAZ: building with /fsanitize=address")
     else()
-        if(TAZER_SANITIZER STREQUAL "address")
-            set(_tazer_san_flags -fsanitize=address,undefined
-                                 -fno-sanitize-recover=undefined)
-        elseif(TAZER_SANITIZER STREQUAL "thread")
-            set(_tazer_san_flags -fsanitize=thread)
+        if(TAZ_SANITIZER STREQUAL "address")
+            set(_taz_san_flags -fsanitize=address,undefined
+                               -fno-sanitize-recover=undefined)
+        elseif(TAZ_SANITIZER STREQUAL "thread")
+            set(_taz_san_flags -fsanitize=thread)
         else()
-            message(FATAL_ERROR "Unknown TAZER_SANITIZER '${TAZER_SANITIZER}'")
+            message(FATAL_ERROR "Unknown TAZ_SANITIZER '${TAZ_SANITIZER}'")
         endif()
-        add_compile_options(${_tazer_san_flags} -fno-omit-frame-pointer -g)
-        add_link_options(${_tazer_san_flags})
-        message(STATUS "TAZER: building with -fsanitize=${TAZER_SANITIZER}")
+        add_compile_options(${_taz_san_flags} -fno-omit-frame-pointer -g)
+        add_link_options(${_taz_san_flags})
+        message(STATUS "TAZ: building with -fsanitize=${TAZ_SANITIZER}")
     endif()
 endif()
 
@@ -169,55 +168,54 @@ find_package(libuv REQUIRED CONFIG)
 
 # nanopb runtime, vendored as a git submodule pinned to the same release as the
 # generator used by `just proto`.
-set(TAZER_NANOPB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanopb)
-if(NOT EXISTS ${TAZER_NANOPB_DIR}/pb.h)
-    message(FATAL_ERROR "nanopb submodule missing at ${TAZER_NANOPB_DIR}. "
+set(TAZ_NANOPB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanopb)
+if(NOT EXISTS ${TAZ_NANOPB_DIR}/pb.h)
+    message(FATAL_ERROR "nanopb submodule missing at ${TAZ_NANOPB_DIR}. "
                         "Run: git submodule update --init --recursive")
 endif()
 add_library(
-    nanopb STATIC
-    ${TAZER_NANOPB_DIR}/pb_common.c ${TAZER_NANOPB_DIR}/pb_decode.c
-    ${TAZER_NANOPB_DIR}/pb_encode.c)
-target_include_directories(nanopb SYSTEM PUBLIC ${TAZER_NANOPB_DIR})
+    nanopb STATIC ${TAZ_NANOPB_DIR}/pb_common.c ${TAZ_NANOPB_DIR}/pb_decode.c
+                  ${TAZ_NANOPB_DIR}/pb_encode.c)
+target_include_directories(nanopb SYSTEM PUBLIC ${TAZ_NANOPB_DIR})
 add_library(nanopb::nanopb ALIAS nanopb)
 
 # ---------------------------------------------------------------------------
 # Generated protocol messages (checked in; regenerate with `just proto`)
 # ---------------------------------------------------------------------------
-set(TAZER_GENERATED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/generated)
-file(GLOB TAZER_PROTO_SOURCES CONFIGURE_DEPENDS
-     ${TAZER_GENERATED_DIR}/tazer/v1/*.pb.c)
-if(NOT TAZER_PROTO_SOURCES)
+set(TAZ_GENERATED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/generated)
+file(GLOB TAZ_PROTO_SOURCES CONFIGURE_DEPENDS
+     ${TAZ_GENERATED_DIR}/taz/v1/*.pb.c)
+if(NOT TAZ_PROTO_SOURCES)
     message(
-        FATAL_ERROR "No generated protocol sources in ${TAZER_GENERATED_DIR}. "
+        FATAL_ERROR "No generated protocol sources in ${TAZ_GENERATED_DIR}. "
                     "Run: just proto")
 endif()
-add_library(tazer_proto STATIC ${TAZER_PROTO_SOURCES})
-target_include_directories(tazer_proto SYSTEM PUBLIC ${TAZER_GENERATED_DIR})
-target_link_libraries(tazer_proto PUBLIC nanopb::nanopb)
-add_library(tazer::proto ALIAS tazer_proto)
+add_library(taz_proto STATIC ${TAZ_PROTO_SOURCES})
+target_include_directories(taz_proto SYSTEM PUBLIC ${TAZ_GENERATED_DIR})
+target_link_libraries(taz_proto PUBLIC nanopb::nanopb)
+add_library(taz::proto ALIAS taz_proto)
 
 # ---------------------------------------------------------------------------
 # Daemon executable
 # ---------------------------------------------------------------------------
-add_executable(tazer src/main.c)
-target_include_directories(tazer PRIVATE include)
+add_executable(tazd src/main.c)
+target_include_directories(tazd PRIVATE include)
 # Strict -std=c11 hides POSIX declarations that libuv's headers rely on
 # (pthread_rwlock_t, pthread_barrier_t); libuv documents _GNU_SOURCE on Linux.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_compile_definitions(tazer PRIVATE _GNU_SOURCE)
+    target_compile_definitions(tazd PRIVATE _GNU_SOURCE)
 endif()
-target_compile_definitions(tazer PRIVATE TAZER_VERSION="${PROJECT_VERSION}"
-                                         TAZER_BUILD_ID="${TAZER_BUILD_ID}")
+target_compile_definitions(tazd PRIVATE TAZ_VERSION="${PROJECT_VERSION}"
+                                        TAZ_BUILD_ID="${TAZ_BUILD_ID}")
 # Conan's libuv recipe exports the static library as libuv::uv_a.
-target_link_libraries(tazer PRIVATE tazer_warnings tazer::proto libuv::uv_a)
+target_link_libraries(tazd PRIVATE taz_warnings taz::proto libuv::uv_a)
 
-install(TARGETS tazer)
+install(TARGETS tazd)
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-if(TAZER_BUILD_TESTS)
+if(TAZ_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()

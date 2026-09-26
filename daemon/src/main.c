@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief TAZER reference daemon entry point.
+ * @brief TAZ reference daemon entry point.
  */
 
 #include <stdio.h>
@@ -9,21 +9,21 @@
 #include <pb.h>
 #include <uv.h>
 
-#include "tazer/v1/common.pb.h"
+#include "taz/v1/common.pb.h"
 
-#ifndef TAZER_VERSION
-#define TAZER_VERSION "0.0.0"
+#ifndef TAZ_VERSION
+#define TAZ_VERSION "0.0.0"
 #endif
 
-#ifndef TAZER_BUILD_ID
-#define TAZER_BUILD_ID "unknown"
+#ifndef TAZ_BUILD_ID
+#define TAZ_BUILD_ID "unknown"
 #endif
 
 int main(void)
 {
-    (void)printf("tazer %s (%s) libuv %s %s\n", TAZER_VERSION, TAZER_BUILD_ID,
+    (void)printf("tazd %s (%s) libuv %s %s\n", TAZ_VERSION, TAZ_BUILD_ID,
                  uv_version_string(), NANOPB_VERSION);
     (void)printf("protocol opcode range: 0x0001..0x%04x\n",
-                 (unsigned)tazer_v1_Opcode_OPCODE_PIPELINE);
+                 (unsigned)taz_v1_Opcode_OPCODE_PIPELINE);
     return EXIT_SUCCESS;
 }

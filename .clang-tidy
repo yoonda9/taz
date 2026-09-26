@@ -1,4 +1,4 @@
-# Static analysis for the TAZER daemon (C sources under daemon/src and
+# Static analysis for the TAZ daemon (C sources under daemon/src and
 # daemon/include only). Style: Barr Embedded C; safety: CERT C subset.
 #
 # Run via `just lint-c`, which first produces compile_commands.json with

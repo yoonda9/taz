@@ -2,7 +2,7 @@
 daemon/generated/
 daemon/third_party/
 daemon/build/
-c3/src/tazer/v1/
+c3/src/taz/v1/
 .venv/
 .ruff_cache/
 .agents/scratchpad/

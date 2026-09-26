@@ -36,7 +36,7 @@ linux:
     - just lint
   artifacts:
     paths:
-      - daemon/build/linux-debug/tazer
+      - daemon/build/linux-debug/tazd
     expire_in: 1 week
 
 linux-asan:
@@ -72,13 +72,13 @@ linux-coverage:
     expire_in: 1 week
 
 # Windows jobs need a runner with Visual Studio Build Tools (C++ workload) and
-# mise on PATH. Enabled by setting TAZER_WINDOWS_RUNNER=true in the project's
+# mise on PATH. Enabled by setting TAZ_WINDOWS_RUNNER=true in the project's
 # CI variables so pipelines without such a runner do not hang.
 .windows:
   stage: verify
   tags: [windows, msvc]
   rules:
-    - if: $TAZER_WINDOWS_RUNNER == "true"
+    - if: $TAZ_WINDOWS_RUNNER == "true"
   before_script:
     - choco install cppcheck --no-progress -y
     - $env:PATH = "C:\Program Files\Cppcheck;$env:PATH"
@@ -94,7 +94,7 @@ windows:
     - just lint
   artifacts:
     paths:
-      - daemon/build/windows-debug/tazer.exe
+      - daemon/build/windows-debug/tazd.exe
     expire_in: 1 week
 
 windows-asan:

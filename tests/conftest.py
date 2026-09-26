@@ -15,8 +15,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--daemon",
         action="store",
-        default=os.environ.get("TAZER_DAEMON"),
-        help="Path to a tazer daemon binary (or set TAZER_DAEMON).",
+        default=os.environ.get("TAZ_DAEMON"),
+        help="Path to a tazd binary (or set TAZ_DAEMON).",
     )
 
 
@@ -24,7 +24,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def daemon_binary(request: pytest.FixtureRequest) -> Path:
     value = request.config.getoption("--daemon")
     if not value:
-        pytest.skip("no daemon binary: pass --daemon or set TAZER_DAEMON")
+        pytest.skip("no daemon binary: pass --daemon or set TAZ_DAEMON")
     path = Path(value)
     if not path.exists():
         pytest.fail(f"daemon binary not found: {path}")

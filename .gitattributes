@@ -18,5 +18,5 @@
 
 # Generated code: keep out of language statistics and collapse in diffs.
 daemon/generated/** linguist-generated=true
-c3/src/tazer/v1/*_pb2.py linguist-generated=true
-c3/src/tazer/v1/*_pb2.pyi linguist-generated=true
+c3/src/taz/v1/*_pb2.py linguist-generated=true
+c3/src/taz/v1/*_pb2.pyi linguist-generated=true

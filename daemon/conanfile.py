@@ -1,4 +1,4 @@
-"""Conan consumer recipe for the TAZER daemon.
+"""Conan consumer recipe for the TAZ daemon.
 
 Driven by `just configure <preset>` (tools/dev.py), which runs
 `conan install` with the preset's host profile chain and output folder, then
@@ -11,7 +11,7 @@ from conan import ConanFile
 from conan.tools.cmake import CMakeDeps, CMakeToolchain
 
 
-class TazerDaemon(ConanFile):
+class TazDaemon(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
 
     def requirements(self) -> None:

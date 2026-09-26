@@ -1,4 +1,4 @@
-# Tool pins for the TAZER repo. `mise install` is the single bootstrap step.
+# Tool pins for the TAZ repo. `mise install` is the single bootstrap step.
 #
 # Split of responsibilities:
 #   mise      -> tool versions and environment (this file). No tasks live here.

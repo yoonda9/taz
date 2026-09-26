@@ -7,7 +7,7 @@ exclude: |
   (?x)^(
     daemon/third_party/|
     daemon/generated/|
-    c3/src/tazer/v1/|
+    c3/src/taz/v1/|
     \.venv/
   )
 

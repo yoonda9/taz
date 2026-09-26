@@ -1,0 +1,17 @@
+# nanopb size limits for daemon_control.proto (reference C daemon only).
+taz.v1.VersionResponse.version              max_size:32
+taz.v1.VersionResponse.build                max_size:64
+taz.v1.VersionResponse.platform             max_size:32
+
+# CAPABILITY payload is capped at 1 KiB on the wire.
+taz.v1.CapabilityPayload.operations         max_count:64
+taz.v1.CapabilityPayload.max_payload_sizes  max_count:8
+taz.v1.CapabilityPayload.compression        max_count:4 max_size:16
+
+taz.v1.ConfigurationGetRequest.keys         max_count:32 max_size:128
+taz.v1.ConfigurationGetResponse.config      max_count:32
+taz.v1.ConfigurationUpdateRequest.config    max_count:32
+taz.v1.ConfigurationUpdateResponse.applied  max_count:32 max_size:128
+taz.v1.ConfigurationUpdateResponse.rejected max_count:32
+taz.v1.RejectedKey.key                      max_size:128
+taz.v1.RejectedKey.reason                   max_size:256

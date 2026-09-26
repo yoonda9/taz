@@ -64,7 +64,7 @@
       "inherits": "linux-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "TAZER_STATIC_ANALYSIS": "ON"
+        "TAZ_STATIC_ANALYSIS": "ON"
       }
     },
     {
@@ -73,7 +73,7 @@
       "inherits": "linux-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "TAZER_COVERAGE": "ON"
+        "TAZ_COVERAGE": "ON"
       }
     },
     {
@@ -82,7 +82,7 @@
       "inherits": "linux-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "TAZER_SANITIZER": "address"
+        "TAZ_SANITIZER": "address"
       }
     },
     {
@@ -91,7 +91,7 @@
       "inherits": "linux-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "TAZER_SANITIZER": "thread"
+        "TAZ_SANITIZER": "thread"
       }
     },
     {
@@ -113,7 +113,7 @@
       "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "TAZER_STATIC_ANALYSIS": "ON"
+        "TAZ_STATIC_ANALYSIS": "ON"
       }
     },
     {
@@ -123,7 +123,7 @@
       "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "TAZER_SANITIZER": "address"
+        "TAZ_SANITIZER": "address"
       }
     }
   ],

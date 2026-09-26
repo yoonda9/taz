@@ -8,8 +8,8 @@ resolution-markers = [
 
 [manifest]
 members = [
-    "tazer",
-    "tazer-workspace",
+    "taz-workspace",
+    "test-agent-zero",
 ]
 
 [[package]]
@@ -900,17 +900,7 @@ wheels = [
 ]
 
 [[package]]
-name = "tazer"
-source = { editable = "c3" }
-dependencies = [
-    { name = "protobuf" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "protobuf", specifier = ">=7" }]
-
-[[package]]
-name = "tazer-workspace"
+name = "taz-workspace"
 version = "0.0.0"
 source = { virtual = "." }
 
@@ -927,7 +917,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pyyaml" },
     { name = "ruff" },
-    { name = "tazer" },
+    { name = "test-agent-zero" },
     { name = "types-protobuf" },
 ]
 
@@ -946,9 +936,19 @@ dev = [
     { name = "pytest-cov", specifier = ">=7.1" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.16.9" },
-    { name = "tazer", editable = "c3" },
+    { name = "test-agent-zero", editable = "c3" },
     { name = "types-protobuf", specifier = ">=6" },
 ]
+
+[[package]]
+name = "test-agent-zero"
+source = { editable = "c3" }
+dependencies = [
+    { name = "protobuf" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "protobuf", specifier = ">=7" }]
 
 [[package]]
 name = "types-protobuf"

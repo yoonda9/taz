@@ -1,0 +1,66 @@
+// TAZ protocol: daemon control operations (docs/api.md §1).
+
+syntax = "proto3";
+
+package taz.v1;
+
+import "taz/v1/common.proto";
+
+// VERSION (0x0002)
+message VersionRequest {}
+
+message VersionResponse {
+  string version = 1;
+  string build = 2;
+  string platform = 3;
+}
+
+// CAPABILITY frame payload (docs/api.md §1.3). Sent by the daemon on connect
+// with stream_id = 0. Not a request/response pair.
+message CapabilityPayload {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  // Opcode values this daemon implements.
+  repeated uint32 operations = 3;
+  // Per-frame-type payload maximums keyed by the FrameType byte.
+  repeated UInt32Pair max_payload_sizes = 4;
+  // Supported compression algorithm names in preferred order, e.g. ["NONE"].
+  repeated string compression = 5;
+}
+
+// CONFIGURATION_GET (0x0003)
+message ConfigurationGetRequest {
+  // Specific keys to retrieve; empty returns the full configuration.
+  repeated string keys = 1;
+}
+
+message ConfigurationGetResponse {
+  repeated KeyValue config = 1;
+}
+
+// CONFIGURATION_UPDATE (0x0004)
+message ConfigurationUpdateRequest {
+  repeated KeyValue config = 1;
+}
+
+message RejectedKey {
+  string key = 1;
+  string reason = 2;
+}
+
+message ConfigurationUpdateResponse {
+  repeated string applied = 1;
+  repeated RejectedKey rejected = 2;
+}
+
+// RESTART (0x0005)
+message RestartRequest {
+  // Delay before restart. The daemon clamps values below 100 up to 100 so the
+  // response can be flushed before the process exits.
+  uint32 delay_ms = 1;
+}
+
+message RestartResponse {
+  bool acknowledged = 1;
+  uint32 effective_delay_ms = 2;
+}

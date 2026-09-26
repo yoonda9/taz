@@ -38,7 +38,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RPC_DIR = ROOT / "rpc"
-PROTO_PACKAGE_DIR = Path("tazer") / "v1"
+PROTO_PACKAGE_DIR = Path("taz") / "v1"
 PY_OUT = ROOT / "c3" / "src"
 C_OUT = ROOT / "daemon" / "generated"
 NANOPB_GENERATOR = (
@@ -244,7 +244,7 @@ def cmd_proto(check: bool) -> None:
     (PY_OUT / PROTO_PACKAGE_DIR).mkdir(parents=True, exist_ok=True)
     (C_OUT / PROTO_PACKAGE_DIR).mkdir(parents=True, exist_ok=True)
 
-    # Python: protoc from grpcio-tools, output mirrors the tazer/v1 package.
+    # Python: protoc from grpcio-tools, output mirrors the taz/v1 package.
     run(
         [
             sys.executable,
@@ -258,7 +258,7 @@ def cmd_proto(check: bool) -> None:
     )
     init_py = PY_OUT / PROTO_PACKAGE_DIR / "__init__.py"
     init_py.write_text(
-        '"""Generated protobuf modules for TAZER protocol v1 (see rpc/)."""\n'
+        '"""Generated protobuf modules for TAZ protocol v1 (see rpc/)."""\n'
     )
 
     # C: nanopb generator from the submodule (same release as the runtime).
@@ -380,7 +380,7 @@ def cmd_cmake_format(check: bool) -> None:
 
 
 def test_binary(build_dir: Path) -> Path:
-    exe = build_dir / "tests" / ("tazer_tests.exe" if IS_WINDOWS else "tazer_tests")
+    exe = build_dir / "tests" / ("taz_tests.exe" if IS_WINDOWS else "taz_tests")
     if not exe.exists():
         sys.exit(f"error: {exe} not found. Run `just build` first.")
     return exe
@@ -394,9 +394,7 @@ def cmd_valgrind(build_dir: Path) -> None:
             sys.exit(f"error: {message}")
         print(f"warning: {message}; skipping")
         return
-    if (
-        build_dir / "CMakeCache.txt"
-    ).exists() and "TAZER_SANITIZER:STRING=none" not in (
+    if (build_dir / "CMakeCache.txt").exists() and "TAZ_SANITIZER:STRING=none" not in (
         build_dir / "CMakeCache.txt"
     ).read_text():
         sys.exit("error: run valgrind on a plain build, not a sanitizer build")

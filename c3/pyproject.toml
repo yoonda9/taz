@@ -1,7 +1,7 @@
 [project]
-name = "tazer"
+name = "test-agent-zero"
 dynamic = ["version"]
-description = "Python client (c3) for the TAZER test-orchestration daemon"
+description = "Python client (c3) for Test Agent Zero, the taz remote test daemon"
 readme = "README.md"
 authors = [
     { name = "David Yoon", email = "" }
@@ -11,12 +11,15 @@ dependencies = [
     "protobuf>=7",
 ]
 
+[project.scripts]
+taz = "taz.cli:main"
+
 [tool.hatch.version]
 source = "vcs"
 raw-options = { root = ".." }
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/tazer"]
+packages = ["src/taz"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

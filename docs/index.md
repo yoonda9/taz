@@ -1,8 +1,8 @@
-# TAZER Design
+# TAZ Design
 
-TAZER is intended to be a well defined API such that both the daemon and client can be implemented in any language.
+TAZ is intended to be a well defined API such that both the daemon and client can be implemented in any language.
 
-The TAZER reference daemon is written in C in order to be able to support _any_ test host without requiring redesigning the API or communication protocol.
+The TAZ reference daemon is written in C in order to be able to support _any_ test host without requiring redesigning the API or communication protocol.
 
 For detailed requirements see [Requirements](requirements.md). For the wire protocol specification see [Protocol Design](protocol.md).
 
@@ -48,11 +48,11 @@ In terms of a synchronous test framework, the client should be able to mark each
 If so, a failure caught in task a, can send an error response back on the channel reserved for the response for task b.
 
 ```python
-some_proc = tazer.run(
+some_proc = taz.run(
     cmd="some-process", detach=True, monitor=True, error_priority="critical"
 )
 try:
-    file = tazer.get(src="some-path.txt", dest="/tmp/some-path.txt")
+    file = taz.get(src="some-path.txt", dest="/tmp/some-path.txt")
 except Exception as err:
     ...
 ```

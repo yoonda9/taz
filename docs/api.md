@@ -1,4 +1,4 @@
-# TAZER API
+# TAZ API
 
 > Living document. Last updated: 2026-09-26
 >
@@ -6,7 +6,7 @@
 
 ## Overview
 
-The TAZER API is a set of RPC operations exposed by the daemon over the [TAZER binary protocol](protocol.md).
+The TAZ API is a set of RPC operations exposed by the daemon over the [TAZ binary protocol](protocol.md).
 
 - Every operation has a stable **opcode** (see §Opcodes below). The opcode travels in the frame header (`protocol.md` §4.4), not in the payload. Dispatch on the daemon is a single integer lookup — no envelope message to parse.
 - Requests and responses are serialized as Protocol Buffers. Each operation defines its own request and response message directly; there is no wrapper.
@@ -371,7 +371,7 @@ Subscribe to ongoing status updates for an OS process. The daemon sends periodic
 | `exit_code_known` | bool        | Whether `exit_code` is authoritative                                                                                                                                                                                                                                                   |
 | `reason`          | string      | Why the stream ended: `""` (still open), `"exited"`, `"cancelled"`, `"error"`                                                                                                                                                                                                          |
 
-The final response has `CONTINUATION` cleared. `cpu_percent` requires two samples and is `0` on the first update. To subscribe to a TAZER-managed detached task rather than an OS PID, use `TASK_STATUS` (§5.5).
+The final response has `CONTINUATION` cleared. `cpu_percent` requires two samples and is `0` on the first update. To subscribe to a TAZ-managed detached task rather than an OS PID, use `TASK_STATUS` (§5.5).
 
 ## 4. File Operations
 

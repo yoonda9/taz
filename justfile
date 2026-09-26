@@ -1,4 +1,4 @@
-# TAZER task runner.
+# TAZ task runner.
 #
 # Bootstrap on a fresh clone:   mise install && just setup
 # Everyday:                     just build | just test | just lint | just fmt
@@ -33,7 +33,7 @@ doctor:
 
 # --- protobuf ---------------------------------------------------------------
 
-# Regenerate protobuf code: Python -> c3/src/tazer/v1, C -> daemon/generated
+# Regenerate protobuf code: Python -> c3/src/taz/v1, C -> daemon/generated
 proto:
     {{ dev }} proto
 
@@ -58,7 +58,7 @@ clean:
 
 # Check that a built daemon binary has no unexpected dynamic dependencies
 verify-static preset="linux-release":
-    {{ dev }} verify-static daemon/build/{{ preset }}/tazer
+    {{ dev }} verify-static daemon/build/{{ preset }}/tazd
 
 # --- tests ------------------------------------------------------------------
 
@@ -98,7 +98,7 @@ analyze: (build "windows-analyze")
 [unix]
 coverage: (test-c "linux-coverage")
     {{ dev }} coverage --build-dir daemon/build/linux-coverage
-    uv run pytest --cov=tazer --cov-report=term --cov-report=html:out/coverage/python --cov-report=xml:out/coverage/python.xml
+    uv run pytest --cov=taz --cov-report=term --cov-report=html:out/coverage/python --cov-report=xml:out/coverage/python.xml
 
 # --- formatting -------------------------------------------------------------
 

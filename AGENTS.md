@@ -2,7 +2,9 @@
 
 ## Project
 
-TAZER is a remote test daemon for running tests on remote hosts. Protocol-first:
+Test Agent Zero (TAZ) is a remote test daemon for running tests on remote
+hosts. Daemon binary `tazd`, client CLI `taz`, Python import `taz`, PyPI
+distribution `test-agent-zero`, identifier prefix `TAZ_`/`taz_`. Protocol-first:
 the wire spec and protobuf schemas (`rpc/`) are the contract; the C daemon
 (`daemon/`) and Python client (`c3/`) are reference implementations.
 
@@ -13,7 +15,7 @@ the wire spec and protobuf schemas (`rpc/`) are the contract; the C daemon
 | `docs/`        | Requirements, wire protocol, API spec               |
 | `rpc/`         | Protobuf schemas (source of truth for the protocol) |
 | `daemon/`      | C daemon (libuv + nanopb), CMake + Conan build      |
-| `c3/`          | Python client package (`tazer`)                     |
+| `c3/`          | Python client package (`import taz`)                |
 | `tests/`       | Integration tests (daemon + client)                 |
 | `tools/dev.py` | Cross-platform helpers behind `just` recipes        |
 | `justfile`     | Every developer/CI task                             |
@@ -35,11 +37,11 @@ just --list         # everything else
 
 - **`just` is the single entry point.** Every task is a recipe. CI and the
   pre-push hook run the same recipes, so a red CI job reproduces locally.
-- **Protobuf is checked in.** Python stubs go to `c3/src/tazer/v1/`, C (nanopb)
+- **Protobuf is checked in.** Python stubs go to `c3/src/taz/v1/`, C (nanopb)
   to `daemon/generated/`. Run `just proto` after editing `rpc/`; CI fails if
   the generated code is stale (`just proto-check`).
 - **Daemon is pure C11.** GoogleTest (C++) is used only for unit tests.
-  C++ is enabled in CMake only when `TAZER_BUILD_TESTS=ON`.
+  C++ is enabled in CMake only when `TAZ_BUILD_TESTS=ON`.
 - **nanopb is a git submodule** at `daemon/third_party/nanopb`, pinned to the
   same release as the generator used by `just proto`.
 - **Conan manages C dependencies** (libuv, gtest). Profiles live in
