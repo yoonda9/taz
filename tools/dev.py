@@ -445,13 +445,15 @@ def cmd_doctor() -> None:
     if IS_WINDOWS:
         ensure_msvc_env(required=False)
         system_tools = {"cl": "MSVC (Visual Studio Build Tools, C++ workload)"}
-        optional_tools = {"cppcheck": "cppcheck (winget; required in CI)"}
+        # name -> (hint, required when CI is set). Only tools that `just lint`
+        # itself needs are required in CI; jobs for the others fail on their own.
+        optional_tools = {"cppcheck": ("cppcheck (winget; required in CI)", True)}
     else:
         system_tools = {"cc": "C compiler (gcc or clang)"}
         optional_tools = {
-            "cppcheck": "cppcheck (apt/dnf; required in CI)",
-            "valgrind": "valgrind (apt/dnf; `just test-valgrind`, required in CI)",
-            "clang": "clang (apt/dnf; `just build linux-clang-debug`)",
+            "cppcheck": ("cppcheck (apt/dnf; required in CI)", True),
+            "valgrind": ("valgrind (apt/dnf; for `just test-valgrind`)", False),
+            "clang": ("clang (apt/dnf; for `just test-c linux-clang-debug`)", False),
         }
 
     problems: list[str] = []
@@ -476,8 +478,8 @@ def cmd_doctor() -> None:
     print("system tools:")
     for name, hint in system_tools.items():
         report(name, hint, required=True)
-    for name, hint in optional_tools.items():
-        report(name, hint, required=IN_CI)
+    for name, (hint, required_in_ci) in optional_tools.items():
+        report(name, hint, required=IN_CI and required_in_ci)
 
     if not IS_WINDOWS and shutil.which("cc"):
         print("sanitizer runtimes (for `just test-sanitizers`):")

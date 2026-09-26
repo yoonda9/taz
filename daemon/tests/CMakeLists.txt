@@ -1,10 +1,6 @@
-# Unit tests are C++ (GoogleTest) calling the daemon's C headers. C++ is
-# enabled only here so the daemon itself stays a pure C build.
-enable_language(CXX)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
+# Unit tests are C++ (GoogleTest) calling the daemon's C headers. The C++
+# language and standard are enabled at the top level (only when
+# TAZER_BUILD_TESTS is on) so Conan builds gtest with the same settings.
 find_package(GTest REQUIRED CONFIG)
 include(GoogleTest)
 

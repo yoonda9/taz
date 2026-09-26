@@ -158,6 +158,12 @@ endif()
 # lets Conan build gtest with the same compiler CMake selected.
 if(TAZER_BUILD_TESTS)
     enable_language(CXX)
+    # Declared here, before the Conan provider runs, so the auto-detected host
+    # profile carries compiler.cppstd=17 for every compiler (Conan drops
+    # profile sub-settings when the compiler changes, e.g. gcc -> clang).
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
 endif()
 
 find_package(libuv REQUIRED CONFIG)
