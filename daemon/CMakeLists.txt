@@ -94,8 +94,9 @@ if(NOT TAZER_SANITIZER STREQUAL "none")
         # gtest is Conan-built without ASan; disable the STL container
         # annotations so std::string/std::vector crossing that boundary do not
         # raise false container-overflow reports (per Microsoft's guidance).
-        add_compile_definitions(_DISABLE_VECTOR_ANNOTATION
-                                _DISABLE_STRING_ANNOTATION)
+        add_compile_definitions(
+            _DISABLE_VECTOR_ANNOTATION _DISABLE_STRING_ANNOTATION
+            _DISABLE_OPTIONAL_ANNOTATION) # optional: VS 2026 STL and later
         message(STATUS "TAZER: building with /fsanitize=address")
     else()
         if(TAZER_SANITIZER STREQUAL "address")
