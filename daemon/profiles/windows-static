@@ -11,3 +11,9 @@ compiler.cppstd=17
 
 [options]
 *:shared=False
+
+[conf]
+# Must match the generator in daemon/CMakePresets.json. Without it Conan's
+# toolchain assumes Visual Studio and emits CMAKE_GENERATOR_PLATFORM/TOOLSET,
+# which Ninja rejects.
+tools.cmake.cmaketoolchain:generator=Ninja

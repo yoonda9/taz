@@ -10,3 +10,7 @@ compiler.cppstd=17
 
 [options]
 *:shared=False
+
+[conf]
+# Must match the generator in daemon/CMakePresets.json.
+tools.cmake.cmaketoolchain:generator=Ninja
