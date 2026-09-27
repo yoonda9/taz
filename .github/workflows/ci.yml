@@ -28,6 +28,8 @@ env:
   CI: "1"
   # Fail instead of re-resolving when uv.lock is out of date with pyproject.toml.
   UV_LOCKED: "1"
+  # mise itself, for both jobs' mise-action (the tools are pinned in mise.toml).
+  MISE_VERSION: 2026.9.14
 
 jobs:
   linux:
@@ -61,7 +63,7 @@ jobs:
       - name: Install pinned tools
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
-          version: 2026.9.14
+          version: ${{ env.MISE_VERSION }}
           # Entries without `main` skip the lint-only tools (node, prettier, buf).
           install_args: ${{ matrix.mise-tools }}
 
@@ -171,7 +173,7 @@ jobs:
       - name: Install pinned tools
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
-          version: 2026.9.14
+          version: ${{ env.MISE_VERSION }}
           install_args: ${{ matrix.mise-tools }}
 
       # The pinned release MSI, checksum-verified. Chocolatey took ~40 s to

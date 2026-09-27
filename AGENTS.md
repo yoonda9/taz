@@ -84,13 +84,13 @@ Every version is exact and bumped by hand (no update bot). Where each lives:
 | What                          | Where                                                         | Bump                                     |
 | ----------------------------- | ------------------------------------------------------------- | ---------------------------------------- |
 | CLI tools (uv, just, node…)   | `mise.toml`                                                   | edit the version                         |
-| mise itself (CI)              | `ci.yml` mise-action `version` (two jobs)                     | edit both                                |
+| mise itself (CI)              | `ci.yml` `MISE_VERSION`                                       | edit the version                         |
 | Python                        | `.python-version`                                             | edit the version                         |
 | Python packages (incl. conan) | `uv.lock`                                                     | `uv lock --upgrade-package NAME`         |
 | Build backend for `c3`        | `[tool.uv] build-constraint-dependencies` in `pyproject.toml` | edit, then `uv lock`                     |
 | C dependencies                | `daemon/conanfile.py` + `daemon/conan.lock`                   | edit versions, then `just lock-deps`     |
 | GitHub Actions                | `ci.yml` `uses:` commit SHA + `# vX.Y.Z`                      | replace both                             |
-| cppcheck on Windows           | `ci.yml` (MSI URL + SHA-256)                                  | edit both                                |
+| cppcheck on Windows           | `ci.yml` `CPPCHECK_VERSION` + `CPPCHECK_SHA256`               | edit both                                |
 | nanopb                        | submodule commit                                              | check out a tag in it, then `just proto` |
 
 Not pinned by the repo: runner images and their apt packages (Ubuntu 24.04,

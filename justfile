@@ -48,8 +48,8 @@ deps preset=preset:
     {{ dev }} deps {{ preset }}
 
 # Re-resolve daemon/conan.lock to the newest Conan recipe revisions (a manual bump)
-lock-deps:
-    {{ dev }} lock-deps
+lock-deps preset=preset:
+    {{ dev }} lock-deps {{ preset }}
 
 # Configure the daemon: `conan install` with the preset's host profiles, then
 # `cmake --preset`. On Windows the MSVC environment is loaded first if needed.
