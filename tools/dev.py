@@ -196,11 +196,15 @@ def cmd_conan_profiles() -> None:
 
 
 def host_profiles_for(preset: str) -> list[str]:
-    """Host profile chain for a preset: detected base first, then our partial."""
+    """Host profile chain for a preset: detected base first, then our partials."""
     if preset.startswith("windows-"):
         return ["default", str(PROFILES_DIR / "windows-static")]
     if preset.startswith("linux-clang"):
-        return ["clang", str(PROFILES_DIR / "linux-static")]
+        return [
+            "clang",
+            str(PROFILES_DIR / "linux-static"),
+            str(PROFILES_DIR / "linux-clang"),
+        ]
     return ["default", str(PROFILES_DIR / "linux-static")]
 
 

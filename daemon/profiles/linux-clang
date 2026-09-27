@@ -1,0 +1,9 @@
+# Partial Conan host profile for the linux-clang-* presets, composed after the
+# detected `clang` base profile and linux-static.
+#
+# `conan profile detect` records compiler=clang but not the executables, so
+# dependencies built from source would fall back to /usr/bin/cc and c++ (GCC),
+# which reject the -stdlib=libstdc++ flag Conan adds for clang. Name the same
+# compilers as the preset's CMAKE_C_COMPILER / CMAKE_CXX_COMPILER.
+[conf]
+tools.build:compiler_executables={"c": "clang", "cpp": "clang++"}
