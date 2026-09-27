@@ -8,6 +8,9 @@ name: CI
 # job bills at least a minute in a private repo: every matrix entry lists its
 # `checks` (`main` is doctor, build, test and lint), and a check's step runs only
 # in the entry that lists it. To give a check its own job, move it to a new entry.
+#
+# Every version here is exact and bumped by hand ("Pinned versions" in
+# AGENTS.md): actions by commit SHA, mise by release, tools via mise.toml.
 on:
   push:
   workflow_dispatch:
@@ -23,6 +26,8 @@ concurrency:
 
 env:
   CI: "1"
+  # Fail instead of re-resolving when uv.lock is out of date with pyproject.toml.
+  UV_LOCKED: "1"
 
 jobs:
   linux:
@@ -41,21 +46,22 @@ jobs:
             checks: [clang]
             packages: clang
             conan-preset: linux-clang-debug
-            mise-tools: uv just prek cmake ninja pipx:conan
+            mise-tools: uv just prek cmake ninja
     env:
       # Every preset an entry builds must need the same Conan packages as this
       # one; `just deps` enforces it (see the Conan cache steps).
       TAZ_CI_CONAN_PRESET: ${{ matrix.conan-preset }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           fetch-depth: 0 # hatch-vcs derives the client version from tags
           persist-credentials: false
 
       - name: Install pinned tools
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
+          version: 2026.9.14
           # Entries without `main` skip the lint-only tools (node, prettier, buf).
           install_args: ${{ matrix.mise-tools }}
 
@@ -79,7 +85,7 @@ jobs:
 
       - name: Restore Conan packages
         id: conan-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.conan2/p
           key: ${{ steps.conan-key.outputs.key }}
@@ -93,7 +99,7 @@ jobs:
 
       - name: Save Conan packages
         if: steps.conan-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.conan2/p
           key: ${{ steps.conan-key.outputs.key }}
@@ -106,7 +112,7 @@ jobs:
         run: just lint
 
       - if: contains(matrix.checks, 'main')
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: taz-linux-x64-debug
           path: daemon/build/linux-debug/tazd
@@ -133,7 +139,7 @@ jobs:
         run: just coverage
 
       - if: ${{ !cancelled() && steps.coverage.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
           path: out/coverage
@@ -152,19 +158,20 @@ jobs:
           - name: Windows (asan, analyze)
             checks: [asan, analyze]
             conan-preset: windows-asan
-            mise-tools: uv just prek cmake ninja pipx:conan
+            mise-tools: uv just prek cmake ninja
     env:
       TAZ_CI_CONAN_PRESET: ${{ matrix.conan-preset }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned tools
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
+          version: 2026.9.14
           install_args: ${{ matrix.mise-tools }}
 
       # The pinned release MSI, checksum-verified. Chocolatey took ~40 s to
@@ -200,7 +207,7 @@ jobs:
 
       - name: Restore Conan packages
         id: conan-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.conan2/p
           key: ${{ steps.conan-key.outputs.key }}
@@ -214,7 +221,7 @@ jobs:
 
       - name: Save Conan packages
         if: steps.conan-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.conan2/p
           key: ${{ steps.conan-key.outputs.key }}
@@ -227,7 +234,7 @@ jobs:
         run: just lint
 
       - if: contains(matrix.checks, 'main')
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: taz-windows-x64-debug
           path: daemon/build/windows-debug/tazd.exe

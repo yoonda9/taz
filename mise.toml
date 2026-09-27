@@ -4,7 +4,12 @@
 #   mise      -> tool versions and environment (this file). No tasks live here.
 #   justfile  -> every developer/CI task (`just --list`).
 #   uv        -> Python environments and Python-ecosystem tools (ruff, mypy,
-#                clang-format/clang-tidy wheels, protoc via grpcio-tools).
+#                clang-format/clang-tidy wheels, protoc via grpcio-tools,
+#                conan), locked with their dependencies in uv.lock.
+#
+# Every version is exact and bumped by hand (see "Pinned versions" in
+# AGENTS.md); a partial version such as "22" would resolve differently on
+# each machine and in CI.
 #
 # Not provided by mise (checked by `just doctor`): a system C compiler
 # (GCC/Clang on Linux, MSVC + "C++ Clang tools for Windows" on Windows)
@@ -17,11 +22,10 @@ just = "1.58.0"
 cmake = "4.4.3"
 ninja = "1.13.2"
 buf = "1.73.0"
-node = "22"
-"npm:prettier" = "3"
-"pipx:conan" = "2.32.0"
+node = "22.23.3"
+"npm:prettier" = "3.9.9"
 
 [env]
-# Keep Conan's cache and the uv project venv inside predictable locations so
-# `just` recipes behave the same locally and in CI.
+# Keep the uv project venv in a predictable location so `just` recipes behave
+# the same locally and in CI.
 UV_PROJECT_ENVIRONMENT = "{{config_root}}/.venv"

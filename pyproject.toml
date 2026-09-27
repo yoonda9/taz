@@ -10,6 +10,20 @@ dependencies = []
 
 [tool.uv]
 package = false
+# uv.lock does not cover the build backend that builds ./c3, so pin it and its
+# dependencies here (bumped by hand with the rest of the pins).
+build-constraint-dependencies = [
+    "hatch-vcs==0.5.0",
+    "hatchling==1.32.4",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.6.0",
+    "setuptools==84.0.0",
+    "setuptools-scm==10.3.4",
+    "tomlkit==0.15.1",
+    "trove-classifiers==2026.9.21.13",
+    "vcs-versioning==2.5.0",
+]
 
 [tool.uv.workspace]
 members = ["c3"]
@@ -32,6 +46,7 @@ dev = [
     "protobuf>=7",
     "gcovr>=8.6",
     "pytest-cov>=7.1",
+    "conan>=2.32.0,<3",
 ]
 
 # ---------------------------------------------------------------------------

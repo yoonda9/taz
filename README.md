@@ -26,8 +26,8 @@ Tool versions are pinned with [mise](https://mise.jdx.dev) and every task is a
 [`just`](https://just.systems) recipe. On a fresh clone:
 
 ```sh
-mise install     # pinned tools: uv, just, cmake, ninja, buf, prettier, conan, prek
-just setup       # Python env, git submodules, Conan profiles, pre-push hook
+mise install     # pinned tools: uv, just, cmake, ninja, buf, prettier, prek
+just setup       # Python env (incl. conan), git submodules, Conan profiles, pre-push hook
 just doctor      # reports anything mise cannot install (C compiler, cppcheck)
 ```
 

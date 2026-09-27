@@ -7,7 +7,8 @@ read identically on Linux, macOS and Windows.
 
 Subcommands:
     conan-profiles       create the detected Conan base profiles (default, clang)
-    deps PRESET          conan install (profiles from the preset name)
+    deps PRESET          conan install (preset's profiles, daemon/conan.lock)
+    lock-deps            re-resolve daemon/conan.lock to the newest Conan revisions
     configure PRESET     deps + cmake --preset
     conan-cache-key PRESET   CI cache key for the Conan packages a preset needs
     conan-cache-trim     drop what a restored CI package cache never uses
@@ -178,6 +179,9 @@ def ensure_msvc_env(*, required: bool = True) -> bool:
 # Conan + CMake configure
 # ---------------------------------------------------------------------------
 PROFILES_DIR = ROOT / "daemon" / "profiles"
+# Pins every Conan recipe revision, and the versions that recipes request as
+# ranges (e.g. libuv's CMake tool); `conan install` fails on anything unlisted.
+CONAN_LOCKFILE = ROOT / "daemon" / "conan.lock"
 # Set by CI to the preset its Conan package cache is keyed on (see
 # cmd_conan_cache_key); `deps` then refuses presets that need other packages.
 CI_CONAN_PRESET_VAR = "TAZ_CI_CONAN_PRESET"
@@ -240,7 +244,29 @@ def cmd_deps(preset: str) -> None:
             "install",
             ROOT / "daemon",
             f"--output-folder={output}",
+            f"--lockfile={CONAN_LOCKFILE}",
             "--build=missing",
+            *conan_profile_args(preset),
+        ]
+    )
+
+
+def cmd_lock_deps() -> None:
+    """Rewrite daemon/conan.lock with the newest revisions on the remotes.
+
+    The recipes' requirements do not depend on the platform, so one host
+    profile resolves the graph for every preset.
+    """
+    preset = "windows-debug" if IS_WINDOWS else "linux-debug"
+    run(
+        [
+            tool("conan"),
+            "lock",
+            "create",
+            ROOT / "daemon",
+            "--lockfile=",  # re-resolve instead of reading the current lock
+            "--update",
+            f"--lockfile-out={CONAN_LOCKFILE}",
             *conan_profile_args(preset),
         ]
     )
@@ -256,7 +282,7 @@ def cmd_conan_cache_key(preset: str) -> None:
 
     The digest covers everything that decides those binaries: the Conan
     version, the resolved host and build profiles (so a runner image with a
-    new compiler starts a fresh cache) and conanfile.py. CI restores exact
+    new compiler starts a fresh cache), conanfile.py and conan.lock. CI restores exact
     matches only: package ids ignore [conf] such as compiler_executables, so a
     cache filled under other profiles can satisfy `conan install` with
     binaries the current profiles would not produce.
@@ -273,7 +299,8 @@ def cmd_conan_cache_key(preset: str) -> None:
         check=True,
     ).stdout
     digest = hashlib.sha256()
-    for part in (version, profiles, (ROOT / "daemon" / "conanfile.py").read_text()):
+    inputs = (ROOT / "daemon" / "conanfile.py", CONAN_LOCKFILE)
+    for part in (version, profiles, *(path.read_text() for path in inputs)):
         digest.update(part.encode())
     host = json.loads(profiles)["host"]["settings"]
     fields = ("os", "compiler", "compiler.version", "build_type")
@@ -564,8 +591,16 @@ def sanitizer_available(flag: str) -> bool:
 
 
 def cmd_doctor() -> None:
-    mise_tools = ["uv", "prek", "just", "cmake", "ninja", "buf", "prettier", "conan"]
-    uv_tools = ["ruff", "mypy", "clang-format", "clang-tidy", "cmake-format", "gcovr"]
+    mise_tools = ["uv", "prek", "just", "cmake", "ninja", "buf", "prettier"]
+    uv_tools = [
+        "ruff",
+        "mypy",
+        "clang-format",
+        "clang-tidy",
+        "cmake-format",
+        "gcovr",
+        "conan",
+    ]
     if IS_WINDOWS:
         ensure_msvc_env(required=False)
         system_tools = {"cl": "MSVC (Visual Studio Build Tools, C++ workload)"}
@@ -702,6 +737,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub.add_parser("conan-profiles")
     p = sub.add_parser("deps")
     p.add_argument("preset")
+    sub.add_parser("lock-deps")
     p = sub.add_parser("configure")
     p.add_argument("preset")
     p = sub.add_parser("conan-cache-key")
@@ -739,6 +775,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             cmd_conan_profiles()
         case "deps":
             cmd_deps(args.preset)
+        case "lock-deps":
+            cmd_lock_deps()
         case "configure":
             cmd_configure(args.preset)
         case "conan-cache-key":
