@@ -3,179 +3,237 @@ name: CI
 # Runs on every branch push (checks appear on PRs via the head commit) and on
 # demand. No separate pull_request trigger, which would double-run same-repo PRs.
 #
-# Every step is a `just` recipe, so a red job reproduces locally with the same
-# command. The matrix jobs each select one CMake preset (daemon/CMakePresets.json).
+# Every check is a `just` recipe, so a red step reproduces locally with the same
+# command. Checks that share a toolchain run as steps of one job, because each
+# job bills at least a minute in a private repo: every matrix entry lists its
+# `checks` (`main` is doctor, build, test and lint), and a check's step runs only
+# in the entry that lists it. To give a check its own job, move it to a new entry.
 on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push supersedes a branch's running CI; every commit on main keeps
+  # its own result.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CI: "1"
 
 jobs:
   linux:
-    name: Linux (build, test, lint)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0 # hatch-vcs derives the client version from tags
-
-      - name: Install pinned tools
-        uses: jdx/mise-action@v2
-        with:
-          install: true
-          cache: true
-
-      - name: Install system tools not managed by mise
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cppcheck
-
-      - name: Cache Conan packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.conan2/p
-          key: conan-${{ runner.os }}-gcc-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
-          restore-keys: conan-${{ runner.os }}-
-
-      - run: just setup
-      - run: just doctor
-      - run: just build
-      - run: just test
-      - run: just lint
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: taz-linux-x64-debug
-          path: daemon/build/linux-debug/tazd
-
-  linux-checks:
-    name: Linux ${{ matrix.check }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
-          - check: asan
-            run: just test-c linux-asan
-          - check: tsan
-            run: just test-c linux-tsan
-          - check: valgrind
-            packages: valgrind
-            run: just test-valgrind
-          - check: analyze
-            run: just build linux-analyze
-          - check: clang
+          - name: Linux gcc (build, test, lint, sanitizers, valgrind, analyze, coverage)
+            checks: [main, asan, tsan, valgrind, analyze, coverage]
+            packages: cppcheck valgrind
+            conan-preset: linux-debug
+          - name: Linux clang (build, test)
+            checks: [clang]
             packages: clang
-            run: just test-c linux-clang-debug
-          - check: coverage
-            run: just coverage
+            conan-preset: linux-clang-debug
+            mise-tools: uv just prek cmake ninja pipx:conan
+    env:
+      # Every preset an entry builds must need the same Conan packages as this
+      # one; `just deps` enforces it (see the Conan cache steps).
+      TAZ_CI_CONAN_PRESET: ${{ matrix.conan-preset }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 0 # hatch-vcs derives the client version from tags
+          persist-credentials: false
 
       - name: Install pinned tools
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v4
         with:
-          install: true
-          cache: true
+          # Entries without `main` skip the lint-only tools (node, prettier, buf).
+          install_args: ${{ matrix.mise-tools }}
 
       - name: Install system tools not managed by mise
         if: matrix.packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
 
-      - name: Cache Conan packages
-        uses: actions/cache@v4
+      - run: just setup
+
+      - if: contains(matrix.checks, 'main')
+        run: just doctor
+
+      # The Conan package cache is restored only on an exact key match: the key
+      # digests every input that decides the package binaries, and package ids
+      # alone do not (tools/dev.py conan-cache-key).
+      - name: Conan cache key
+        id: conan-key
+        run: |
+          key=$(uv run python tools/dev.py conan-cache-key ${{ matrix.conan-preset }})
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Conan packages
+        id: conan-cache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.conan2/p
-          key: conan-${{ runner.os }}-${{ matrix.check }}-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
-          restore-keys: conan-${{ runner.os }}-
+          key: ${{ steps.conan-key.outputs.key }}
 
-      - run: just setup
-      - run: ${{ matrix.run }}
+      - id: deps
+        run: just deps ${{ matrix.conan-preset }}
 
-      - uses: actions/upload-artifact@v4
-        if: matrix.check == 'coverage'
+      - name: Trim Conan packages
+        if: steps.conan-cache.outputs.cache-hit != 'true'
+        run: uv run python tools/dev.py conan-cache-trim
+
+      - name: Save Conan packages
+        if: steps.conan-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.conan2/p
+          key: ${{ steps.conan-key.outputs.key }}
+
+      - if: contains(matrix.checks, 'main')
+        run: just build
+      - if: contains(matrix.checks, 'main')
+        run: just test
+      - if: contains(matrix.checks, 'main')
+        run: just lint
+
+      - if: contains(matrix.checks, 'main')
+        uses: actions/upload-artifact@v7
+        with:
+          name: taz-linux-x64-debug
+          path: daemon/build/linux-debug/tazd
+
+      # The other checks run even after an earlier step failed, as long as the
+      # dependencies installed, so one red check never hides another.
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'asan') }}
+        run: just test-c linux-asan
+
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'tsan') }}
+        run: just test-c linux-tsan
+
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'valgrind') }}
+        run: just test-valgrind
+
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'analyze') }}
+        run: just build linux-analyze
+
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'clang') }}
+        run: just test-c linux-clang-debug
+
+      - id: coverage
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'coverage') }}
+        run: just coverage
+
+      - if: ${{ !cancelled() && steps.coverage.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: out/coverage
 
   windows:
-    name: Windows (build, test, lint)
+    name: ${{ matrix.name }}
     runs-on: windows-2025
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (build, test, lint)
+            checks: [main]
+            conan-preset: windows-debug
+          - name: Windows (asan, analyze)
+            checks: [asan, analyze]
+            conan-preset: windows-asan
+            mise-tools: uv just prek cmake ninja pipx:conan
+    env:
+      TAZ_CI_CONAN_PRESET: ${{ matrix.conan-preset }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install pinned tools
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v4
         with:
-          install: true
-          cache: true
+          install_args: ${{ matrix.mise-tools }}
 
-      - name: Install system tools not managed by mise
+      # The pinned release MSI, checksum-verified. Chocolatey took ~40 s to
+      # install the same file.
+      - name: Install cppcheck
+        if: contains(matrix.checks, 'main')
+        env:
+          CPPCHECK_VERSION: 2.19.0
+          CPPCHECK_SHA256: aac15f6dc2b404b3b2562015419f11d91f391e686279cabd20627a8435782128
         run: |
-          choco install cppcheck --no-progress -y
+          $msi = Join-Path $env:RUNNER_TEMP "cppcheck-$env:CPPCHECK_VERSION-x64-Setup.msi"
+          Invoke-WebRequest -OutFile $msi -Uri "https://github.com/cppcheck-opensource/cppcheck/releases/download/$env:CPPCHECK_VERSION/cppcheck-$env:CPPCHECK_VERSION-x64-Setup.msi"
+          if ((Get-FileHash $msi -Algorithm SHA256).Hash -ne $env:CPPCHECK_SHA256) { throw "cppcheck installer checksum mismatch" }
+          $install = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "cppcheck install failed with exit code $($install.ExitCode)" }
+          & 'C:\Program Files\Cppcheck\cppcheck.exe' --version
           Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\Cppcheck'
-
-      - name: Cache Conan packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.conan2/p
-          key: conan-${{ runner.os }}-msvc-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
-          restore-keys: conan-${{ runner.os }}-
 
       # No msvc-dev-cmd step on purpose: `just configure` must find MSVC by
       # itself (tools/dev.py loads vcvarsall via vswhere), exactly as on a
       # developer's machine.
       - run: just setup
-      - run: just doctor
-      - run: just build
-      - run: just test
-      - run: just lint
 
-      - uses: actions/upload-artifact@v4
+      - if: contains(matrix.checks, 'main')
+        run: just doctor
+
+      - name: Conan cache key
+        id: conan-key
+        run: |
+          $key = uv run python tools/dev.py conan-cache-key ${{ matrix.conan-preset }}
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "key=$key" >> $env:GITHUB_OUTPUT
+
+      - name: Restore Conan packages
+        id: conan-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.conan2/p
+          key: ${{ steps.conan-key.outputs.key }}
+
+      - id: deps
+        run: just deps ${{ matrix.conan-preset }}
+
+      - name: Trim Conan packages
+        if: steps.conan-cache.outputs.cache-hit != 'true'
+        run: uv run python tools/dev.py conan-cache-trim
+
+      - name: Save Conan packages
+        if: steps.conan-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.conan2/p
+          key: ${{ steps.conan-key.outputs.key }}
+
+      - if: contains(matrix.checks, 'main')
+        run: just build
+      - if: contains(matrix.checks, 'main')
+        run: just test
+      - if: contains(matrix.checks, 'main')
+        run: just lint
+
+      - if: contains(matrix.checks, 'main')
+        uses: actions/upload-artifact@v7
         with:
           name: taz-windows-x64-debug
           path: daemon/build/windows-debug/tazd.exe
 
-  windows-checks:
-    name: Windows ${{ matrix.check }}
-    runs-on: windows-2025
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - check: asan
-            run: just test-c windows-asan
-          - check: analyze
-            run: just build windows-analyze
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'asan') }}
+        run: just test-c windows-asan
 
-      - name: Install pinned tools
-        uses: jdx/mise-action@v2
-        with:
-          install: true
-          cache: true
-
-      - name: Cache Conan packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.conan2/p
-          key: conan-${{ runner.os }}-msvc-${{ hashFiles('daemon/conanfile.py', 'daemon/profiles/*') }}
-          restore-keys: conan-${{ runner.os }}-
-
-      - run: just setup
-      - run: ${{ matrix.run }}
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'analyze') }}
+        run: just build windows-analyze

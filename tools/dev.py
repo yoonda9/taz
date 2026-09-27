@@ -7,7 +7,10 @@ read identically on Linux, macOS and Windows.
 
 Subcommands:
     conan-profiles       create the detected Conan base profiles (default, clang)
-    configure PRESET     conan install (profiles from the preset name) + cmake --preset
+    deps PRESET          conan install (profiles from the preset name)
+    configure PRESET     deps + cmake --preset
+    conan-cache-key PRESET   CI cache key for the Conan packages a preset needs
+    conan-cache-trim     drop what a restored CI package cache never uses
     cmake ARGS...        run cmake; on Windows, load the MSVC environment first
     ctest ARGS...        run ctest; same MSVC environment handling
     proto [--check]      regenerate Python + C protobuf code (or verify no diff)
@@ -26,6 +29,8 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import platform
 import shutil
@@ -173,6 +178,9 @@ def ensure_msvc_env(*, required: bool = True) -> bool:
 # Conan + CMake configure
 # ---------------------------------------------------------------------------
 PROFILES_DIR = ROOT / "daemon" / "profiles"
+# Set by CI to the preset its Conan package cache is keyed on (see
+# cmd_conan_cache_key); `deps` then refuses presets that need other packages.
+CI_CONAN_PRESET_VAR = "TAZ_CI_CONAN_PRESET"
 
 
 def cmd_conan_profiles() -> None:
@@ -208,23 +216,81 @@ def host_profiles_for(preset: str) -> list[str]:
     return ["default", str(PROFILES_DIR / "linux-static")]
 
 
-def cmd_configure(preset: str) -> None:
-    ensure_msvc_env()
+def conan_profile_args(preset: str) -> list[str]:
+    """Conan arguments selecting a preset's settings and host profile chain."""
     build_type = "Release" if preset.endswith("-release") else "Debug"
-    output = ROOT / "daemon" / "build" / preset / "conan"
-    cmd: list[str | Path] = [
-        tool("conan"),
-        "install",
-        ROOT / "daemon",
-        f"--output-folder={output}",
-        "--build=missing",
-        "-s",
-        f"build_type={build_type}",
-    ]
+    args = ["-s", f"build_type={build_type}"]
     for profile in host_profiles_for(preset):
-        cmd += ["--profile:host", profile]
-    run(cmd)
+        args += ["--profile:host", profile]
+    return args
+
+
+def cmd_deps(preset: str) -> None:
+    ensure_msvc_env()
+    cached = os.environ.get(CI_CONAN_PRESET_VAR)
+    if cached and conan_profile_args(preset) != conan_profile_args(cached):
+        sys.exit(
+            f"error: {preset} needs other Conan packages than {cached}, which this "
+            "CI job's package cache is keyed on. Build it in its own matrix entry."
+        )
+    output = ROOT / "daemon" / "build" / preset / "conan"
+    run(
+        [
+            tool("conan"),
+            "install",
+            ROOT / "daemon",
+            f"--output-folder={output}",
+            "--build=missing",
+            *conan_profile_args(preset),
+        ]
+    )
+
+
+def cmd_configure(preset: str) -> None:
+    cmd_deps(preset)
     run([tool("cmake"), "-S", ROOT / "daemon", "--preset", preset])
+
+
+def cmd_conan_cache_key(preset: str) -> None:
+    """Print the CI cache key for the Conan packages a preset needs.
+
+    The digest covers everything that decides those binaries: the Conan
+    version, the resolved host and build profiles (so a runner image with a
+    new compiler starts a fresh cache) and conanfile.py. CI restores exact
+    matches only: package ids ignore [conf] such as compiler_executables, so a
+    cache filled under other profiles can satisfy `conan install` with
+    binaries the current profiles would not produce.
+    """
+    conan = tool("conan")
+    version = subprocess.run(
+        [conan, "--version"], capture_output=True, text=True, check=True
+    ).stdout
+    profiles = subprocess.run(
+        [conan, "profile", "show", *conan_profile_args(preset), "--format=json"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    digest = hashlib.sha256()
+    for part in (version, profiles, (ROOT / "daemon" / "conanfile.py").read_text()):
+        digest.update(part.encode())
+    host = json.loads(profiles)["host"]["settings"]
+    fields = ("os", "compiler", "compiler.version", "build_type")
+    print("-".join(["conan", *(host[f] for f in fields), digest.hexdigest()[:16]]))
+
+
+def cmd_conan_cache_trim() -> None:
+    """Shrink the Conan package cache before CI saves it.
+
+    Build, source and download folders are never reused, and the CMake tool
+    package (about 200 MB) is only needed to build libuv from source, which a
+    restored cache never does. Its recipe stays so the graph still resolves
+    offline.
+    """
+    conan = tool("conan")
+    run([conan, "cache", "clean"])
+    run([conan, "remove", "cmake/*:*", "--confirm"])
 
 
 def cmd_passthrough(program: str, args: Sequence[str]) -> None:
@@ -634,8 +700,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub.add_parser("cmake", help="run cmake ARGS... (handled before argparse)")
     sub.add_parser("ctest", help="run ctest ARGS... (handled before argparse)")
     sub.add_parser("conan-profiles")
+    p = sub.add_parser("deps")
+    p.add_argument("preset")
     p = sub.add_parser("configure")
     p.add_argument("preset")
+    p = sub.add_parser("conan-cache-key")
+    p.add_argument("preset")
+    sub.add_parser("conan-cache-trim")
     p = sub.add_parser("proto")
     p.add_argument("--check", action="store_true")
     p = sub.add_parser("clang-format")
@@ -666,8 +737,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     match args.command:
         case "conan-profiles":
             cmd_conan_profiles()
+        case "deps":
+            cmd_deps(args.preset)
         case "configure":
             cmd_configure(args.preset)
+        case "conan-cache-key":
+            cmd_conan_cache_key(args.preset)
+        case "conan-cache-trim":
+            cmd_conan_cache_trim()
         case "proto":
             cmd_proto(args.check)
         case "clang-format":

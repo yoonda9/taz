@@ -43,6 +43,10 @@ proto-check:
 
 # --- daemon build -----------------------------------------------------------
 
+# Install the preset's Conan dependencies (the first half of `configure`)
+deps preset=preset:
+    {{ dev }} deps {{ preset }}
+
 # Configure the daemon: `conan install` with the preset's host profiles, then
 # `cmake --preset`. On Windows the MSVC environment is loaded first if needed.
 configure preset=preset:

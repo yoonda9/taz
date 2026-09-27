@@ -70,9 +70,12 @@ just --list         # everything else
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`). Matrix: Linux GCC, Linux Clang,
-Windows MSVC; plus per-check jobs for ASan, TSan, Valgrind, coverage, and
-static analysis. Every step is a `just` recipe.
+GitHub Actions (`.github/workflows/ci.yml`). One job per toolchain: Linux GCC
+(build, test, lint, ASan, TSan, Valgrind, static analysis, coverage), Linux
+Clang, Windows MSVC (build, test, lint), and Windows ASan + static analysis.
+Every check is a `just` recipe and runs even when an earlier one fails. The
+Conan package cache is restored only on an exact key match
+(`tools/dev.py conan-cache-key`).
 
 ## Do not
 
