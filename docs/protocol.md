@@ -1,6 +1,6 @@
 # TAZ Protocol Design
 
-> Living document. Last updated: 2026-09-26
+> Living document. Last updated: 2026-09-28
 
 ## 1. Overview
 
@@ -67,6 +67,7 @@ Identifies the kind of message. Dispatch is an integer switch, not string matchi
 
 | Value         | Name         | Description                                          |
 | ------------- | ------------ | ---------------------------------------------------- |
+| `0x00`        | —            | Never valid; handled as an unknown type (§10.1)      |
 | `0x01`        | `REQUEST`    | Client-to-daemon RPC request                         |
 | `0x02`        | `RESPONSE`   | Daemon-to-client RPC response                        |
 | `0x03`        | `FILE_CHUNK` | A chunk of file data (upload or download)            |
@@ -110,7 +111,7 @@ Identifies the RPC operation, encoded as a **16-bit unsigned little-endian** int
 
 - Only meaningful on `REQUEST` frames — routes the payload to the correct handler on the daemon.
 - On `RESPONSE` and `ERROR` frames, senders MUST echo the opcode of the originating request (aids debugging and lets the client validate schema before parsing).
-- On `FILE_CHUNK`, `PING`, `PONG`, and `CAPABILITY` frames, `opcode` MUST be `0`.
+- On `FILE_CHUNK`, `PING`, `PONG`, and `CAPABILITY` frames, senders MUST set `opcode` to `0` and receivers MUST ignore it. These frames are routed by `type` and `stream_id` alone, so a nonzero value is not an error.
 - The full set of assigned opcodes is defined in the `.proto` schema and mirrored in the `CAPABILITY` frame's `operations` list (see [api.md](api.md)).
 - Opcode `0` is reserved and means "no operation" — never used for a real RPC.
 
@@ -308,7 +309,8 @@ There is no client-side capability message. The connection is ready for requests
 ### 10.1 Frame-Level Errors
 
 - **Oversized frame:** receiver reads the 12-byte header, sees `length` exceeds its maximum for that `type`, and (a) on a full-OS daemon SHOULD send an `ERROR` frame with `INVALID_REQUEST` and then close the connection; (b) on a constrained daemon MAY simply close the connection with no ERROR frame.
-- **Unknown type:** receiver sends an `ERROR` frame with `NOT_SUPPORTED` and continues (forward compatibility).
+- **Unknown type** (any value not assigned in §4.2, including `0x00`): the payload's meaning is unknown, but `length` still delimits it. If `length` is no larger than the largest payload limit the receiver enforces for any known type (64 KiB with the §6 defaults), the receiver discards exactly `length` payload bytes and continues (forward compatibility): a daemon also sends an `ERROR` frame with `NOT_SUPPORTED` echoing the frame's `stream_id` and `opcode`, and a client drops the frame silently. A larger `length` is handled as an oversized frame, so a peer cannot hold the connection with gigabytes of payload nobody can parse.
+- **Opcode on `FILE_CHUNK`, `PING`, `PONG`, `CAPABILITY`:** ignored (§4.4).
 - **Unknown opcode:** receiver sends an `ERROR` frame with `NOT_SUPPORTED` echoing the request's `stream_id` and continues.
 - **Unknown flags:** receiver ignores unknown flag bits (forward compatibility).
 
