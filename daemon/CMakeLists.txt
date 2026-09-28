@@ -196,19 +196,27 @@ target_link_libraries(taz_proto PUBLIC nanopb::nanopb)
 add_library(taz::proto ALIAS taz_proto)
 
 # ---------------------------------------------------------------------------
-# Daemon executable
+# Core logic library (frame pack/unpack/validate; shared by daemon and tests)
 # ---------------------------------------------------------------------------
-add_executable(tazd src/main.c)
-target_include_directories(tazd PRIVATE include)
+add_library(taz_core STATIC src/frame.c)
+target_include_directories(taz_core PUBLIC include)
 # Strict -std=c11 hides POSIX declarations that libuv's headers rely on
 # (pthread_rwlock_t, pthread_barrier_t); libuv documents _GNU_SOURCE on Linux.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_compile_definitions(tazd PRIVATE _GNU_SOURCE)
+    target_compile_definitions(taz_core PUBLIC _GNU_SOURCE)
 endif()
+# taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
+# to the C++ GoogleTest target that links taz_core.
+target_link_libraries(taz_core PRIVATE taz_warnings PUBLIC taz::proto libuv::uv_a)
+
+# ---------------------------------------------------------------------------
+# Daemon executable
+# ---------------------------------------------------------------------------
+add_executable(tazd src/main.c)
 target_compile_definitions(tazd PRIVATE TAZ_VERSION="${PROJECT_VERSION}"
                                         TAZ_BUILD_ID="${TAZ_BUILD_ID}")
-# Conan's libuv recipe exports the static library as libuv::uv_a.
-target_link_libraries(tazd PRIVATE taz_warnings taz::proto libuv::uv_a)
+# include/, _GNU_SOURCE, taz::proto, and libuv::uv_a come in transitively.
+target_link_libraries(tazd PRIVATE taz_warnings taz_core)
 
 install(TARGETS tazd)
 

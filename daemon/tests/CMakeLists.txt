@@ -4,8 +4,8 @@
 find_package(GTest REQUIRED CONFIG)
 include(GoogleTest)
 
-add_executable(taz_tests test_proto.cpp)
-target_link_libraries(taz_tests PRIVATE taz::proto GTest::gtest_main)
+add_executable(taz_tests test_proto.cpp test_frame.cpp)
+target_link_libraries(taz_tests PRIVATE taz_core taz::proto GTest::gtest_main)
 target_include_directories(taz_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 gtest_discover_tests(taz_tests)
