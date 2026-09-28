@@ -5,8 +5,9 @@ from __future__ import annotations
 import enum
 import socket as _socket
 import struct
+import types
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from taz.c3.errors import TazError, TazProtocolError
 from taz.v1 import common_pb2
@@ -14,16 +15,20 @@ from taz.v1 import common_pb2
 _STRUCT = struct.Struct("<BBHII")
 HEADER_SIZE = _STRUCT.size
 
-# Protocol §6 default payload limits keyed by frame type integer value.
-DEFAULT_MAX_PAYLOAD: Mapping[int, int] = {
-    common_pb2.FRAME_TYPE_PING: 0,
-    common_pb2.FRAME_TYPE_PONG: 0,
-    common_pb2.FRAME_TYPE_CAPABILITY: 1024,
-    common_pb2.FRAME_TYPE_ERROR: 4096,
-    common_pb2.FRAME_TYPE_REQUEST: 65536,
-    common_pb2.FRAME_TYPE_RESPONSE: 65536,
-    common_pb2.FRAME_TYPE_FILE_CHUNK: 65536,
-}
+# Protocol §6 default payload limits keyed by frame type integer value. Its keys
+# are exactly the types assigned in §4.2. Read-only because recv_frame uses it
+# as its default table.
+DEFAULT_MAX_PAYLOAD: Mapping[int, int] = types.MappingProxyType(
+    {
+        common_pb2.FRAME_TYPE_PING: 0,
+        common_pb2.FRAME_TYPE_PONG: 0,
+        common_pb2.FRAME_TYPE_CAPABILITY: 1024,
+        common_pb2.FRAME_TYPE_ERROR: 4096,
+        common_pb2.FRAME_TYPE_REQUEST: 65536,
+        common_pb2.FRAME_TYPE_RESPONSE: 65536,
+        common_pb2.FRAME_TYPE_FILE_CHUNK: 65536,
+    }
+)
 
 
 class Verdict(enum.Enum):
@@ -39,7 +44,8 @@ class Frame:
     opcode: int
     length: int
     stream_id: int
-    payload: bytes = b""
+    # Kept out of repr so logging a frame does not dump up to 64 KiB of payload.
+    payload: bytes = field(default=b"", repr=False)
 
 
 def pack_header(frame: Frame) -> bytes:
@@ -54,14 +60,29 @@ def unpack_header(data: bytes) -> Frame:
 
 
 def validate_header(frame: Frame, limits: Mapping[int, int]) -> Verdict:
-    if frame.type in limits:
-        if frame.length > limits[frame.type]:
+    """Check a header against per-type payload limits.
+
+    A type is known if protocol §4.2 assigns it (the keys of
+    DEFAULT_MAX_PAYLOAD), as in the C daemon. ``limits`` overrides the default
+    for a known type; entries for other types are ignored.
+    """
+    if frame.type in DEFAULT_MAX_PAYLOAD:
+        if frame.length > limits.get(frame.type, DEFAULT_MAX_PAYLOAD[frame.type]):
             return Verdict.OVERSIZED
         return Verdict.OK
-    # Unknown type — bound by the largest limit in the table (§10.1).
-    if frame.length > max(limits.values()):
+    # Unknown type — bound by the largest known-type limit (§10.1).
+    bound = max(limits.get(t, d) for t, d in DEFAULT_MAX_PAYLOAD.items())
+    if frame.length > bound:
         return Verdict.OVERSIZED
     return Verdict.UNKNOWN_TYPE
+
+
+def _connection_lost(exc: OSError) -> TazError:
+    if isinstance(exc, TimeoutError):
+        message = "connection timed out"
+    else:
+        message = f"connection lost: {exc}"
+    return TazError(common_pb2.ERROR_CODE_CONNECTION_LOST, message)
 
 
 def _recv_exact(sock: _socket.socket, n: int) -> bytes:
@@ -71,11 +92,8 @@ def _recv_exact(sock: _socket.socket, n: int) -> bytes:
     while received < n:
         try:
             chunk = sock.recv_into(view[received:], n - received)
-        except TimeoutError as exc:
-            raise TazError(
-                common_pb2.ERROR_CODE_CONNECTION_LOST,
-                "connection timed out",
-            ) from exc
+        except OSError as exc:  # timeout, reset, abort, closed socket
+            raise _connection_lost(exc) from exc
         if chunk == 0:
             raise TazError(
                 common_pb2.ERROR_CODE_CONNECTION_LOST,
@@ -103,4 +121,7 @@ def recv_frame(
 def send_frame(sock: _socket.socket, frame: Frame) -> None:
     frame.length = len(frame.payload)
     data = pack_header(frame) + frame.payload
-    sock.sendall(data)
+    try:
+        sock.sendall(data)
+    except OSError as exc:  # timeout (possibly mid-frame), reset, broken pipe
+        raise _connection_lost(exc) from exc

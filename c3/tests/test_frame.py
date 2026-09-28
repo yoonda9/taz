@@ -30,15 +30,25 @@ def _verdict(type_: int, length: int) -> frame.Verdict:
     return frame.validate_header(_frame(type_, length), frame.DEFAULT_MAX_PAYLOAD)
 
 
-def _sock(*chunks: bytes) -> MagicMock:
-    """Mock socket whose recv_into serves ``chunks`` one read at a time, then EOF."""
+def _sock(*chunks: bytes | OSError) -> MagicMock:
+    """Mock socket whose recv_into serves ``chunks`` one read at a time, then EOF.
+
+    An exception in ``chunks`` is raised by the read that reaches it. Arguments
+    are checked as socket.recv_into checks them.
+    """
     pending = list(chunks)
 
-    def recv_into(buf: memoryview, n: int) -> int:
+    def recv_into(buf: memoryview, nbytes: int = 0, flags: int = 0) -> int:
+        if nbytes < 0:
+            raise ValueError("negative buffersize in recv_into")
+        if nbytes > len(buf):
+            raise ValueError("buffer too small for requested bytes")
         if not pending:
             return 0
         chunk = pending.pop(0)
-        size = min(n, len(chunk))
+        if isinstance(chunk, OSError):
+            raise chunk
+        size = min(nbytes or len(buf), len(chunk))
         buf[:size] = chunk[:size]
         if size < len(chunk):
             pending.insert(0, chunk[size:])
@@ -109,6 +119,12 @@ class TestPackUnpack:
         """Verify HEADER_SIZE is exactly 12 bytes."""
         assert frame.HEADER_SIZE == 12
 
+    def test_repr_omits_payload(self) -> None:
+        """Logging a frame does not dump its payload."""
+        f = _frame(common_pb2.FRAME_TYPE_FILE_CHUNK, 65536)
+        f.payload = b"\xab" * 65536
+        assert "payload" not in repr(f)
+
     @pytest.mark.parametrize("opcode", [0xFFFF, 0x0000, 0x0134])
     def test_opcode_edge_values_roundtrip(self, opcode: int) -> None:
         """Verify opcode boundary values survive pack/unpack."""
@@ -149,6 +165,11 @@ class TestMaxPayloadTable:
         }
         assert set(frame.DEFAULT_MAX_PAYLOAD) == known_types
 
+    def test_default_table_is_read_only(self) -> None:
+        """The defaults (recv_frame's default argument) cannot be mutated."""
+        with pytest.raises(TypeError):
+            frame.DEFAULT_MAX_PAYLOAD[common_pb2.FRAME_TYPE_PING] = 1  # type: ignore[index]
+
 
 # ---------------------------------------------------------------------------
 # Validate header
@@ -158,26 +179,45 @@ class TestMaxPayloadTable:
 class TestValidateHeader:
     """Test header validation logic."""
 
-    def test_validate_known_types_at_limit_is_ok(self) -> None:
-        """Known types at their limit pass validation."""
-        for ftype, limit in frame.DEFAULT_MAX_PAYLOAD.items():
-            assert _verdict(ftype, limit) == frame.Verdict.OK, f"type={ftype}"
+    @pytest.mark.parametrize(
+        ("ftype", "limit"), sorted(frame.DEFAULT_MAX_PAYLOAD.items())
+    )
+    def test_validate_known_type_limit_boundary(self, ftype: int, limit: int) -> None:
+        """A known type is OK at its limit and OVERSIZED one byte over (§6)."""
+        assert _verdict(ftype, limit) == frame.Verdict.OK
+        assert _verdict(ftype, limit + 1) == frame.Verdict.OVERSIZED
 
-    def test_validate_ping_with_payload_is_oversized(self) -> None:
-        """PING with any payload fails validation."""
-        assert _verdict(common_pb2.FRAME_TYPE_PING, 1) == frame.Verdict.OVERSIZED
+    def test_validate_limits_for_unassigned_types_are_ignored(self) -> None:
+        """Table entries for unassigned types neither make them known nor raise
+        the unknown-type bound (§4.2, §10.1)."""
+        limits = {**frame.DEFAULT_MAX_PAYLOAD, 0x00: 1 << 20, 0x08: 1 << 20}
 
-    def test_validate_capability_oversized(self) -> None:
-        """CAPABILITY exceeding its limit fails validation."""
-        limit = frame.DEFAULT_MAX_PAYLOAD[common_pb2.FRAME_TYPE_CAPABILITY]
-        verdict = _verdict(common_pb2.FRAME_TYPE_CAPABILITY, limit + 1)
-        assert verdict == frame.Verdict.OVERSIZED
+        def verdict(ftype: int, length: int) -> frame.Verdict:
+            return frame.validate_header(_frame(ftype, length), limits)
 
-    def test_validate_request_oversized(self) -> None:
-        """REQUEST exceeding its limit fails validation."""
-        limit = frame.DEFAULT_MAX_PAYLOAD[common_pb2.FRAME_TYPE_REQUEST]
-        verdict = _verdict(common_pb2.FRAME_TYPE_REQUEST, limit + 1)
-        assert verdict == frame.Verdict.OVERSIZED
+        assert verdict(0x00, 100) == frame.Verdict.UNKNOWN_TYPE
+        assert verdict(0x08, 100) == frame.Verdict.UNKNOWN_TYPE
+        assert verdict(0x09, _UNKNOWN_BOUND + 1) == frame.Verdict.OVERSIZED
+
+    def test_validate_partial_limits_fall_back_to_defaults(self) -> None:
+        """Known types missing from the table keep their §6 default."""
+        limits: dict[int, int] = {common_pb2.FRAME_TYPE_REQUEST: 1024}
+
+        def verdict(ftype: int, length: int) -> frame.Verdict:
+            return frame.validate_header(_frame(ftype, length), limits)
+
+        assert verdict(common_pb2.FRAME_TYPE_PING, 0) == frame.Verdict.OK
+        assert verdict(common_pb2.FRAME_TYPE_PING, 1) == frame.Verdict.OVERSIZED
+        assert verdict(common_pb2.FRAME_TYPE_ERROR, 2048) == frame.Verdict.OK
+        assert verdict(common_pb2.FRAME_TYPE_REQUEST, 1025) == frame.Verdict.OVERSIZED
+        assert verdict(0x08, _UNKNOWN_BOUND) == frame.Verdict.UNKNOWN_TYPE
+        assert frame.validate_header(_frame(0x08, 0), {}) == frame.Verdict.UNKNOWN_TYPE
+
+    def test_validate_raised_limit_raises_unknown_type_bound(self) -> None:
+        """The unknown-type bound follows the largest known-type limit (§10.1)."""
+        limits = {**frame.DEFAULT_MAX_PAYLOAD, common_pb2.FRAME_TYPE_RESPONSE: 1 << 17}
+        f = _frame(0x08, 1 << 17)
+        assert frame.validate_header(f, limits) == frame.Verdict.UNKNOWN_TYPE
 
     @pytest.mark.parametrize("ftype", [0x00, 0x08, 0xFF])
     def test_validate_unknown_type_within_bound_is_unknown_type(
@@ -235,6 +275,22 @@ class TestSendFrame:
 
         assert f.length == 0
         mock_sock.sendall.assert_called_once_with(frame.pack_header(f))
+
+    @pytest.mark.parametrize(
+        "error", [BrokenPipeError(32, "Broken pipe"), TimeoutError("timed out")]
+    )
+    def test_send_frame_socket_error_raises_connection_lost(
+        self, error: OSError
+    ) -> None:
+        """A failed or timed-out sendall surfaces as TazError(CONNECTION_LOST)."""
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.sendall.side_effect = error
+
+        with pytest.raises(TazError) as exc_info:
+            frame.send_frame(mock_sock, _frame(common_pb2.FRAME_TYPE_PING))
+
+        assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
+        assert exc_info.value.__cause__ is error
 
 
 class TestRecvFrame:
@@ -295,6 +351,54 @@ class TestRecvFrame:
 
         assert "closed by peer" in str(exc_info.value)
         assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
+
+    @pytest.mark.parametrize(
+        "received",
+        [5, frame.HEADER_SIZE + 4],
+        ids=["mid-header", "mid-payload"],
+    )
+    def test_recv_frame_eof_mid_frame_raises_taz_error(self, received: int) -> None:
+        """EOF partway through a frame is CONNECTION_LOST, never a short frame."""
+        payload = b"0123456789"
+        header = frame.pack_header(_frame(common_pb2.FRAME_TYPE_REQUEST, len(payload)))
+        mock_sock = _sock((header + payload)[:received])
+
+        with pytest.raises(TazError) as exc_info:
+            frame.recv_frame(mock_sock)
+
+        assert "closed by peer" in str(exc_info.value)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
+
+    def test_recv_frame_connection_reset_raises_taz_error(self) -> None:
+        """A reset mid-frame (e.g. the daemon closing after an ERROR, §10.1)
+        surfaces as TazError(CONNECTION_LOST), not a raw OSError."""
+        reset = ConnectionResetError(104, "Connection reset by peer")
+        header = frame.pack_header(_frame(common_pb2.FRAME_TYPE_RESPONSE, 8))
+        mock_sock = _sock(header, b"1234", reset)
+
+        with pytest.raises(TazError) as exc_info:
+            frame.recv_frame(mock_sock)
+
+        assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
+        assert exc_info.value.__cause__ is reset
+
+    def test_recv_frame_unknown_type_returned_with_payload(self) -> None:
+        """An in-bounds unknown-type frame is returned whole, so the next frame
+        still parses (§10.1 forward compatibility)."""
+        unknown_payload = b"future"
+        unknown = frame.pack_header(_frame(0x08, len(unknown_payload), stream_id=3))
+        ping = frame.pack_header(_frame(common_pb2.FRAME_TYPE_PING))
+        mock_sock = _sock(unknown + unknown_payload + ping)
+
+        f1 = frame.recv_frame(mock_sock)
+        f2 = frame.recv_frame(mock_sock)
+
+        assert f1.type == 0x08
+        assert f1.payload == unknown_payload
+        assert frame.validate_header(f1, frame.DEFAULT_MAX_PAYLOAD) == (
+            frame.Verdict.UNKNOWN_TYPE
+        )
+        assert f2.type == common_pb2.FRAME_TYPE_PING
 
     def test_recv_frame_custom_limits(self) -> None:
         """recv_frame respects custom max payload limits."""
