@@ -515,6 +515,140 @@ class TestRecvFrame:
 
         assert "oversized" in str(exc_info.value)
 
+    def test_recv_frame_partial_header_reassembly(self) -> None:
+        """recv_frame reassembles a header that arrives in multiple partial reads."""
+        payload = b"partial_test"
+        header = struct.pack(
+            "<BBHII",
+            common_pb2.FRAME_TYPE_REQUEST,
+            0,  # flags
+            5,  # opcode
+            len(payload),
+            99,  # stream_id
+        )
+
+        # Wire data arrives in 3 chunks: first 4 bytes, last 8 bytes of header, payload.
+        chunks = [header[:4], header[4:], payload]
+        chunk_iter = iter(chunks)
+
+        def recv_into_partial(buf: bytearray, n: int) -> int:
+            data = next(chunk_iter)
+            to_write = min(len(data), n)
+            buf[:to_write] = data[:to_write]
+            return to_write
+
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.recv_into.side_effect = recv_into_partial
+
+        f = frame.recv_frame(mock_sock, frame.DEFAULT_MAX_PAYLOAD)
+
+        assert f.type == common_pb2.FRAME_TYPE_REQUEST
+        assert f.opcode == 5
+        assert f.stream_id == 99
+        assert f.payload == payload
+
+    def test_recv_frame_concatenated_frames_boundary(self) -> None:
+        """recv_frame reads exactly one frame when two frames arrive back-to-back."""
+        payload1 = b"first_frame_payload"
+        payload2 = b"second_frame_payload"
+
+        header1 = struct.pack(
+            "<BBHII",
+            common_pb2.FRAME_TYPE_REQUEST,
+            0,
+            1,
+            len(payload1),
+            1,
+        )
+        header2 = struct.pack(
+            "<BBHII",
+            common_pb2.FRAME_TYPE_RESPONSE,
+            0,
+            2,
+            len(payload2),
+            2,
+        )
+
+        wire_data = header1 + payload1 + header2 + payload2
+        pos = 0
+
+        def recv_into_stream(buf: bytearray, n: int) -> int:
+            nonlocal pos
+            to_read = min(n, len(wire_data) - pos)
+            if to_read == 0:
+                return 0
+            buf[:to_read] = wire_data[pos : pos + to_read]
+            pos += to_read
+            return to_read
+
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.recv_into.side_effect = recv_into_stream
+
+        f1 = frame.recv_frame(mock_sock, frame.DEFAULT_MAX_PAYLOAD)
+        f2 = frame.recv_frame(mock_sock, frame.DEFAULT_MAX_PAYLOAD)
+
+        assert f1.type == common_pb2.FRAME_TYPE_REQUEST
+        assert f1.opcode == 1
+        assert f1.stream_id == 1
+        assert f1.payload == payload1
+
+        assert f2.type == common_pb2.FRAME_TYPE_RESPONSE
+        assert f2.opcode == 2
+        assert f2.stream_id == 2
+        assert f2.payload == payload2
+
+    def test_recv_frame_raised_response_limit_accepts_large_response(self) -> None:
+        """recv_frame with RESPONSE raised to 128 KiB accepts a 100 KiB response.
+
+        The default limit (65536) rejects it; a raised limit (131072) accepts it.
+        This verifies the limits parameter is actually used for validation.
+        """
+        payload_size = 100 * 1024  # 100 KiB — exceeds 64 KiB default
+        payload = b"x" * payload_size
+
+        response_frame = frame.Frame(
+            type=common_pb2.FRAME_TYPE_RESPONSE,
+            flags=0,
+            opcode=1,
+            length=payload_size,
+            stream_id=1,
+        )
+        # Confirm default limits reject this size.
+        assert (
+            frame.validate_header(response_frame, frame.DEFAULT_MAX_PAYLOAD)
+            == frame.Verdict.OVERSIZED
+        )
+
+        raised_limits = dict(frame.DEFAULT_MAX_PAYLOAD)
+        raised_limits[common_pb2.FRAME_TYPE_RESPONSE] = 128 * 1024  # 128 KiB
+
+        header = struct.pack(
+            "<BBHII",
+            common_pb2.FRAME_TYPE_RESPONSE,
+            0,
+            1,
+            payload_size,
+            1,
+        )
+        wire_data = header + payload
+        pos = 0
+
+        def recv_into_impl(buf: bytearray, n: int) -> int:
+            nonlocal pos
+            to_read = min(n, len(wire_data) - pos)
+            buf[:to_read] = wire_data[pos : pos + to_read]
+            pos += to_read
+            return to_read
+
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.recv_into.side_effect = recv_into_impl
+
+        f = frame.recv_frame(mock_sock, raised_limits)
+
+        assert f.type == common_pb2.FRAME_TYPE_RESPONSE
+        assert f.length == payload_size
+        assert f.payload == payload
+
 
 # ---------------------------------------------------------------------------
 # Verdict enum
