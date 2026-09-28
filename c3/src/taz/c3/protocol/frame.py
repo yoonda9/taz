@@ -6,13 +6,13 @@ import enum
 import socket as _socket
 import struct
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from taz.c3.errors import TazError, TazProtocolError
 from taz.v1 import common_pb2
 
-HEADER_SIZE = 12
 _STRUCT = struct.Struct("<BBHII")
+HEADER_SIZE = _STRUCT.size
 
 # Protocol §6 default payload limits keyed by frame type integer value.
 DEFAULT_MAX_PAYLOAD: Mapping[int, int] = {
@@ -39,7 +39,7 @@ class Frame:
     opcode: int
     length: int
     stream_id: int
-    payload: bytes = field(default=b"")
+    payload: bytes = b""
 
 
 def pack_header(frame: Frame) -> bytes:
@@ -49,14 +49,8 @@ def pack_header(frame: Frame) -> bytes:
 
 
 def unpack_header(data: bytes) -> Frame:
-    type_, flags, opcode, length, stream_id = _STRUCT.unpack(data[:HEADER_SIZE])
-    return Frame(
-        type=type_,
-        flags=flags,
-        opcode=opcode,
-        length=length,
-        stream_id=stream_id,
-    )
+    # Frame's header fields are declared in wire order.
+    return Frame(*_STRUCT.unpack_from(data))
 
 
 def validate_header(frame: Frame, limits: Mapping[int, int]) -> Verdict:
@@ -71,8 +65,6 @@ def validate_header(frame: Frame, limits: Mapping[int, int]) -> Verdict:
 
 
 def _recv_exact(sock: _socket.socket, n: int) -> bytes:
-    if n == 0:
-        return b""
     buf = bytearray(n)
     view = memoryview(buf)
     received = 0

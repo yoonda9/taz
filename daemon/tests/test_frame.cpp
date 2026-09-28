@@ -1,7 +1,6 @@
 // Tests for the C framing layer: pack/unpack, max-payload table, validate.
 
 #include <cstdint>
-#include <cstring>
 
 #include <gtest/gtest.h>
 
@@ -10,6 +9,23 @@
 
 namespace
 {
+
+taz_frame_header_t RoundTrip(const taz_frame_header_t &in)
+{
+    uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
+    taz_frame_pack_header(&in, buf);
+    taz_frame_header_t out{};
+    taz_frame_unpack_header(buf, &out);
+    return out;
+}
+
+taz_frame_verdict_t Validate(uint8_t type, uint32_t length)
+{
+    taz_frame_header_t h{};
+    h.type = type;
+    h.length = length;
+    return taz_frame_validate_header(&h);
+}
 
 // ---------------------------------------------------------------------------
 // Pack / unpack
@@ -24,11 +40,7 @@ TEST(Frame, PackUnpackRoundTrip)
     in.length = 0x00ABCDEFU;
     in.stream_id = 0xDEADBEEFU;
 
-    uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
-    taz_frame_pack_header(&in, buf);
-
-    taz_frame_header_t out{};
-    taz_frame_unpack_header(buf, &out);
+    const taz_frame_header_t out = RoundTrip(in);
 
     EXPECT_EQ(out.type, in.type);
     EXPECT_EQ(out.flags, in.flags);
@@ -82,17 +94,10 @@ TEST(Frame, OpcodeEdgeValuesRoundTrip)
     taz_frame_header_t h{};
     h.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
     h.opcode = 0xFFFFU;
-
-    uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
-    taz_frame_pack_header(&h, buf);
-    taz_frame_header_t out{};
-    taz_frame_unpack_header(buf, &out);
-    EXPECT_EQ(out.opcode, 0xFFFFU);
+    EXPECT_EQ(RoundTrip(h).opcode, 0xFFFFU);
 
     h.opcode = 0x0134U;
-    taz_frame_pack_header(&h, buf);
-    taz_frame_unpack_header(buf, &out);
-    EXPECT_EQ(out.opcode, 0x0134U);
+    EXPECT_EQ(RoundTrip(h).opcode, 0x0134U);
 }
 
 TEST(Frame, StreamIdBoundaryValuesRoundTrip)
@@ -101,17 +106,10 @@ TEST(Frame, StreamIdBoundaryValuesRoundTrip)
     taz_frame_header_t h{};
     h.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
     h.stream_id = 0U;
-
-    uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
-    taz_frame_pack_header(&h, buf);
-    taz_frame_header_t out{};
-    taz_frame_unpack_header(buf, &out);
-    EXPECT_EQ(out.stream_id, 0U);
+    EXPECT_EQ(RoundTrip(h).stream_id, 0U);
 
     h.stream_id = 0xFFFFFFFFU;
-    taz_frame_pack_header(&h, buf);
-    taz_frame_unpack_header(buf, &out);
-    EXPECT_EQ(out.stream_id, 0xFFFFFFFFU);
+    EXPECT_EQ(RoundTrip(h).stream_id, 0xFFFFFFFFU);
 }
 
 // ---------------------------------------------------------------------------
@@ -174,74 +172,53 @@ TEST(Frame, ValidateKnownTypesAtLimitIsOk)
     };
     for (uint8_t t : known_types)
     {
-        taz_frame_header_t h{};
-        h.type = t;
-        h.length = taz_frame_max_payload(t);
-        EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OK) << "type=" << +t;
+        EXPECT_EQ(Validate(t, taz_frame_max_payload(t)), TAZ_FRAME_OK)
+            << "type=" << +t;
     }
 }
 
 TEST(Frame, ValidatePingPongZeroLengthIsOk)
 {
-    taz_frame_header_t h{};
-    h.type = taz_v1_FrameType_FRAME_TYPE_PING;
-    h.length = 0U;
-    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OK);
-
-    h.type = taz_v1_FrameType_FRAME_TYPE_PONG;
-    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OK);
+    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_PING, 0U), TAZ_FRAME_OK);
+    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_PONG, 0U), TAZ_FRAME_OK);
 }
 
 TEST(Frame, ValidatePingWithPayloadIsOversized)
 {
-    taz_frame_header_t h{};
-    h.type = taz_v1_FrameType_FRAME_TYPE_PING;
-    h.length = 1U;
-    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OVERSIZED);
+    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_PING, 1U),
+              TAZ_FRAME_OVERSIZED);
 }
 
 TEST(Frame, ValidateCapabilityOversized)
 {
-    taz_frame_header_t h{};
-    h.type = taz_v1_FrameType_FRAME_TYPE_CAPABILITY;
-    h.length = TAZ_FRAME_MAX_PAYLOAD_CAPABILITY + 1U;
-    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OVERSIZED);
+    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_CAPABILITY,
+                       TAZ_FRAME_MAX_PAYLOAD_CAPABILITY + 1U),
+              TAZ_FRAME_OVERSIZED);
 }
 
 TEST(Frame, ValidateRequestOversized)
 {
-    taz_frame_header_t h{};
-    h.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
-    h.length = TAZ_FRAME_MAX_PAYLOAD_REQUEST + 1U;
-    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OVERSIZED);
+    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_REQUEST,
+                       TAZ_FRAME_MAX_PAYLOAD_REQUEST + 1U),
+              TAZ_FRAME_OVERSIZED);
 }
 
 TEST(Frame, ValidateUnknownTypeWithinBoundIsUnknownType)
 {
-    taz_frame_header_t h{};
-    h.type = taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED; // 0x00
-    h.length = 0U;
-    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_UNKNOWN_TYPE);
-
-    h.type = 0x08U; // reserved
-    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_UNKNOWN_TYPE);
+    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED, 0U), // 0x00
+              TAZ_FRAME_UNKNOWN_TYPE);
+    EXPECT_EQ(Validate(0x08U, 0U), TAZ_FRAME_UNKNOWN_TYPE); // reserved
 }
 
 TEST(Frame, ValidateUnknownTypeOversized)
 {
     // Unknown type still applies the 64 KiB guard (§10.1).
-    taz_frame_header_t h{};
-    h.type = 0x08U;
-    h.length = TAZ_FRAME_MAX_PAYLOAD + 1U;
-    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OVERSIZED);
+    EXPECT_EQ(Validate(0x08U, TAZ_FRAME_MAX_PAYLOAD + 1U), TAZ_FRAME_OVERSIZED);
 }
 
 TEST(Frame, ValidateUnknownTypeAtExactBoundIsUnknownType)
 {
-    taz_frame_header_t h{};
-    h.type = 0x09U;
-    h.length = TAZ_FRAME_MAX_PAYLOAD;
-    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_UNKNOWN_TYPE);
+    EXPECT_EQ(Validate(0x09U, TAZ_FRAME_MAX_PAYLOAD), TAZ_FRAME_UNKNOWN_TYPE);
 }
 
 TEST(Frame, ValidatePingNonzeroOpcodeIsOk)
@@ -263,12 +240,7 @@ TEST(Frame, ValidateAllFlagBitsSetIsOkAndRoundTrips)
     h.flags = 0xFFU;
     h.length = 0U;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OK);
-
-    uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
-    taz_frame_pack_header(&h, buf);
-    taz_frame_header_t out{};
-    taz_frame_unpack_header(buf, &out);
-    EXPECT_EQ(out.flags, 0xFFU);
+    EXPECT_EQ(RoundTrip(h).flags, 0xFFU);
 }
 
 } // namespace

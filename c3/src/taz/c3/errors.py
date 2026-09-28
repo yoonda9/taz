@@ -14,10 +14,11 @@ class TazError(Exception):
         self.detail = detail
 
     def __repr__(self) -> str:
+        cls = type(self).__name__
         name = common_pb2.ErrorCode.Name(self.code)
         if self.detail:
-            return f"TazError({name}, {self.message!r}, {self.detail!r})"
-        return f"TazError({name}, {self.message!r})"
+            return f"{cls}({name}, {self.message!r}, {self.detail!r})"
+        return f"{cls}({name}, {self.message!r})"
 
 
 class TazProtocolError(TazError):
