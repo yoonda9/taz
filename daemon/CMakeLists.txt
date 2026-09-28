@@ -207,7 +207,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 # taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
 # to the C++ GoogleTest target that links taz_core.
-target_link_libraries(taz_core PRIVATE taz_warnings PUBLIC taz::proto libuv::uv_a)
+target_link_libraries(
+    taz_core
+    PRIVATE taz_warnings
+    PUBLIC taz::proto libuv::uv_a)
 
 # ---------------------------------------------------------------------------
 # Daemon executable

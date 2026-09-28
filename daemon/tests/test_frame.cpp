@@ -18,10 +18,10 @@ namespace
 TEST(Frame, PackUnpackRoundTrip)
 {
     taz_frame_header_t in{};
-    in.type      = taz_v1_FrameType_FRAME_TYPE_REQUEST;
-    in.flags     = 0xABU;
-    in.opcode    = 0x1234U;
-    in.length    = 0x00ABCDEFU;
+    in.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
+    in.flags = 0xABU;
+    in.opcode = 0x1234U;
+    in.length = 0x00ABCDEFU;
     in.stream_id = 0xDEADBEEFU;
 
     uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
@@ -30,10 +30,10 @@ TEST(Frame, PackUnpackRoundTrip)
     taz_frame_header_t out{};
     taz_frame_unpack_header(buf, &out);
 
-    EXPECT_EQ(out.type,      in.type);
-    EXPECT_EQ(out.flags,     in.flags);
-    EXPECT_EQ(out.opcode,    in.opcode);
-    EXPECT_EQ(out.length,    in.length);
+    EXPECT_EQ(out.type, in.type);
+    EXPECT_EQ(out.flags, in.flags);
+    EXPECT_EQ(out.opcode, in.opcode);
+    EXPECT_EQ(out.length, in.length);
     EXPECT_EQ(out.stream_id, in.stream_id);
 }
 
@@ -41,16 +41,17 @@ TEST(Frame, WireLayoutLittleEndian)
 {
     // Verify each multi-byte field is stored little-endian.
     taz_frame_header_t h{};
-    h.type      = taz_v1_FrameType_FRAME_TYPE_RESPONSE;
-    h.flags     = 0x01U;
-    h.opcode    = 0x1234U;   // lo=0x34, hi=0x12
-    h.length    = 0x01020304U; // bytes: 04 03 02 01
+    h.type = taz_v1_FrameType_FRAME_TYPE_RESPONSE;
+    h.flags = 0x01U;
+    h.opcode = 0x1234U;        // lo=0x34, hi=0x12
+    h.length = 0x01020304U;    // bytes: 04 03 02 01
     h.stream_id = 0xAABBCCDDU; // bytes: DD CC BB AA
 
     uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
     taz_frame_pack_header(&h, buf);
 
-    EXPECT_EQ(buf[0], static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(buf[0],
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
     EXPECT_EQ(buf[1], 0x01U);
 
     // opcode LE
@@ -64,8 +65,8 @@ TEST(Frame, WireLayoutLittleEndian)
     EXPECT_EQ(buf[7], 0x01U);
 
     // stream_id LE
-    EXPECT_EQ(buf[8],  0xDDU);
-    EXPECT_EQ(buf[9],  0xCCU);
+    EXPECT_EQ(buf[8], 0xDDU);
+    EXPECT_EQ(buf[9], 0xCCU);
     EXPECT_EQ(buf[10], 0xBBU);
     EXPECT_EQ(buf[11], 0xAAU);
 }
@@ -79,7 +80,7 @@ TEST(Frame, OpcodeEdgeValuesRoundTrip)
 {
     // 0xFFFF and 0x0134 must survive pack/unpack unchanged.
     taz_frame_header_t h{};
-    h.type   = taz_v1_FrameType_FRAME_TYPE_REQUEST;
+    h.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
     h.opcode = 0xFFFFU;
 
     uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
@@ -98,7 +99,7 @@ TEST(Frame, StreamIdBoundaryValuesRoundTrip)
 {
     // stream_id=0 and 0xFFFFFFFF must survive pack/unpack unchanged.
     taz_frame_header_t h{};
-    h.type      = taz_v1_FrameType_FRAME_TYPE_REQUEST;
+    h.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
     h.stream_id = 0U;
 
     uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
@@ -171,9 +172,10 @@ TEST(Frame, ValidateKnownTypesAtLimitIsOk)
         taz_v1_FrameType_FRAME_TYPE_ERROR,
         taz_v1_FrameType_FRAME_TYPE_CAPABILITY,
     };
-    for (uint8_t t : known_types) {
+    for (uint8_t t : known_types)
+    {
         taz_frame_header_t h{};
-        h.type   = t;
+        h.type = t;
         h.length = taz_frame_max_payload(t);
         EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OK) << "type=" << +t;
     }
@@ -182,7 +184,7 @@ TEST(Frame, ValidateKnownTypesAtLimitIsOk)
 TEST(Frame, ValidatePingPongZeroLengthIsOk)
 {
     taz_frame_header_t h{};
-    h.type   = taz_v1_FrameType_FRAME_TYPE_PING;
+    h.type = taz_v1_FrameType_FRAME_TYPE_PING;
     h.length = 0U;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OK);
 
@@ -193,7 +195,7 @@ TEST(Frame, ValidatePingPongZeroLengthIsOk)
 TEST(Frame, ValidatePingWithPayloadIsOversized)
 {
     taz_frame_header_t h{};
-    h.type   = taz_v1_FrameType_FRAME_TYPE_PING;
+    h.type = taz_v1_FrameType_FRAME_TYPE_PING;
     h.length = 1U;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OVERSIZED);
 }
@@ -201,7 +203,7 @@ TEST(Frame, ValidatePingWithPayloadIsOversized)
 TEST(Frame, ValidateCapabilityOversized)
 {
     taz_frame_header_t h{};
-    h.type   = taz_v1_FrameType_FRAME_TYPE_CAPABILITY;
+    h.type = taz_v1_FrameType_FRAME_TYPE_CAPABILITY;
     h.length = TAZ_FRAME_MAX_PAYLOAD_CAPABILITY + 1U;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OVERSIZED);
 }
@@ -209,7 +211,7 @@ TEST(Frame, ValidateCapabilityOversized)
 TEST(Frame, ValidateRequestOversized)
 {
     taz_frame_header_t h{};
-    h.type   = taz_v1_FrameType_FRAME_TYPE_REQUEST;
+    h.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
     h.length = TAZ_FRAME_MAX_PAYLOAD_REQUEST + 1U;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OVERSIZED);
 }
@@ -217,7 +219,7 @@ TEST(Frame, ValidateRequestOversized)
 TEST(Frame, ValidateUnknownTypeWithinBoundIsUnknownType)
 {
     taz_frame_header_t h{};
-    h.type   = taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED; // 0x00
+    h.type = taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED; // 0x00
     h.length = 0U;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_UNKNOWN_TYPE);
 
@@ -229,7 +231,7 @@ TEST(Frame, ValidateUnknownTypeOversized)
 {
     // Unknown type still applies the 64 KiB guard (§10.1).
     taz_frame_header_t h{};
-    h.type   = 0x08U;
+    h.type = 0x08U;
     h.length = TAZ_FRAME_MAX_PAYLOAD + 1U;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OVERSIZED);
 }
@@ -237,16 +239,17 @@ TEST(Frame, ValidateUnknownTypeOversized)
 TEST(Frame, ValidateUnknownTypeAtExactBoundIsUnknownType)
 {
     taz_frame_header_t h{};
-    h.type   = 0x09U;
+    h.type = 0x09U;
     h.length = TAZ_FRAME_MAX_PAYLOAD;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_UNKNOWN_TYPE);
 }
 
 TEST(Frame, ValidatePingNonzeroOpcodeIsOk)
 {
-    // Validation never inspects the opcode field; PING with opcode 0xFFFF is OK.
+    // Validation never inspects the opcode field; PING with opcode 0xFFFF is
+    // OK.
     taz_frame_header_t h{};
-    h.type   = taz_v1_FrameType_FRAME_TYPE_PING;
+    h.type = taz_v1_FrameType_FRAME_TYPE_PING;
     h.length = 0U;
     h.opcode = 0xFFFFU;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OK);
@@ -256,8 +259,8 @@ TEST(Frame, ValidateAllFlagBitsSetIsOkAndRoundTrips)
 {
     // flags=0xFF must validate as OK and survive a pack/unpack round-trip.
     taz_frame_header_t h{};
-    h.type   = taz_v1_FrameType_FRAME_TYPE_REQUEST;
-    h.flags  = 0xFFU;
+    h.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
+    h.flags = 0xFFU;
     h.length = 0U;
     EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OK);
 
