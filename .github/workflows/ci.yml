@@ -177,6 +177,24 @@ jobs:
           version: ${{ env.MISE_VERSION }}
           install_args: ${{ matrix.mise-tools }}
 
+      # mise installs cppcheck on Linux only (conda-forge's Windows build cannot
+      # find its cfg files), so Windows takes the official MSI, checksum-
+      # verified. CPPCHECK_VERSION must equal the pin in mise.toml; `just
+      # doctor` fails otherwise.
+      - name: Install cppcheck
+        if: contains(matrix.checks, 'main')
+        env:
+          CPPCHECK_VERSION: 2.22.0
+          CPPCHECK_SHA256: 3929162bab7e71d1b9b18708ec054fb0188bfc8ea1660979ed95837f5a9f547b
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP "cppcheck-$env:CPPCHECK_VERSION-x64-Setup.msi"
+          Invoke-WebRequest -OutFile $msi -Uri "https://github.com/cppcheck-opensource/cppcheck/releases/download/$env:CPPCHECK_VERSION/cppcheck-$env:CPPCHECK_VERSION-x64-Setup.msi"
+          if ((Get-FileHash $msi -Algorithm SHA256).Hash -ne $env:CPPCHECK_SHA256) { throw "cppcheck installer checksum mismatch" }
+          $install = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "cppcheck install failed with exit code $($install.ExitCode)" }
+          & 'C:\Program Files\Cppcheck\cppcheck.exe' --version
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\Cppcheck'
+
       # No msvc-dev-cmd step on purpose: `just configure` must find MSVC by
       # itself (tools/dev.py loads vcvarsall via vswhere), exactly as on a
       # developer's machine.

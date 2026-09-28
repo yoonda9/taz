@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -445,6 +446,13 @@ def cmd_clang_tidy(build_dir: Path) -> None:
         sys.exit(1)
 
 
+def pinned_cppcheck_version() -> str:
+    """The cppcheck version in mise.toml; Windows installs must match it."""
+    with (ROOT / "mise.toml").open("rb") as f:
+        version: str = tomllib.load(f)["tools"]["conda:cppcheck"]["version"]
+    return version
+
+
 def cmd_cppcheck() -> None:
     run(
         [
@@ -587,7 +595,7 @@ def sanitizer_available(flag: str) -> bool:
 
 
 def cmd_doctor() -> None:
-    mise_tools = ["uv", "prek", "just", "cmake", "ninja", "buf", "prettier", "cppcheck"]
+    mise_tools = ["uv", "prek", "just", "cmake", "ninja", "buf", "prettier"]
     uv_tools = [
         "ruff",
         "mypy",
@@ -602,8 +610,14 @@ def cmd_doctor() -> None:
     optional_tools: dict[str, str] = {}
     if IS_WINDOWS:
         ensure_msvc_env(required=False)
-        system_tools = {"cl": "MSVC (Visual Studio Build Tools, C++ workload)"}
+        # mise installs cppcheck on Linux/macOS only (see mise.toml).
+        system_tools = {
+            "cl": "MSVC (Visual Studio Build Tools, C++ workload)",
+            "cppcheck": f"cppcheck {pinned_cppcheck_version()} "
+            "(official installer from cppcheck.sourceforge.io)",
+        }
     else:
+        mise_tools.append("cppcheck")
         system_tools = {"cc": "C compiler (gcc or clang)"}
         optional_tools = {
             "valgrind": "valgrind (apt/dnf; for `just test-valgrind`)",
@@ -634,6 +648,21 @@ def cmd_doctor() -> None:
         report(name, hint, required=True)
     for name, hint in optional_tools.items():
         report(name, hint, required=False)
+
+    # One cppcheck version everywhere, or `just lint` results differ by machine.
+    cppcheck = shutil.which("cppcheck")
+    if cppcheck:
+        pinned = pinned_cppcheck_version()
+        result = subprocess.run(
+            [cppcheck, "--version"], capture_output=True, text=True, check=False
+        )
+        found = (result.stdout.split() or ["unknown"])[-1]
+        print("cppcheck version (pinned in mise.toml):")
+        if found == pinned:
+            print(f"  ok       {found}")
+        else:
+            print(f"  WRONG    {found}  <- need {pinned}")
+            problems.append("cppcheck version")
 
     if not IS_WINDOWS and shutil.which("cc"):
         print("sanitizer runtimes (for `just test-sanitizers`):")

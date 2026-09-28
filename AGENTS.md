@@ -90,6 +90,7 @@ Every version is exact and bumped by hand (no update bot). Where each lives:
 | Build backend for `c3`        | `[tool.uv] build-constraint-dependencies` in `pyproject.toml` | edit, then `uv lock`                     |
 | C dependencies                | `daemon/conanfile.py` + `daemon/conan.lock`                   | edit versions, then `just lock-deps`     |
 | GitHub Actions                | `ci.yml` `uses:` commit SHA + `# vX.Y.Z`                      | replace both                             |
+| cppcheck on Windows           | `ci.yml` `CPPCHECK_VERSION` + `CPPCHECK_SHA256`               | same version as `mise.toml`              |
 | nanopb                        | submodule commit                                              | check out a tag in it, then `just proto` |
 
 Not pinned by the repo: runner images and their apt packages (Ubuntu 24.04,
