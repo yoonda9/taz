@@ -446,16 +446,9 @@ def cmd_clang_tidy(build_dir: Path) -> None:
 
 
 def cmd_cppcheck() -> None:
-    cppcheck = shutil.which("cppcheck")
-    if cppcheck is None:
-        message = "cppcheck not found on PATH (system package; see `just doctor`)"
-        if IN_CI:
-            sys.exit(f"error: {message}")
-        print(f"warning: {message}; skipping")
-        return
     run(
         [
-            cppcheck,
+            tool("cppcheck"),
             "--std=c11",
             "--enable=warning,style,performance,portability",
             "--error-exitcode=1",
@@ -594,7 +587,7 @@ def sanitizer_available(flag: str) -> bool:
 
 
 def cmd_doctor() -> None:
-    mise_tools = ["uv", "prek", "just", "cmake", "ninja", "buf", "prettier"]
+    mise_tools = ["uv", "prek", "just", "cmake", "ninja", "buf", "prettier", "cppcheck"]
     uv_tools = [
         "ruff",
         "mypy",
@@ -604,18 +597,17 @@ def cmd_doctor() -> None:
         "gcovr",
         "conan",
     ]
+    # name -> hint. Each is needed only by the recipe it names, which fails on
+    # its own when the tool is missing.
+    optional_tools: dict[str, str] = {}
     if IS_WINDOWS:
         ensure_msvc_env(required=False)
         system_tools = {"cl": "MSVC (Visual Studio Build Tools, C++ workload)"}
-        # name -> (hint, required when CI is set). Only tools that `just lint`
-        # itself needs are required in CI; jobs for the others fail on their own.
-        optional_tools = {"cppcheck": ("cppcheck (winget; required in CI)", True)}
     else:
         system_tools = {"cc": "C compiler (gcc or clang)"}
         optional_tools = {
-            "cppcheck": ("cppcheck (apt/dnf; required in CI)", True),
-            "valgrind": ("valgrind (apt/dnf; for `just test-valgrind`)", False),
-            "clang": ("clang (apt/dnf; for `just test-c linux-clang-debug`)", False),
+            "valgrind": "valgrind (apt/dnf; for `just test-valgrind`)",
+            "clang": "clang (apt/dnf; for `just test-c linux-clang-debug`)",
         }
 
     problems: list[str] = []
@@ -640,8 +632,8 @@ def cmd_doctor() -> None:
     print("system tools:")
     for name, hint in system_tools.items():
         report(name, hint, required=True)
-    for name, (hint, required_in_ci) in optional_tools.items():
-        report(name, hint, required=IN_CI and required_in_ci)
+    for name, hint in optional_tools.items():
+        report(name, hint, required=False)
 
     if not IS_WINDOWS and shutil.which("cc"):
         print("sanitizer runtimes (for `just test-sanitizers`):")

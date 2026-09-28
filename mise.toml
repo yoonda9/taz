@@ -12,8 +12,7 @@
 # each machine and in CI.
 #
 # Not provided by mise (checked by `just doctor`): a system C compiler
-# (GCC/Clang on Linux, MSVC + "C++ Clang tools for Windows" on Windows)
-# and cppcheck.
+# (GCC/Clang on Linux, MSVC + "C++ Clang tools for Windows" on Windows).
 
 [tools]
 uv = "0.12.19"
@@ -24,6 +23,12 @@ ninja = "1.13.2"
 buf = "1.73.0"
 node = "22.23.3"
 "npm:prettier" = "3.9.9"
+# cppcheck publishes release binaries for Windows only, and distro packages
+# lag (Ubuntu 24.04 has 2.13). conda-forge builds it for every platform; mise
+# fetches the package itself, no conda needed. The install is ~340 MB because
+# it carries its own Python, and only cppcheck is put on PATH. Its
+# dependencies resolve at install time, so only cppcheck's version is pinned.
+"conda:cppcheck" = "2.22.0"
 
 [env]
 # Keep the uv project venv in a predictable location so `just` recipes behave

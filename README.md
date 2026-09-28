@@ -26,9 +26,9 @@ Tool versions are pinned with [mise](https://mise.jdx.dev) and every task is a
 [`just`](https://just.systems) recipe. On a fresh clone:
 
 ```sh
-mise install     # pinned tools: uv, just, cmake, ninja, buf, prettier, prek
+mise install     # pinned tools: uv, just, cmake, ninja, buf, prettier, prek, cppcheck
 just setup       # Python env (incl. conan), git submodules, Conan profiles, pre-push hook
-just doctor      # reports anything mise cannot install (C compiler, cppcheck)
+just doctor      # reports anything mise cannot install (C compiler)
 ```
 
 Then:
@@ -54,7 +54,6 @@ The build produces the daemon binary `tazd`; the Python package installs the
   with the C++ workload and the "C++ Clang tools for Windows" component
   (provides `clang-format`/`clang-tidy` alongside the PyPI wheels used on
   other platforms).
-- `cppcheck` (`dnf`/`apt`/`winget`). Optional locally, required in CI.
 
 ## Hooks
 
