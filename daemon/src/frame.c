@@ -3,6 +3,33 @@
 #include <stddef.h>
 
 #include "taz/v1/common.pb.h"
+#include "taz/v1/daemon_control.pb.h"
+
+/* A FrameType added to common.proto would otherwise pass is_known_type() with
+ * a zero-filled MAX_PAYLOAD entry, rejecting every nonzero-length frame. */
+_Static_assert(_taz_v1_FrameType_MAX == taz_v1_FrameType_FRAME_TYPE_CAPABILITY,
+               "new FrameType: add its limit to MAX_PAYLOAD and frame.h");
+
+/* TAZ_FRAME_MAX_PAYLOAD is the unknown-type bound (§10.1): the largest
+ * per-type limit (frame.h defines the 64 KiB types as it), so none may
+ * exceed it. */
+#define ASSERT_WITHIN_MAX_PAYLOAD(limit)                                       \
+    _Static_assert((limit) <= TAZ_FRAME_MAX_PAYLOAD,                           \
+                   #limit " exceeds TAZ_FRAME_MAX_PAYLOAD")
+ASSERT_WITHIN_MAX_PAYLOAD(TAZ_FRAME_MAX_PAYLOAD_PING);
+ASSERT_WITHIN_MAX_PAYLOAD(TAZ_FRAME_MAX_PAYLOAD_PONG);
+ASSERT_WITHIN_MAX_PAYLOAD(TAZ_FRAME_MAX_PAYLOAD_CAPABILITY);
+ASSERT_WITHIN_MAX_PAYLOAD(TAZ_FRAME_MAX_PAYLOAD_ERROR);
+ASSERT_WITHIN_MAX_PAYLOAD(TAZ_FRAME_MAX_PAYLOAD_REQUEST);
+ASSERT_WITHIN_MAX_PAYLOAD(TAZ_FRAME_MAX_PAYLOAD_RESPONSE);
+ASSERT_WITHIN_MAX_PAYLOAD(TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK);
+
+/* The single-message frame types must fit their largest encoded message. */
+_Static_assert(taz_v1_ErrorInfo_size <= TAZ_FRAME_MAX_PAYLOAD_ERROR,
+               "ErrorInfo can exceed the ERROR frame limit");
+_Static_assert(taz_v1_CapabilityPayload_size <=
+                   TAZ_FRAME_MAX_PAYLOAD_CAPABILITY,
+               "CapabilityPayload can exceed the CAPABILITY frame limit");
 
 /* Protocol §6 defaults, indexed by frame type. */
 static const uint32_t MAX_PAYLOAD[_taz_v1_FrameType_ARRAYSIZE] = {

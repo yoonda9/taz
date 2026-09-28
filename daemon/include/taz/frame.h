@@ -10,17 +10,18 @@ extern "C"
 
 #define TAZ_FRAME_HEADER_SIZE 12
 
-/* Per-type default payload limits (protocol §6). */
+/* Largest per-type limit; used as the bound for unknown types (§10.1). */
+#define TAZ_FRAME_MAX_PAYLOAD 65536U
+
+/* Per-type default payload limits (protocol §6). frame.c asserts that none
+ * exceeds TAZ_FRAME_MAX_PAYLOAD. */
 #define TAZ_FRAME_MAX_PAYLOAD_PING       0U
 #define TAZ_FRAME_MAX_PAYLOAD_PONG       0U
 #define TAZ_FRAME_MAX_PAYLOAD_CAPABILITY 1024U
 #define TAZ_FRAME_MAX_PAYLOAD_ERROR      4096U
-#define TAZ_FRAME_MAX_PAYLOAD_REQUEST    65536U
-#define TAZ_FRAME_MAX_PAYLOAD_RESPONSE   65536U
-#define TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK 65536U
-
-/* Largest per-type limit; used as the bound for unknown types (§10.1). */
-#define TAZ_FRAME_MAX_PAYLOAD 65536U
+#define TAZ_FRAME_MAX_PAYLOAD_REQUEST    TAZ_FRAME_MAX_PAYLOAD
+#define TAZ_FRAME_MAX_PAYLOAD_RESPONSE   TAZ_FRAME_MAX_PAYLOAD
+#define TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK TAZ_FRAME_MAX_PAYLOAD
 
     typedef struct
     {

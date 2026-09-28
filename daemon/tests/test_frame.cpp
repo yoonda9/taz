@@ -1,6 +1,9 @@
 // Tests for the C framing layer: pack/unpack, max-payload table, validate.
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <iterator>
 
 #include <gtest/gtest.h>
 
@@ -10,11 +13,45 @@
 namespace
 {
 
+// Protocol §6 defaults as literals, so frame.c is checked against the spec
+// rather than against the frame.h macros it is built from.
+struct SpecLimit
+{
+    uint8_t type;
+    uint32_t max_payload;
+};
+
+constexpr SpecLimit kSpecLimits[] = {
+    {taz_v1_FrameType_FRAME_TYPE_REQUEST, 65536U},
+    {taz_v1_FrameType_FRAME_TYPE_RESPONSE, 65536U},
+    {taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK, 65536U},
+    {taz_v1_FrameType_FRAME_TYPE_ERROR, 4096U},
+    {taz_v1_FrameType_FRAME_TYPE_PING, 0U},
+    {taz_v1_FrameType_FRAME_TYPE_PONG, 0U},
+    {taz_v1_FrameType_FRAME_TYPE_CAPABILITY, 1024U},
+};
+
+// Every FrameType in common.proto (0x01.._MAX) needs a row above.
+static_assert(std::size(kSpecLimits) ==
+                  static_cast<std::size_t>(_taz_v1_FrameType_MAX),
+              "new FrameType: add its protocol §6 limit to kSpecLimits");
+
+// UNSPECIFIED, the first reserved value, and the largest type byte.
+constexpr uint8_t kUnknownTypes[] = {
+    taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED,
+    static_cast<uint8_t>(_taz_v1_FrameType_MAX + 1),
+    0xFFU,
+};
+
+// buf and out start as all ones, so pack and unpack must assign every byte and
+// field rather than OR into a zeroed destination.
 taz_frame_header_t RoundTrip(const taz_frame_header_t &in)
 {
-    uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
+    uint8_t buf[TAZ_FRAME_HEADER_SIZE];
+    std::memset(buf, 0xFF, sizeof buf);
     taz_frame_pack_header(&in, buf);
-    taz_frame_header_t out{};
+    taz_frame_header_t out;
+    std::memset(&out, 0xFF, sizeof out);
     taz_frame_unpack_header(buf, &out);
     return out;
 }
@@ -37,7 +74,7 @@ TEST(Frame, PackUnpackRoundTrip)
     in.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
     in.flags = 0xABU;
     in.opcode = 0x1234U;
-    in.length = 0x00ABCDEFU;
+    in.length = 0x12ABCDEFU;
     in.stream_id = 0xDEADBEEFU;
 
     const taz_frame_header_t out = RoundTrip(in);
@@ -112,48 +149,42 @@ TEST(Frame, StreamIdBoundaryValuesRoundTrip)
     EXPECT_EQ(RoundTrip(h).stream_id, 0xFFFFFFFFU);
 }
 
+TEST(Frame, AllFlagBitsClearedRoundTrips)
+{
+    // flags=0 next to all-ones fields: packing must not set any flag bit.
+    taz_frame_header_t h{};
+    h.type = taz_v1_FrameType_FRAME_TYPE_REQUEST;
+    h.flags = 0U;
+    h.opcode = 0xFFFFU;
+    h.length = 0xFFFFFFFFU;
+    h.stream_id = 0xFFFFFFFFU;
+
+    uint8_t buf[TAZ_FRAME_HEADER_SIZE]{};
+    taz_frame_pack_header(&h, buf);
+    EXPECT_EQ(buf[1], 0U);
+    EXPECT_EQ(RoundTrip(h).flags, 0U);
+}
+
 // ---------------------------------------------------------------------------
 // Max-payload table (§6)
 // ---------------------------------------------------------------------------
 
-TEST(Frame, MaxPayloadPingAndPongIsZero)
+TEST(Frame, MaxPayloadMatchesSpec)
 {
-    EXPECT_EQ(taz_frame_max_payload(taz_v1_FrameType_FRAME_TYPE_PING), 0U);
-    EXPECT_EQ(taz_frame_max_payload(taz_v1_FrameType_FRAME_TYPE_PONG), 0U);
-}
-
-TEST(Frame, MaxPayloadCapabilityIs1024)
-{
-    EXPECT_EQ(taz_frame_max_payload(taz_v1_FrameType_FRAME_TYPE_CAPABILITY),
-              TAZ_FRAME_MAX_PAYLOAD_CAPABILITY);
-    EXPECT_EQ(TAZ_FRAME_MAX_PAYLOAD_CAPABILITY, 1024U);
-}
-
-TEST(Frame, MaxPayloadErrorIs4096)
-{
-    EXPECT_EQ(taz_frame_max_payload(taz_v1_FrameType_FRAME_TYPE_ERROR),
-              TAZ_FRAME_MAX_PAYLOAD_ERROR);
-    EXPECT_EQ(TAZ_FRAME_MAX_PAYLOAD_ERROR, 4096U);
-}
-
-TEST(Frame, MaxPayloadRequestResponseFileChunkIs65536)
-{
-    EXPECT_EQ(taz_frame_max_payload(taz_v1_FrameType_FRAME_TYPE_REQUEST),
-              TAZ_FRAME_MAX_PAYLOAD_REQUEST);
-    EXPECT_EQ(taz_frame_max_payload(taz_v1_FrameType_FRAME_TYPE_RESPONSE),
-              TAZ_FRAME_MAX_PAYLOAD_RESPONSE);
-    EXPECT_EQ(taz_frame_max_payload(taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK),
-              TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK);
-    EXPECT_EQ(TAZ_FRAME_MAX_PAYLOAD_REQUEST, 65536U);
+    for (const SpecLimit &row : kSpecLimits)
+    {
+        EXPECT_EQ(taz_frame_max_payload(row.type), row.max_payload)
+            << "type=" << +row.type;
+    }
 }
 
 TEST(Frame, MaxPayloadUnknownTypeBoundIs65536)
 {
-    // UNSPECIFIED(0) and any reserved type (>=8) use the 64 KiB bound (§10.1).
-    EXPECT_EQ(taz_frame_max_payload(taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED),
-              TAZ_FRAME_MAX_PAYLOAD);
-    EXPECT_EQ(taz_frame_max_payload(0x08U), TAZ_FRAME_MAX_PAYLOAD);
-    EXPECT_EQ(taz_frame_max_payload(0xFFU), TAZ_FRAME_MAX_PAYLOAD);
+    // UNSPECIFIED and reserved types use the 64 KiB bound (§10.1).
+    for (uint8_t t : kUnknownTypes)
+    {
+        EXPECT_EQ(taz_frame_max_payload(t), 65536U) << "type=" << +t;
+    }
     EXPECT_EQ(TAZ_FRAME_MAX_PAYLOAD, 65536U);
 }
 
@@ -161,64 +192,27 @@ TEST(Frame, MaxPayloadUnknownTypeBoundIs65536)
 // Validate header
 // ---------------------------------------------------------------------------
 
-TEST(Frame, ValidateKnownTypesAtLimitIsOk)
+TEST(Frame, ValidateKnownTypesAtLimitOkAndOneOverOversized)
 {
-    const uint8_t known_types[] = {
-        taz_v1_FrameType_FRAME_TYPE_REQUEST,
-        taz_v1_FrameType_FRAME_TYPE_RESPONSE,
-        taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK,
-        taz_v1_FrameType_FRAME_TYPE_ERROR,
-        taz_v1_FrameType_FRAME_TYPE_CAPABILITY,
-    };
-    for (uint8_t t : known_types)
+    for (const SpecLimit &row : kSpecLimits)
     {
-        EXPECT_EQ(Validate(t, taz_frame_max_payload(t)), TAZ_FRAME_OK)
-            << "type=" << +t;
+        EXPECT_EQ(Validate(row.type, row.max_payload), TAZ_FRAME_OK)
+            << "type=" << +row.type;
+        EXPECT_EQ(Validate(row.type, row.max_payload + 1U), TAZ_FRAME_OVERSIZED)
+            << "type=" << +row.type;
     }
 }
 
-TEST(Frame, ValidatePingPongZeroLengthIsOk)
+TEST(Frame, ValidateUnknownTypesAgainst64KiBBound)
 {
-    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_PING, 0U), TAZ_FRAME_OK);
-    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_PONG, 0U), TAZ_FRAME_OK);
-}
-
-TEST(Frame, ValidatePingWithPayloadIsOversized)
-{
-    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_PING, 1U),
-              TAZ_FRAME_OVERSIZED);
-}
-
-TEST(Frame, ValidateCapabilityOversized)
-{
-    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_CAPABILITY,
-                       TAZ_FRAME_MAX_PAYLOAD_CAPABILITY + 1U),
-              TAZ_FRAME_OVERSIZED);
-}
-
-TEST(Frame, ValidateRequestOversized)
-{
-    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_REQUEST,
-                       TAZ_FRAME_MAX_PAYLOAD_REQUEST + 1U),
-              TAZ_FRAME_OVERSIZED);
-}
-
-TEST(Frame, ValidateUnknownTypeWithinBoundIsUnknownType)
-{
-    EXPECT_EQ(Validate(taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED, 0U), // 0x00
-              TAZ_FRAME_UNKNOWN_TYPE);
-    EXPECT_EQ(Validate(0x08U, 0U), TAZ_FRAME_UNKNOWN_TYPE); // reserved
-}
-
-TEST(Frame, ValidateUnknownTypeOversized)
-{
-    // Unknown type still applies the 64 KiB guard (§10.1).
-    EXPECT_EQ(Validate(0x08U, TAZ_FRAME_MAX_PAYLOAD + 1U), TAZ_FRAME_OVERSIZED);
-}
-
-TEST(Frame, ValidateUnknownTypeAtExactBoundIsUnknownType)
-{
-    EXPECT_EQ(Validate(0x09U, TAZ_FRAME_MAX_PAYLOAD), TAZ_FRAME_UNKNOWN_TYPE);
+    // Within the bound an unknown type is skippable; over it, oversized
+    // (§10.1).
+    for (uint8_t t : kUnknownTypes)
+    {
+        EXPECT_EQ(Validate(t, 0U), TAZ_FRAME_UNKNOWN_TYPE) << "type=" << +t;
+        EXPECT_EQ(Validate(t, 65536U), TAZ_FRAME_UNKNOWN_TYPE) << "type=" << +t;
+        EXPECT_EQ(Validate(t, 65537U), TAZ_FRAME_OVERSIZED) << "type=" << +t;
+    }
 }
 
 TEST(Frame, ValidatePingNonzeroOpcodeIsOk)
