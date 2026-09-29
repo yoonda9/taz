@@ -29,6 +29,7 @@ TEST(Proto, ErrorCodeValuesMatchSpecification)
     EXPECT_EQ(taz_v1_ErrorCode_ERROR_CODE_UNKNOWN, 0);
     EXPECT_EQ(taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND, 1);
     EXPECT_EQ(taz_v1_ErrorCode_ERROR_CODE_CONNECTION_LOST, 10);
+    EXPECT_EQ(taz_v1_ErrorCode_ERROR_CODE_PROTOCOL_ERROR, 11);
 }
 
 TEST(Proto, ErrorInfoRoundTrip)

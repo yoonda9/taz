@@ -86,7 +86,8 @@ typedef enum _taz_v1_ErrorCode {
     taz_v1_ErrorCode_ERROR_CODE_INTERNAL = 7,
     taz_v1_ErrorCode_ERROR_CODE_BUSY = 8,
     taz_v1_ErrorCode_ERROR_CODE_CANCELLED = 9,
-    taz_v1_ErrorCode_ERROR_CODE_CONNECTION_LOST = 10
+    taz_v1_ErrorCode_ERROR_CODE_CONNECTION_LOST = 10,
+    taz_v1_ErrorCode_ERROR_CODE_PROTOCOL_ERROR = 11
 } pb_packed taz_v1_ErrorCode;
 
 /* Cross-task error escalation level for detached tasks (docs/api.md §5.4). */
@@ -145,8 +146,8 @@ extern "C" {
 #define _taz_v1_FrameFlag_ARRAYSIZE ((taz_v1_FrameFlag)(taz_v1_FrameFlag_FRAME_FLAG_PRIORITY+1))
 
 #define _taz_v1_ErrorCode_MIN taz_v1_ErrorCode_ERROR_CODE_UNKNOWN
-#define _taz_v1_ErrorCode_MAX taz_v1_ErrorCode_ERROR_CODE_CONNECTION_LOST
-#define _taz_v1_ErrorCode_ARRAYSIZE ((taz_v1_ErrorCode)(taz_v1_ErrorCode_ERROR_CODE_CONNECTION_LOST+1))
+#define _taz_v1_ErrorCode_MAX taz_v1_ErrorCode_ERROR_CODE_PROTOCOL_ERROR
+#define _taz_v1_ErrorCode_ARRAYSIZE ((taz_v1_ErrorCode)(taz_v1_ErrorCode_ERROR_CODE_PROTOCOL_ERROR+1))
 
 #define _taz_v1_ErrorPriority_MIN taz_v1_ErrorPriority_ERROR_PRIORITY_NONE
 #define _taz_v1_ErrorPriority_MAX taz_v1_ErrorPriority_ERROR_PRIORITY_CRITICAL

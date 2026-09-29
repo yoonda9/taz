@@ -94,6 +94,7 @@ enum ErrorCode {
   ERROR_CODE_BUSY = 8;
   ERROR_CODE_CANCELLED = 9;
   ERROR_CODE_CONNECTION_LOST = 10;
+  ERROR_CODE_PROTOCOL_ERROR = 11;
 }
 
 // Cross-task error escalation level for detached tasks (docs/api.md §5.4).

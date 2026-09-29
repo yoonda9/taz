@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import enum
-import socket as _socket
+import socket
 import struct
 import types
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from taz.c3.errors import TazError, TazProtocolError
+from taz.c3.errors import TazConnectionLost, TazProtocolError
 from taz.v1 import common_pb2
 
 _STRUCT = struct.Struct("<BBHII")
@@ -77,15 +77,15 @@ def validate_header(frame: Frame, limits: Mapping[int, int]) -> Verdict:
     return Verdict.UNKNOWN_TYPE
 
 
-def _connection_lost(exc: OSError) -> TazError:
+def _connection_lost(exc: OSError) -> TazConnectionLost:
     if isinstance(exc, TimeoutError):
         message = "connection timed out"
     else:
         message = f"connection lost: {exc}"
-    return TazError(common_pb2.ERROR_CODE_CONNECTION_LOST, message)
+    return TazConnectionLost(message)
 
 
-def _recv_exact(sock: _socket.socket, n: int) -> bytes:
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = bytearray(n)
     view = memoryview(buf)
     received = 0
@@ -95,30 +95,41 @@ def _recv_exact(sock: _socket.socket, n: int) -> bytes:
         except OSError as exc:  # timeout, reset, abort, closed socket
             raise _connection_lost(exc) from exc
         if chunk == 0:
-            raise TazError(
-                common_pb2.ERROR_CODE_CONNECTION_LOST,
-                "connection closed by peer",
-            )
+            raise TazConnectionLost("connection closed by peer")
         received += chunk
     return bytes(buf)
 
 
 def recv_frame(
-    sock: _socket.socket,
+    sock: socket.socket,
     limits: Mapping[int, int] = DEFAULT_MAX_PAYLOAD,
 ) -> Frame:
     header_bytes = _recv_exact(sock, HEADER_SIZE)
     frame = unpack_header(header_bytes)
     verdict = validate_header(frame, limits)
     if verdict is Verdict.OVERSIZED:
+        if frame.type in DEFAULT_MAX_PAYLOAD:
+            limit = limits.get(frame.type, DEFAULT_MAX_PAYLOAD[frame.type])
+            frame_name = common_pb2.FrameType.Name(frame.type).removeprefix(
+                "FRAME_TYPE_"
+            )
+        else:
+            limit = max(limits.get(t, d) for t, d in DEFAULT_MAX_PAYLOAD.items())
+            frame_name = f"type 0x{frame.type:02x}"
+        detail = (
+            f"type=0x{frame.type:02x} flags=0x{frame.flags:02x} "
+            f"opcode=0x{frame.opcode:04x} stream_id={frame.stream_id} "
+            f"length={frame.length} limit={limit}"
+        )
         raise TazProtocolError(
-            f"oversized frame: type=0x{frame.type:02x} length={frame.length}",
+            f"{frame_name} payload {frame.length} bytes exceeds limit {limit}",
+            detail,
         )
     frame.payload = _recv_exact(sock, frame.length)
     return frame
 
 
-def send_frame(sock: _socket.socket, frame: Frame) -> None:
+def send_frame(sock: socket.socket, frame: Frame) -> None:
     frame.length = len(frame.payload)
     data = pack_header(frame) + frame.payload
     try:

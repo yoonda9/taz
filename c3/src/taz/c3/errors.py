@@ -36,14 +36,19 @@ class TazError(Exception):
         return f"{cls}({name}, {self.message!r})"
 
 
-class TazProtocolError(TazError):
-    """Raised when the peer violates the wire protocol; the connection is unusable."""
+class TazConnectionError(TazError):
+    """The connection is unusable; reconnect."""
 
+
+class TazConnectionLost(TazConnectionError):  # noqa: N818
     def __init__(self, message: str, detail: str = "") -> None:
-        super().__init__(common_pb2.ERROR_CODE_INTERNAL, message, detail)
+        super().__init__(common_pb2.ERROR_CODE_CONNECTION_LOST, message, detail)
 
-    def __repr__(self) -> str:
-        cls = type(self).__name__
-        if self.detail:
-            return f"{cls}({self.message!r}, {self.detail!r})"
-        return f"{cls}({self.message!r})"
+
+class TazProtocolError(TazConnectionError):
+    def __init__(self, message: str, detail: str = "") -> None:
+        super().__init__(
+            common_pb2.ERROR_CODE_PROTOCOL_ERROR,
+            f"protocol violation: {message}",
+            detail,
+        )

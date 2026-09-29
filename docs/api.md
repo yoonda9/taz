@@ -103,13 +103,13 @@ Sent by the daemon immediately on connection as a `CAPABILITY` frame (`stream_id
 
 **Payload:**
 
-| Field               | Type                | Description                                                                                                                     |
-| ------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `protocol_major`    | uint32              | Major protocol version. Client MUST refuse to speak if it disagrees.                                                            |
-| `protocol_minor`    | uint32              | Minor protocol version. Different minor is compatible.                                                                          |
-| `operations`        | repeated uint32     | Opcodes this daemon implements                                                                                                  |
-| `max_payload_sizes` | map<uint32, uint32> | Per-frame-type payload maximums, keyed by the `type` byte (see `protocol.md` §4.2). Overrides the defaults in `protocol.md` §6. |
-| `compression`       | repeated string     | Supported compression algorithms in preferred order (e.g. `["NONE", "LZ4"]`)                                                    |
+| Field               | Type                | Description                                                                                                                                                                                           |
+| ------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `protocol_major`    | uint32              | Major protocol version. Client MUST refuse to speak if it disagrees.                                                                                                                                  |
+| `protocol_minor`    | uint32              | Minor protocol version. Different minor is compatible.                                                                                                                                                |
+| `operations`        | repeated uint32     | Opcodes this daemon implements                                                                                                                                                                        |
+| `max_payload_sizes` | map<uint32, uint32> | Per-frame-type payload maximums, keyed by the `type` byte (see `protocol.md` §4.2). Overrides the defaults in `protocol.md` §6. Omit a type to keep its default; 0 means the type carries no payload. |
+| `compression`       | repeated string     | Supported compression algorithms in preferred order (e.g. `["NONE", "LZ4"]`)                                                                                                                          |
 
 The client selects a compression algorithm by sending `CONFIGURATION_UPDATE` with key `compression` set to one of the advertised names. Until then, the `COMPRESSED` flag MUST NOT be set on any frame.
 
@@ -736,19 +736,20 @@ The cancelled stream sends a final frame with `CONTINUATION` cleared (and `reaso
 
 All `ERROR` frames carry a protobuf payload with a code, message, and optional detail. The originating request is identified by the `stream_id` in the frame header (see `protocol.md` §10.2), not by a payload field.
 
-| Code | Name                | Description                              |
-| ---- | ------------------- | ---------------------------------------- |
-| `0`  | `UNKNOWN`           | Unspecified error                        |
-| `1`  | `NOT_FOUND`         | File, process, or resource not found     |
-| `2`  | `PERMISSION_DENIED` | Insufficient permissions                 |
-| `3`  | `ALREADY_EXISTS`    | File or resource already exists          |
-| `4`  | `TIMEOUT`           | Operation timed out                      |
-| `5`  | `NOT_SUPPORTED`     | Operation not supported by this daemon   |
-| `6`  | `INVALID_REQUEST`   | Malformed or invalid request             |
-| `7`  | `INTERNAL`          | Daemon internal error                    |
-| `8`  | `BUSY`              | Daemon is too busy to accept the request |
-| `9`  | `CANCELLED`         | Operation was cancelled                  |
-| `10` | `CONNECTION_LOST`   | Downstream connection was lost           |
+| Code | Name                | Description                                                                                                                                                         |
+| ---- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | `UNKNOWN`           | Unspecified error                                                                                                                                                   |
+| `1`  | `NOT_FOUND`         | File, process, or resource not found                                                                                                                                |
+| `2`  | `PERMISSION_DENIED` | Insufficient permissions                                                                                                                                            |
+| `3`  | `ALREADY_EXISTS`    | File or resource already exists                                                                                                                                     |
+| `4`  | `TIMEOUT`           | Operation timed out                                                                                                                                                 |
+| `5`  | `NOT_SUPPORTED`     | Operation not supported by this daemon                                                                                                                              |
+| `6`  | `INVALID_REQUEST`   | The request is malformed or invalid (payload, arguments, or a `stream_id` already in use). The connection stays usable.                                             |
+| `7`  | `INTERNAL`          | Daemon internal error                                                                                                                                               |
+| `8`  | `BUSY`              | Daemon is too busy to accept the request                                                                                                                            |
+| `9`  | `CANCELLED`         | Operation was cancelled                                                                                                                                             |
+| `10` | `CONNECTION_LOST`   | The transport is gone or unresponsive: closed, reset, stalled inside a frame, or no `PONG` to a keepalive `PING`. Reported by the client; never sent by the daemon. |
+| `11` | `PROTOCOL_ERROR`    | The peer violated the framing protocol (for example, a frame above its type's size limit). The connection is closed.                                                |
 
 **ErrorInfo payload:**
 

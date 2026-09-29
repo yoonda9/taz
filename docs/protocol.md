@@ -308,7 +308,7 @@ There is no client-side capability message. The connection is ready for requests
 
 ### 10.1 Frame-Level Errors
 
-- **Oversized frame:** receiver reads the 12-byte header, sees `length` exceeds its maximum for that `type`, and (a) on a full-OS daemon SHOULD send an `ERROR` frame with `INVALID_REQUEST` and then close the connection; (b) on a constrained daemon MAY simply close the connection with no ERROR frame.
+- **Oversized frame:** receiver reads the 12-byte header, sees `length` exceeds its maximum for that `type`, and (a) on a full-OS daemon SHOULD send an `ERROR` frame with `PROTOCOL_ERROR` and then close the connection; (b) on a constrained daemon MAY simply close the connection with no ERROR frame.
 - **Unknown type** (any value not assigned in §4.2, including `0x00`): the payload's meaning is unknown, but `length` still delimits it. If `length` is no larger than the largest payload limit the receiver enforces for any known type (64 KiB with the §6 defaults), the receiver discards exactly `length` payload bytes and continues (forward compatibility): a daemon also sends an `ERROR` frame with `NOT_SUPPORTED` echoing the frame's `stream_id` and `opcode`, and a client drops the frame silently. A larger `length` is handled as an oversized frame, so a peer cannot hold the connection with gigabytes of payload nobody can parse.
 - **Opcode on `FILE_CHUNK`, `PING`, `PONG`, `CAPABILITY`:** ignored (§4.4).
 - **Unknown opcode:** receiver sends an `ERROR` frame with `NOT_SUPPORTED` echoing the request's `stream_id` and continues.

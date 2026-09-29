@@ -6,7 +6,7 @@ import socket
 from unittest.mock import MagicMock
 
 import pytest
-from taz.c3.errors import TazError, TazProtocolError
+from taz.c3.errors import TazConnectionLost, TazProtocolError
 from taz.c3.protocol import frame
 from taz.v1 import common_pb2
 
@@ -282,11 +282,11 @@ class TestSendFrame:
     def test_send_frame_socket_error_raises_connection_lost(
         self, error: OSError
     ) -> None:
-        """A failed or timed-out sendall surfaces as TazError(CONNECTION_LOST)."""
+        """A failed or timed-out sendall surfaces as TazConnectionLost."""
         mock_sock = MagicMock(spec=socket.socket)
         mock_sock.sendall.side_effect = error
 
-        with pytest.raises(TazError) as exc_info:
+        with pytest.raises(TazConnectionLost) as exc_info:
             frame.send_frame(mock_sock, _frame(common_pb2.FRAME_TYPE_PING))
 
         assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
@@ -322,31 +322,76 @@ class TestRecvFrame:
         assert f.length == len(payload)
         assert f.payload == payload
 
-    def test_recv_frame_oversized_raises_protocol_error(self) -> None:
-        """recv_frame raises TazProtocolError for oversized frame."""
+    def test_recv_frame_oversized_known_type_raises_protocol_error(self) -> None:
+        """recv_frame raises TazProtocolError naming type, both sizes, and detail."""
+        oversized_length = 65537
+        limit = frame.DEFAULT_MAX_PAYLOAD[common_pb2.FRAME_TYPE_REQUEST]
         mock_sock = _sock(
-            frame.pack_header(_frame(common_pb2.FRAME_TYPE_REQUEST, 65537))
+            frame.pack_header(
+                _frame(
+                    common_pb2.FRAME_TYPE_REQUEST,
+                    oversized_length,
+                    opcode=2,
+                    stream_id=42,
+                )
+            )
         )
 
         with pytest.raises(TazProtocolError) as exc_info:
             frame.recv_frame(mock_sock, frame.DEFAULT_MAX_PAYLOAD)
 
-        assert "oversized" in str(exc_info.value)
+        err = exc_info.value
+        assert f"REQUEST payload {oversized_length} bytes exceeds limit {limit}" in str(
+            err
+        )
+        assert err.detail == (
+            f"type=0x{common_pb2.FRAME_TYPE_REQUEST:02x} flags=0x00 "
+            f"opcode=0x{2:04x} stream_id=42 "
+            f"length={oversized_length} limit={limit}"
+        )
 
-    def test_recv_frame_connection_timeout_raises_taz_error(self) -> None:
-        """recv_frame raises TazError on socket timeout."""
+    def test_recv_frame_oversized_unknown_type_raises_protocol_error(self) -> None:
+        """recv_frame raises TazProtocolError with hex type label for unknown types."""
+        unknown_type = 0x09
+        oversized_length = _UNKNOWN_BOUND + 1
+        mock_sock = _sock(frame.pack_header(_frame(unknown_type, oversized_length)))
+
+        with pytest.raises(TazProtocolError) as exc_info:
+            frame.recv_frame(mock_sock, frame.DEFAULT_MAX_PAYLOAD)
+
+        err = exc_info.value
+        assert f"type 0x{unknown_type:02x} payload {oversized_length}" in str(err)
+
+    def test_recv_frame_oversized_payload_not_read(self) -> None:
+        """recv_frame does not consume payload bytes after detecting OVERSIZED."""
+        type_ = common_pb2.FRAME_TYPE_RESPONSE
+        limit = frame.DEFAULT_MAX_PAYLOAD[type_]
+        sentinel = b"not_consumed"
+        mock_sock = _sock(frame.pack_header(_frame(type_, limit + 1)) + sentinel)
+
+        with pytest.raises(TazProtocolError):
+            frame.recv_frame(mock_sock, frame.DEFAULT_MAX_PAYLOAD)
+
+        # sentinel bytes are still in the mock's queue
+        buf = bytearray(len(sentinel))
+        read = mock_sock.recv_into(memoryview(buf), len(sentinel))
+        assert read == len(sentinel)
+        assert bytes(buf) == sentinel
+
+    def test_recv_frame_connection_timeout_raises_connection_lost(self) -> None:
+        """recv_frame raises TazConnectionLost on socket timeout."""
         mock_sock = MagicMock(spec=socket.socket)
         mock_sock.recv_into.side_effect = TimeoutError("socket timeout")
 
-        with pytest.raises(TazError) as exc_info:
+        with pytest.raises(TazConnectionLost) as exc_info:
             frame.recv_frame(mock_sock, frame.DEFAULT_MAX_PAYLOAD)
 
         assert "timed out" in str(exc_info.value)
         assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
 
-    def test_recv_frame_connection_closed_raises_taz_error(self) -> None:
-        """recv_frame raises TazError when connection closes."""
-        with pytest.raises(TazError) as exc_info:
+    def test_recv_frame_connection_closed_raises_connection_lost(self) -> None:
+        """recv_frame raises TazConnectionLost when connection closes."""
+        with pytest.raises(TazConnectionLost) as exc_info:
             frame.recv_frame(_sock(), frame.DEFAULT_MAX_PAYLOAD)
 
         assert "closed by peer" in str(exc_info.value)
@@ -357,26 +402,28 @@ class TestRecvFrame:
         [5, frame.HEADER_SIZE + 4],
         ids=["mid-header", "mid-payload"],
     )
-    def test_recv_frame_eof_mid_frame_raises_taz_error(self, received: int) -> None:
-        """EOF partway through a frame is CONNECTION_LOST, never a short frame."""
+    def test_recv_frame_eof_mid_frame_raises_connection_lost(
+        self, received: int
+    ) -> None:
+        """EOF partway through a frame is TazConnectionLost, never a short frame."""
         payload = b"0123456789"
         header = frame.pack_header(_frame(common_pb2.FRAME_TYPE_REQUEST, len(payload)))
         mock_sock = _sock((header + payload)[:received])
 
-        with pytest.raises(TazError) as exc_info:
+        with pytest.raises(TazConnectionLost) as exc_info:
             frame.recv_frame(mock_sock)
 
         assert "closed by peer" in str(exc_info.value)
         assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
 
-    def test_recv_frame_connection_reset_raises_taz_error(self) -> None:
+    def test_recv_frame_connection_reset_raises_connection_lost(self) -> None:
         """A reset mid-frame (e.g. the daemon closing after an ERROR, §10.1)
-        surfaces as TazError(CONNECTION_LOST), not a raw OSError."""
+        surfaces as TazConnectionLost, not a raw OSError."""
         reset = ConnectionResetError(104, "Connection reset by peer")
         header = frame.pack_header(_frame(common_pb2.FRAME_TYPE_RESPONSE, 8))
         mock_sock = _sock(header, b"1234", reset)
 
-        with pytest.raises(TazError) as exc_info:
+        with pytest.raises(TazConnectionLost) as exc_info:
             frame.recv_frame(mock_sock)
 
         assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
@@ -411,7 +458,7 @@ class TestRecvFrame:
         with pytest.raises(TazProtocolError) as exc_info:
             frame.recv_frame(mock_sock, limits)
 
-        assert "oversized" in str(exc_info.value)
+        assert "REQUEST payload 2048 bytes exceeds limit 1024" in str(exc_info.value)
 
     def test_recv_frame_partial_header_reassembly(self) -> None:
         """recv_frame reassembles a header that arrives in multiple partial reads."""

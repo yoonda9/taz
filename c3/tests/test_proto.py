@@ -17,6 +17,7 @@ def test_error_code_values_match_specification() -> None:
     assert common_pb2.ErrorCode.Name(0) == "ERROR_CODE_UNKNOWN"
     assert common_pb2.ErrorCode.Name(1) == "ERROR_CODE_NOT_FOUND"
     assert common_pb2.ErrorCode.Name(10) == "ERROR_CODE_CONNECTION_LOST"
+    assert common_pb2.ErrorCode.Name(11) == "ERROR_CODE_PROTOCOL_ERROR"
 
 
 def test_frame_constants() -> None:

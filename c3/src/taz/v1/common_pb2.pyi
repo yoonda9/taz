@@ -71,6 +71,7 @@ class ErrorCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     ERROR_CODE_BUSY: _ClassVar[ErrorCode]
     ERROR_CODE_CANCELLED: _ClassVar[ErrorCode]
     ERROR_CODE_CONNECTION_LOST: _ClassVar[ErrorCode]
+    ERROR_CODE_PROTOCOL_ERROR: _ClassVar[ErrorCode]
 
 class ErrorPriority(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -139,6 +140,7 @@ ERROR_CODE_INTERNAL: ErrorCode
 ERROR_CODE_BUSY: ErrorCode
 ERROR_CODE_CANCELLED: ErrorCode
 ERROR_CODE_CONNECTION_LOST: ErrorCode
+ERROR_CODE_PROTOCOL_ERROR: ErrorCode
 ERROR_PRIORITY_NONE: ErrorPriority
 ERROR_PRIORITY_CRITICAL: ErrorPriority
 KIND_UNSPECIFIED: Kind
