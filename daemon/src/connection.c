@@ -105,10 +105,8 @@ static void conn_write_fn(const uint8_t *data, size_t len, void *ctx)
  * taz_conn_handle_frame — testable frame routing
  * ------------------------------------------------------------------------- */
 
-void taz_conn_handle_frame(taz_dispatch_t *d,
-                           const taz_frame_header_t *header,
-                           const uint8_t *payload,
-                           taz_frame_verdict_t verdict,
+void taz_conn_handle_frame(taz_dispatch_t *d, const taz_frame_header_t *header,
+                           const uint8_t *payload, taz_frame_verdict_t verdict,
                            taz_dispatch_write_fn_t write_fn, void *ctx,
                            int *close_out)
 {
@@ -120,10 +118,10 @@ void taz_conn_handle_frame(taz_dispatch_t *d,
         uint8_t err_payload[TAZ_FRAME_MAX_PAYLOAD_ERROR];
         uint8_t frame_buf[TAZ_FRAME_HEADER_SIZE + TAZ_FRAME_MAX_PAYLOAD_ERROR];
         taz_frame_header_t h;
-        size_t err_len = taz_error_encode(
-            err_payload, sizeof(err_payload),
-            taz_v1_ErrorCode_ERROR_CODE_PROTOCOL_ERROR, "oversized frame",
-            NULL);
+        size_t err_len =
+            taz_error_encode(err_payload, sizeof(err_payload),
+                             taz_v1_ErrorCode_ERROR_CODE_PROTOCOL_ERROR,
+                             "oversized frame", NULL);
         if (err_len > 0U)
         {
             h.type = (uint8_t)taz_v1_FrameType_FRAME_TYPE_ERROR;
@@ -167,8 +165,7 @@ static void on_frame_cb(const taz_frame_header_t *header,
  * libuv read callbacks
  * ------------------------------------------------------------------------- */
 
-static void alloc_cb(uv_handle_t *handle, size_t suggested_size,
-                     uv_buf_t *buf)
+static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
 {
     taz_conn_t *conn = (taz_conn_t *)handle->data;
     (void)suggested_size;

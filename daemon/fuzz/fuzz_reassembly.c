@@ -32,6 +32,7 @@ static void on_frame(const taz_frame_header_t *header, const uint8_t *payload,
     (void)close_out;
 }
 
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     taz_reassembly_state_t state;

@@ -10,6 +10,7 @@
 #include "taz/v1/common.pb.h"
 #include "taz/v1/daemon_control.pb.h"
 
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     pb_istream_t stream;

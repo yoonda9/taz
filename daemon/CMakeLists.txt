@@ -265,8 +265,7 @@ install(TARGETS tazd)
 # Fuzz harnesses (linux-fuzz preset only)
 # ---------------------------------------------------------------------------
 option(TAZ_BUILD_FUZZ
-       "Build the libFuzzer harnesses (requires Clang + -fsanitize=fuzzer)"
-       OFF)
+       "Build the libFuzzer harnesses (requires Clang + -fsanitize=fuzzer)" OFF)
 if(TAZ_BUILD_FUZZ)
     add_subdirectory(fuzz)
 endif()

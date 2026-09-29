@@ -715,7 +715,7 @@ def cmd_fuzz(build_dir: Path, seconds: int) -> None:
     corpus_dir = fuzz_dir / "corpus"
     harnesses = ["fuzz_reassembly", "fuzz_decode"]
     for harness in harnesses:
-        binary = build_dir / harness
+        binary = build_dir / "fuzz" / harness
         if not binary.exists():
             sys.exit(f"error: fuzz binary not found: {binary}")
         harness_corpus = corpus_dir / harness

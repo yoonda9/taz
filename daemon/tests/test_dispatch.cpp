@@ -26,7 +26,7 @@ void capture_write(const uint8_t *data, size_t len, void *ctx)
 }
 
 taz_frame_header_t MakeHeader(uint8_t type, uint16_t opcode, uint32_t stream_id,
-                               uint32_t length = 0U)
+                              uint32_t length = 0U)
 {
     taz_frame_header_t h{};
     h.type = type;
@@ -66,9 +66,8 @@ TEST(Dispatch, PingProducesPong)
     taz_dispatch_init(&d);
     WriteCtx wctx;
 
-    const taz_frame_header_t h =
-        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_PING), 0U,
-                   7U);
+    const taz_frame_header_t h = MakeHeader(
+        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_PING), 0U, 7U);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
 
     ASSERT_EQ(wctx.frames.size(), 1U);
@@ -90,9 +89,9 @@ TEST(Dispatch, VersionOpcodeProducesResponse)
     taz_dispatch_init(&d);
     WriteCtx wctx;
 
-    const taz_frame_header_t h = MakeHeader(
-        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
-        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), 1U);
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), 1U);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
 
     ASSERT_EQ(wctx.frames.size(), 1U);
@@ -187,9 +186,9 @@ TEST(Dispatch, DuplicateStreamIdProducesInvalidRequest)
     d.active_streams[0] = sid;
     d.active_count = 1U;
 
-    const taz_frame_header_t h = MakeHeader(
-        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
-        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), sid);
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), sid);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
 
     ASSERT_EQ(wctx.frames.size(), 1U);
@@ -218,9 +217,9 @@ TEST(Dispatch, OversizedVerdictIsNoOp)
     taz_dispatch_init(&d);
     WriteCtx wctx;
 
-    const taz_frame_header_t h = MakeHeader(
-        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
-        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), 99U);
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), 99U);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OVERSIZED, capture_write,
                        &wctx);
 

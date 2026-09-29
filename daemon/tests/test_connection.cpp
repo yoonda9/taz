@@ -28,8 +28,8 @@ void capture_write(const uint8_t *data, size_t len, void *ctx)
     wctx->frames.emplace_back(data, data + len);
 }
 
-taz_frame_header_t MakeHeader(uint8_t type, uint16_t opcode,
-                               uint32_t stream_id, uint32_t length = 0U)
+taz_frame_header_t MakeHeader(uint8_t type, uint16_t opcode, uint32_t stream_id,
+                              uint32_t length = 0U)
 {
     taz_frame_header_t h{};
     h.type = type;
@@ -70,9 +70,8 @@ TEST(Connection, OkPingRouted)
     WriteCtx wctx;
     int close_out = -1;
 
-    const taz_frame_header_t h =
-        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_PING), 0U,
-                   11U);
+    const taz_frame_header_t h = MakeHeader(
+        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_PING), 0U, 11U);
     taz_conn_handle_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx,
                           &close_out);
 
@@ -96,8 +95,7 @@ TEST(Connection, UnknownTypeProducesNotSupported)
     int close_out = -1;
 
     const taz_frame_header_t h = MakeHeader(
-        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED), 0U,
-        3U);
+        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED), 0U, 3U);
     taz_conn_handle_frame(&d, &h, nullptr, TAZ_FRAME_UNKNOWN_TYPE,
                           capture_write, &wctx, &close_out);
 
@@ -124,10 +122,10 @@ TEST(Connection, OversizedProducesProtocolErrorAndClose)
     WriteCtx wctx;
     int close_out = 0;
 
-    const taz_frame_header_t h = MakeHeader(
-        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
-        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), 7U,
-        static_cast<uint32_t>(TAZ_FRAME_MAX_PAYLOAD) + 1U);
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), 7U,
+                   static_cast<uint32_t>(TAZ_FRAME_MAX_PAYLOAD) + 1U);
     taz_conn_handle_frame(&d, &h, nullptr, TAZ_FRAME_OVERSIZED, capture_write,
                           &wctx, &close_out);
 
@@ -156,8 +154,8 @@ struct ReassemblyCtx
 };
 
 void reassembly_on_frame(const taz_frame_header_t *header,
-                          const uint8_t *payload,
-                          taz_frame_verdict_t verdict, void *ctx_ptr)
+                         const uint8_t *payload, taz_frame_verdict_t verdict,
+                         void *ctx_ptr)
 {
     auto *rctx = static_cast<ReassemblyCtx *>(ctx_ptr);
     int frame_close = 0;
@@ -209,23 +207,21 @@ TEST(Connection, UnknownTypeThenPingViaReassembly)
     uint8_t combined[sizeof(unk_buf) + sizeof(ping_buf)];
     std::memcpy(combined, unk_buf, sizeof(unk_buf));
     std::memcpy(combined + sizeof(unk_buf), ping_buf, sizeof(ping_buf));
-    taz_reassembly_feed(&state, combined, sizeof(combined),
-                        reassembly_on_frame, &rctx);
+    taz_reassembly_feed(&state, combined, sizeof(combined), reassembly_on_frame,
+                        &rctx);
 
     EXPECT_EQ(rctx.close_out, 0);
     ASSERT_EQ(wctx.frames.size(), 2U);
 
     const auto r0 = UnpackHeader(wctx.frames[0]);
-    EXPECT_EQ(r0.type,
-              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+    EXPECT_EQ(r0.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
     EXPECT_EQ(r0.stream_id, 1U);
     taz_v1_ErrorInfo err0 = taz_v1_ErrorInfo_init_zero;
     ASSERT_TRUE(DecodeErrorInfo(wctx.frames[0], &err0));
     EXPECT_EQ(err0.code, taz_v1_ErrorCode_ERROR_CODE_NOT_SUPPORTED);
 
     const auto r1 = UnpackHeader(wctx.frames[1]);
-    EXPECT_EQ(r1.type,
-              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_PONG));
+    EXPECT_EQ(r1.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_PONG));
     EXPECT_EQ(r1.stream_id, 55U);
 }
 

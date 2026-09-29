@@ -25,7 +25,8 @@ extern "C"
         uv_tcp_t handle;
         taz_reassembly_state_t reassembly;
         taz_dispatch_t dispatch;
-        unsigned int refcount; /* 1 = alive; uv_write increments, done/close decrements */
+        unsigned int refcount; /* 1 = alive; uv_write increments, done/close
+                                  decrements */
         int closing;           /* 1 once teardown begins; gates new writes */
         uint8_t read_buf[TAZ_CONN_READ_BUF_SIZE];
     } taz_conn_t;
