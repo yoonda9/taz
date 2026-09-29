@@ -44,9 +44,11 @@ jobs:
             checks: [main, asan, tsan, valgrind, analyze, coverage]
             packages: valgrind
             conan-preset: linux-debug
-          - name: Linux clang (build, test)
-            checks: [clang]
-            packages: clang
+          - name: Linux clang (build, test, fuzz)
+            checks: [clang, fuzz]
+            # libclang-rt-dev carries the libFuzzer and sanitizer runtimes,
+            # which `clang` alone does not pull in.
+            packages: clang libclang-rt-dev
             conan-preset: linux-clang-debug
             mise-tools: uv just prek cmake ninja
     env:
@@ -136,6 +138,11 @@ jobs:
 
       - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'clang') }}
         run: just test-c linux-clang-debug
+
+      # linux-fuzz shares linux-clang-debug's Conan packages (clang profile,
+      # Debug), so it can run in this entry.
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'fuzz') }}
+        run: just fuzz
 
       - id: coverage
         if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'coverage') }}
