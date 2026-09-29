@@ -30,7 +30,11 @@ DEFAULT_MAX_PAYLOAD: Mapping[int, int] = types.MappingProxyType(
     }
 )
 
+# Upper bound applied to unknown frame types when using the default limits (§10.1).
+DEFAULT_UNKNOWN_TYPE_MAX_PAYLOAD: int = max(DEFAULT_MAX_PAYLOAD.values())
+
 _HAS_SENDMSG = hasattr(socket.socket, "sendmsg")
+_RECV_CAP = 256 * 1024  # max bytes requested per recv() call
 
 
 class Verdict(enum.Enum):
@@ -97,26 +101,65 @@ def _connection_lost(exc: OSError) -> TazConnectionLost:
     return TazConnectionLost(message)
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray(n)
-    view = memoryview(buf)
-    received = 0
-    while received < n:
+def _recv_exact(sock: socket.socket, n: int, what: str) -> bytes:
+    if n == 0:
+        return b""
+    try:
+        first = sock.recv(min(n, _RECV_CAP))
+    except TimeoutError as exc:
+        raise TazConnectionLost(
+            f"connection timed out mid-frame (received 0 of {n} {what} bytes)"
+        ) from exc
+    except OSError as exc:
+        raise _connection_lost(exc) from exc
+    if len(first) == n:
+        return first
+    parts, got = [first], len(first)
+    while got < n:
+        if not parts[-1]:
+            raise TazConnectionLost(
+                f"connection closed by peer mid-frame"
+                f" (received {got} of {n} {what} bytes)"
+            )
         try:
-            chunk = sock.recv_into(view[received:], n - received)
-        except OSError as exc:  # timeout, reset, abort, closed socket
+            piece = sock.recv(min(n - got, _RECV_CAP))
+        except TimeoutError as exc:
+            raise TazConnectionLost(
+                f"connection timed out mid-frame (received {got} of {n} {what} bytes)"
+            ) from exc
+        except OSError as exc:
             raise _connection_lost(exc) from exc
-        if chunk == 0:
-            raise TazConnectionLost("connection closed by peer")
-        received += chunk
-    return bytes(buf)
+        parts.append(piece)
+        got += len(piece)
+    return b"".join(parts)
+
+
+def wait_readable(sock: socket.socket, timeout: float | None) -> bool:
+    """Peek at the socket to check if data is available, without consuming it.
+
+    Returns True if data is ready, False if timeout expires. Raises
+    TazConnectionLost on EOF or error. Restores the socket's original timeout.
+    """
+    old = sock.gettimeout()
+    sock.settimeout(timeout)
+    try:
+        data = sock.recv(1, socket.MSG_PEEK)
+    except TimeoutError:
+        return False
+    except OSError as exc:
+        raise _connection_lost(exc) from exc
+    finally:
+        sock.settimeout(old)
+    if not data:
+        raise TazConnectionLost("connection closed by peer")
+    return True
 
 
 def recv_frame(
     sock: socket.socket,
     limits: Mapping[int, int] = DEFAULT_MAX_PAYLOAD,
 ) -> Frame:
-    header_bytes = _recv_exact(sock, HEADER_SIZE)
+    header_bytes = _recv_exact(sock, HEADER_SIZE, "header")
     frame = unpack_header(header_bytes)
     verdict = validate_header(frame, limits)
     if verdict is Verdict.OVERSIZED:
@@ -137,7 +180,7 @@ def recv_frame(
             f"{frame_name} payload {frame.length} bytes exceeds limit {limit}",
             detail,
         )
-    frame.payload = _recv_exact(sock, frame.length)
+    frame.payload = _recv_exact(sock, frame.length, "payload")
     return frame
 
 

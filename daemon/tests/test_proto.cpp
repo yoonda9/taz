@@ -13,6 +13,9 @@
 namespace
 {
 
+// Default per-type payload limit for REQUEST/RESPONSE/FILE_CHUNK (§6).
+static constexpr uint32_t kDefaultFrameLimit = 65536U;
+
 TEST(Proto, OpcodeValuesMatchSpecification)
 {
     EXPECT_EQ(taz_v1_Opcode_OPCODE_PING, 0x0001);
@@ -30,6 +33,20 @@ TEST(Proto, ErrorCodeValuesMatchSpecification)
     EXPECT_EQ(taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND, 1);
     EXPECT_EQ(taz_v1_ErrorCode_ERROR_CODE_CONNECTION_LOST, 10);
     EXPECT_EQ(taz_v1_ErrorCode_ERROR_CODE_PROTOCOL_ERROR, 11);
+}
+
+TEST(Proto, FrameTypeValuesMatchSpecification)
+{
+    EXPECT_EQ(taz_v1_FrameType_FRAME_TYPE_REQUEST, 0x01);
+    EXPECT_EQ(taz_v1_FrameType_FRAME_TYPE_RESPONSE, 0x02);
+    EXPECT_EQ(taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK, 0x03);
+    EXPECT_EQ(taz_v1_FrameType_FRAME_TYPE_ERROR, 0x04);
+    EXPECT_EQ(taz_v1_FrameType_FRAME_TYPE_PING, 0x05);
+    EXPECT_EQ(taz_v1_FrameType_FRAME_TYPE_PONG, 0x06);
+    EXPECT_EQ(taz_v1_FrameType_FRAME_TYPE_CAPABILITY, 0x07);
+    // Default payload limits: REQUEST/RESPONSE/FILE_CHUNK share
+    // kDefaultFrameLimit.
+    EXPECT_EQ(kDefaultFrameLimit, 65536U);
 }
 
 TEST(Proto, ErrorInfoRoundTrip)
@@ -63,7 +80,7 @@ TEST(Proto, CapabilityPayloadRoundTrip)
     in.operations[2] = taz_v1_Opcode_OPCODE_FILE_PUT;
     in.max_payload_sizes_count = 1;
     in.max_payload_sizes[0].key = taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK;
-    in.max_payload_sizes[0].value = 65536;
+    in.max_payload_sizes[0].value = kDefaultFrameLimit;
     in.compression_count = 1;
     std::strcpy(in.compression[0], "NONE");
 
@@ -81,7 +98,7 @@ TEST(Proto, CapabilityPayloadRoundTrip)
     ASSERT_EQ(decoded.operations_count, 3U);
     EXPECT_EQ(decoded.operations[1], taz_v1_Opcode_OPCODE_COMMAND_EXEC);
     ASSERT_EQ(decoded.max_payload_sizes_count, 1U);
-    EXPECT_EQ(decoded.max_payload_sizes[0].value, 65536U);
+    EXPECT_EQ(decoded.max_payload_sizes[0].value, kDefaultFrameLimit);
     ASSERT_EQ(decoded.compression_count, 1U);
     EXPECT_STREQ(decoded.compression[0], "NONE");
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,7 +11,7 @@ from taz.c3.errors import TazConnectionLost, TazProtocolError
 from taz.c3.protocol import frame
 from taz.v1 import common_pb2
 
-_UNKNOWN_BOUND = max(frame.DEFAULT_MAX_PAYLOAD.values())
+_UNKNOWN_BOUND = frame.DEFAULT_UNKNOWN_TYPE_MAX_PAYLOAD
 
 
 def _frame(
@@ -31,31 +32,33 @@ def _verdict(type_: int, length: int) -> frame.Verdict:
 
 
 def _sock(*chunks: bytes | OSError) -> MagicMock:
-    """Mock socket whose recv_into serves ``chunks`` one read at a time, then EOF.
+    """Mock socket whose recv serves ``chunks`` one read at a time, then EOF.
 
-    An exception in ``chunks`` is raised by the read that reaches it. Arguments
-    are checked as socket.recv_into checks them.
+    An exception in ``chunks`` is raised by the read that reaches it.
+    MSG_PEEK returns the first byte without consuming it from the queue.
+    When a chunk is consumed in full, the original bytes object is returned
+    (enabling identity checks in _recv_exact single-read tests).
     """
     pending = list(chunks)
 
-    def recv_into(buf: memoryview, nbytes: int = 0, flags: int = 0) -> int:
-        if nbytes < 0:
-            raise ValueError("negative buffersize in recv_into")
-        if nbytes > len(buf):
-            raise ValueError("buffer too small for requested bytes")
+    def recv(bufsize: int, flags: int = 0) -> bytes:
         if not pending:
-            return 0
-        chunk = pending.pop(0)
+            return b""
+        chunk = pending[0]
         if isinstance(chunk, OSError):
+            pending.pop(0)
             raise chunk
-        size = min(nbytes or len(buf), len(chunk))
-        buf[:size] = chunk[:size]
-        if size < len(chunk):
-            pending.insert(0, chunk[size:])
-        return size
+        if flags & socket.MSG_PEEK:
+            return chunk[:1] if chunk else b""
+        take = min(bufsize, len(chunk))
+        if take == len(chunk):
+            pending.pop(0)
+            return chunk  # return original object for identity tests
+        pending[0] = chunk[take:]
+        return chunk[:take]
 
     sock = MagicMock(spec=socket.socket)
-    sock.recv_into.side_effect = recv_into
+    sock.recv.side_effect = recv
     return sock
 
 
@@ -92,6 +95,9 @@ class TestPackUnpack:
                 opcode=0x1234,
                 stream_id=0xDEADBEEF,
             ),
+            _frame(
+                common_pb2.FRAME_TYPE_REQUEST, 0, opcode=0x0134, stream_id=0x12345678
+            ),
         ],
     )
     def test_pack_unpack_roundtrip(self, f: frame.Frame) -> None:
@@ -124,18 +130,6 @@ class TestPackUnpack:
         f = _frame(common_pb2.FRAME_TYPE_FILE_CHUNK, 65536)
         f.payload = b"\xab" * 65536
         assert "payload" not in repr(f)
-
-    @pytest.mark.parametrize("opcode", [0xFFFF, 0x0000, 0x0134])
-    def test_opcode_edge_values_roundtrip(self, opcode: int) -> None:
-        """Verify opcode boundary values survive pack/unpack."""
-        f = _frame(common_pb2.FRAME_TYPE_REQUEST, opcode=opcode)
-        assert frame.unpack_header(frame.pack_header(f)).opcode == opcode
-
-    @pytest.mark.parametrize("stream_id", [0, 0xFFFFFFFF, 0x12345678])
-    def test_stream_id_boundary_values_roundtrip(self, stream_id: int) -> None:
-        """Verify stream_id boundary values survive pack/unpack."""
-        f = _frame(common_pb2.FRAME_TYPE_REQUEST, stream_id=stream_id)
-        assert frame.unpack_header(frame.pack_header(f)).stream_id == stream_id
 
 
 # ---------------------------------------------------------------------------
@@ -498,15 +492,13 @@ class TestRecvFrame:
             frame.recv_frame(mock_sock, frame.DEFAULT_MAX_PAYLOAD)
 
         # sentinel bytes are still in the mock's queue
-        buf = bytearray(len(sentinel))
-        read = mock_sock.recv_into(memoryview(buf), len(sentinel))
-        assert read == len(sentinel)
-        assert bytes(buf) == sentinel
+        data = mock_sock.recv(len(sentinel))
+        assert data == sentinel
 
     def test_recv_frame_connection_timeout_raises_connection_lost(self) -> None:
         """recv_frame raises TazConnectionLost on socket timeout."""
         mock_sock = MagicMock(spec=socket.socket)
-        mock_sock.recv_into.side_effect = TimeoutError("socket timeout")
+        mock_sock.recv.side_effect = TimeoutError("socket timeout")
 
         with pytest.raises(TazConnectionLost) as exc_info:
             frame.recv_frame(mock_sock, frame.DEFAULT_MAX_PAYLOAD)
@@ -728,3 +720,161 @@ class TestFrameCleanups:
     def test_verdict_ok_is_not_a_string(self) -> None:
         """Verdict.OK is not a string (migrated from string-valued enum)."""
         assert not isinstance(frame.Verdict.OK.value, str)
+
+
+# ---------------------------------------------------------------------------
+# _recv_exact (Step 4)
+# ---------------------------------------------------------------------------
+
+
+class TestRecvExact:
+    """Unit tests for _recv_exact internals."""
+
+    def test_identity_single_read(self) -> None:
+        """Whole payload in one recv call: returned object is the same bytes object."""
+        payload = b"hello_world"
+        mock_sock = _sock(payload)
+        result = frame._recv_exact(mock_sock, len(payload), "payload")
+        assert result is payload
+
+    def test_pieces_joined_correctly(self) -> None:
+        """Data arriving in multiple pieces is assembled into a single bytes object."""
+        data = b"hello_world_test"
+        mock_sock = _sock(data[:5], data[5:10], data[10:])
+        result = frame._recv_exact(mock_sock, len(data), "payload")
+        assert result == data
+
+    def test_no_recv_call_exceeds_cap(self) -> None:
+        """Every recv call requests at most _RECV_CAP bytes."""
+        n = frame._RECV_CAP + 100
+        mock_sock = _sock(b"x" * n)
+        frame._recv_exact(mock_sock, n, "payload")
+        for call in mock_sock.recv.call_args_list:
+            assert call.args[0] <= frame._RECV_CAP
+
+    def test_zero_bytes_makes_no_recv_call(self) -> None:
+        """_recv_exact(n=0) returns b'' without calling recv."""
+        mock_sock = MagicMock(spec=socket.socket)
+        result = frame._recv_exact(mock_sock, 0, "header")
+        assert result == b""
+        mock_sock.recv.assert_not_called()
+
+    def test_eof_mid_header_message_contains_mid_frame_and_counts(self) -> None:
+        """EOF partway through the header: message says 'mid-frame' with byte counts."""
+        mock_sock = _sock(b"x" * 5)  # 5 of 12 header bytes
+        with pytest.raises(TazConnectionLost) as exc_info:
+            frame._recv_exact(mock_sock, frame.HEADER_SIZE, "header")
+        msg = str(exc_info.value)
+        assert "mid-frame" in msg
+        assert "5 of 12" in msg
+        assert "header" in msg
+
+    def test_eof_mid_payload_message_contains_mid_frame_and_counts(self) -> None:
+        """EOF mid-payload: message says 'mid-frame' with byte counts."""
+        mock_sock = _sock(b"x" * 4)  # 4 of 10 payload bytes
+        with pytest.raises(TazConnectionLost) as exc_info:
+            frame._recv_exact(mock_sock, 10, "payload")
+        msg = str(exc_info.value)
+        assert "mid-frame" in msg
+        assert "4 of 10" in msg
+        assert "payload" in msg
+
+    def test_timeout_mid_payload_chains_timeout_error(self) -> None:
+        """Timeout mid-payload raises TazConnectionLost chaining TimeoutError."""
+        timeout_err = TimeoutError("timed out")
+        mock_sock = _sock(b"x" * 4, timeout_err)  # 4 bytes then timeout
+        with pytest.raises(TazConnectionLost) as exc_info:
+            frame._recv_exact(mock_sock, 10, "payload")
+        msg = str(exc_info.value)
+        assert "mid-frame" in msg
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="RSS check is Linux-only")
+    def test_no_prealloc_for_large_claimed_payload(self) -> None:
+        """Claimed payload far exceeds what arrives: RSS growth stays small."""
+        import resource
+
+        size = 64 * 1024 * 1024  # 64 MiB
+        # Raise RESPONSE limit so validate_header passes; unknown type bound follows.
+        limits = {**frame.DEFAULT_MAX_PAYLOAD, common_pb2.FRAME_TYPE_RESPONSE: size + 1}
+        hdr = frame.pack_header(
+            frame.Frame(type=0x09, flags=0, opcode=0, length=size, stream_id=0)
+        )
+        a, b = socket.socketpair()
+        a_closed = False
+        try:
+            rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            a.sendall(hdr + b"x" * 10)
+            a.close()
+            a_closed = True
+            with pytest.raises(TazConnectionLost):
+                frame.recv_frame(b, limits)
+            rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # ru_maxrss is in KB on Linux; < 8 MiB means growth < 8192 KB
+            assert rss_after - rss_before < 8 * 1024
+        finally:
+            if not a_closed:
+                a.close()
+            b.close()
+
+
+# ---------------------------------------------------------------------------
+# wait_readable (Step 4)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitReadable:
+    """Tests for wait_readable using real socketpairs."""
+
+    def test_no_data_returns_false_and_restores_timeout(self) -> None:
+        """No data within timeout: returns False; original socket timeout restored."""
+        a, b = socket.socketpair()
+        try:
+            original = b.gettimeout()
+            result = frame.wait_readable(b, 0.05)
+            assert not result
+            assert b.gettimeout() == original
+        finally:
+            a.close()
+            b.close()
+
+    def test_data_returns_true_and_byte_still_readable(self) -> None:
+        """Data available: returns True and the byte is not consumed (MSG_PEEK)."""
+        a, b = socket.socketpair()
+        try:
+            a.sendall(b"z")
+            assert frame.wait_readable(b, 1.0)
+            assert b.recv(1) == b"z"  # byte not consumed
+        finally:
+            a.close()
+            b.close()
+
+    def test_eof_raises_connection_lost(self) -> None:
+        """Peer closes connection: wait_readable raises TazConnectionLost."""
+        a, b = socket.socketpair()
+        try:
+            a.close()
+            with pytest.raises(TazConnectionLost):
+                frame.wait_readable(b, 1.0)
+        finally:
+            b.close()
+
+    def test_none_timeout_with_data_returns_true(self) -> None:
+        """timeout=None with data already present: returns True (blocks until data)."""
+        a, b = socket.socketpair()
+        try:
+            a.sendall(b"q")
+            assert frame.wait_readable(b, None)
+        finally:
+            a.close()
+            b.close()
+
+
+# ---------------------------------------------------------------------------
+# Step 4 constant
+# ---------------------------------------------------------------------------
+
+
+def test_default_unknown_type_max_payload_is_65536() -> None:
+    """DEFAULT_UNKNOWN_TYPE_MAX_PAYLOAD equals 65536 (§10.1, pinned by spec)."""
+    assert frame.DEFAULT_UNKNOWN_TYPE_MAX_PAYLOAD == 65536

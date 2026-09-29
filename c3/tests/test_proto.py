@@ -1,5 +1,6 @@
 """Smoke tests for the generated protobuf modules (no daemon required)."""
 
+from taz.c3.protocol import frame
 from taz.v1 import advanced_pb2, command_pb2, common_pb2, daemon_control_pb2
 
 
@@ -40,12 +41,15 @@ def test_capability_payload_round_trip() -> None:
         protocol_minor=0,
         operations=[common_pb2.OPCODE_VERSION, common_pb2.OPCODE_COMMAND_EXEC],
         max_payload_sizes=[
-            common_pb2.UInt32Pair(key=common_pb2.FRAME_TYPE_FILE_CHUNK, value=65536)
+            common_pb2.UInt32Pair(
+                key=common_pb2.FRAME_TYPE_FILE_CHUNK,
+                value=frame.DEFAULT_MAX_PAYLOAD[common_pb2.FRAME_TYPE_FILE_CHUNK],
+            )
         ],
         compression=["NONE"],
     )
     raw = payload.SerializeToString()
-    assert len(raw) <= 1024
+    assert len(raw) <= frame.DEFAULT_MAX_PAYLOAD[common_pb2.FRAME_TYPE_CAPABILITY]
     assert daemon_control_pb2.CapabilityPayload.FromString(raw) == payload
 
 
