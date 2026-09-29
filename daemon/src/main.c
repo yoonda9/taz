@@ -9,20 +9,13 @@
 #include <pb.h>
 #include <uv.h>
 
+#include "taz/build_info.h"
 #include "taz/v1/common.pb.h"
-
-#ifndef TAZ_VERSION
-#define TAZ_VERSION "0.0.0"
-#endif
-
-#ifndef TAZ_BUILD_ID
-#define TAZ_BUILD_ID "unknown"
-#endif
 
 int main(void)
 {
-    (void)printf("tazd %s (%s) libuv %s %s\n", TAZ_VERSION, TAZ_BUILD_ID,
-                 uv_version_string(), NANOPB_VERSION);
+    (void)printf("tazd %s (%s) libuv %s %s\n", taz_build_version(),
+                 taz_build_id(), uv_version_string(), NANOPB_VERSION);
     (void)printf("protocol opcode range: 0x0001..0x%04x\n",
                  (unsigned)taz_v1_Opcode_OPCODE_PIPELINE);
     return EXIT_SUCCESS;

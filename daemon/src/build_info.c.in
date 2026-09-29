@@ -1,0 +1,4 @@
+#include "taz/build_info.h"
+
+const char *taz_build_version(void) { return "@PROJECT_VERSION@"; }
+const char *taz_build_id(void) { return "@TAZ_BUILD_ID@"; }

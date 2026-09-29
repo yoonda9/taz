@@ -224,9 +224,18 @@ target_link_libraries(taz_proto PUBLIC nanopb::nanopb)
 add_library(taz::proto ALIAS taz_proto)
 
 # ---------------------------------------------------------------------------
+# Build-info seam (generated from the git hash and PROJECT_VERSION at configure
+# time; stale hashes require a reconfigure)
+# ---------------------------------------------------------------------------
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/build_info.c.in
+    ${CMAKE_CURRENT_BINARY_DIR}/build_info.c
+    @ONLY)
+
+# ---------------------------------------------------------------------------
 # Core logic library (frame pack/unpack/validate; shared by daemon and tests)
 # ---------------------------------------------------------------------------
-add_library(taz_core STATIC src/frame.c)
+add_library(taz_core STATIC src/frame.c ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
 # taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
 # to the C++ GoogleTest target that links taz_core.
@@ -239,8 +248,6 @@ target_link_libraries(
 # Daemon executable
 # ---------------------------------------------------------------------------
 add_executable(tazd src/main.c)
-target_compile_definitions(tazd PRIVATE TAZ_VERSION="${PROJECT_VERSION}"
-                                        TAZ_BUILD_ID="${TAZ_BUILD_ID}")
 # include/, _GNU_SOURCE, taz::proto, and libuv::uv_a come in transitively.
 target_link_libraries(tazd PRIVATE taz_warnings taz_core)
 
