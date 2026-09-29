@@ -690,8 +690,13 @@ class TestPackHeaderRanges:
         "kwargs",
         [
             dict(type=0, flags=0, opcode=0, length=0, stream_id=0),
-            dict(type=0xFF, flags=0xFF, opcode=0xFFFF, length=0xFFFF_FFFF,
-                 stream_id=0xFFFF_FFFF),
+            dict(
+                type=0xFF,
+                flags=0xFF,
+                opcode=0xFFFF,
+                length=0xFFFF_FFFF,
+                stream_id=0xFFFF_FFFF,
+            ),
         ],
         ids=["min-bounds", "max-bounds"],
     )
