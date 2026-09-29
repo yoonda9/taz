@@ -303,6 +303,9 @@ class TestSendFrame:
         assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
         assert exc_info.value.__cause__ is error
 
+    @pytest.mark.skipif(
+        not frame._HAS_SENDMSG, reason="sendmsg not available on this platform"
+    )
     @pytest.mark.parametrize(
         "error", [BrokenPipeError(32, "Broken pipe"), TimeoutError("timed out")]
     )
@@ -341,6 +344,9 @@ class TestSendFrame:
         )
         assert received == expected_header + payload
 
+    @pytest.mark.skipif(
+        not frame._HAS_SENDMSG, reason="sendmsg not available on this platform"
+    )
     def test_send_frame_sendmsg_partial_sends_deliver_all_bytes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -378,6 +384,9 @@ class TestSendFrame:
 
         assert bytes(collected) == all_bytes
 
+    @pytest.mark.skipif(
+        not frame._HAS_SENDMSG, reason="sendmsg not available on this platform"
+    )
     def test_send_frame_fallback_path_same_bytes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
