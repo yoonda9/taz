@@ -53,8 +53,8 @@ TEST(Proto, ErrorInfoRoundTrip)
 {
     taz_v1_ErrorInfo in = taz_v1_ErrorInfo_init_zero;
     in.code = taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
-    std::strcpy(in.message, "no such file");
-    std::strcpy(in.detail, "/tmp/missing");
+    std::memcpy(in.message, "no such file", sizeof("no such file"));
+    std::memcpy(in.detail, "/tmp/missing", sizeof("/tmp/missing"));
 
     uint8_t buffer[taz_v1_ErrorInfo_size];
     pb_ostream_t out = pb_ostream_from_buffer(buffer, sizeof(buffer));
@@ -82,7 +82,7 @@ TEST(Proto, CapabilityPayloadRoundTrip)
     in.max_payload_sizes[0].key = taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK;
     in.max_payload_sizes[0].value = kDefaultFrameLimit;
     in.compression_count = 1;
-    std::strcpy(in.compression[0], "NONE");
+    std::memcpy(in.compression[0], "NONE", sizeof("NONE"));
 
     uint8_t buffer[taz_v1_CapabilityPayload_size];
     pb_ostream_t out = pb_ostream_from_buffer(buffer, sizeof(buffer));
