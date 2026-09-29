@@ -2,8 +2,8 @@
 
 #include <string.h>
 
+#include "handlers/version.h"
 #include "taz/error.h"
-#include "taz/payload.h"
 #include "taz/v1/common.pb.h"
 
 /* Max payload in an outgoing frame from the dispatch layer.  The dispatcher
@@ -11,11 +11,6 @@
  * (VERSION payload is O(100 bytes)).  Error frames set the ceiling. */
 #define DISPATCH_SEND_BUFSZ                                                    \
     (TAZ_FRAME_HEADER_SIZE + TAZ_FRAME_MAX_PAYLOAD_ERROR)
-
-/* VERSION response payload buffer.  512 bytes is far more than the encoded
- * version/build/platform strings will ever need; encode will fail and we
- * send INTERNAL if it somehow overflows. */
-#define VERSION_PAYLOAD_BUFSZ 512U
 
 /* --------------------------------------------------------------------------
  * Active-stream set (unsorted array; max TAZ_DISPATCH_MAX_STREAMS entries)
@@ -120,30 +115,6 @@ static void handle_ping(const taz_frame_header_t *header,
     write_packed_frame((uint8_t)taz_v1_FrameType_FRAME_TYPE_PONG,
                        (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE, 0U,
                        header->stream_id, NULL, 0U, write_fn, ctx);
-}
-
-static void handle_version(const taz_frame_header_t *header,
-                           const uint8_t *payload,
-                           taz_dispatch_write_fn_t write_fn, void *ctx)
-{
-    uint8_t pay[VERSION_PAYLOAD_BUFSZ];
-    size_t len;
-
-    (void)payload;
-
-    len = taz_payload_version_response(pay, sizeof(pay));
-    if (len == 0U)
-    {
-        send_error(header->stream_id, header->opcode,
-                   taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
-                   "version encode failed", write_fn, ctx);
-        return;
-    }
-
-    write_packed_frame((uint8_t)taz_v1_FrameType_FRAME_TYPE_RESPONSE,
-                       (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE,
-                       header->opcode, header->stream_id, pay, (uint32_t)len,
-                       write_fn, ctx);
 }
 
 /* --------------------------------------------------------------------------

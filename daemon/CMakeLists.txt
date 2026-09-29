@@ -241,6 +241,7 @@ add_library(
     src/error.c
     src/server.c
     src/dispatch.c
+    src/handlers/version.c
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
 # taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
