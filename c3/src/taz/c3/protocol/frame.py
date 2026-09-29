@@ -102,34 +102,71 @@ def _connection_lost(exc: OSError) -> TazConnectionLost:
     return TazConnectionLost(message)
 
 
-def _recv_exact(sock: socket.socket, n: int, what: str) -> bytes:
+def _header_detail(frame: Frame) -> str:
+    return (
+        f"type=0x{frame.type:02x} flags=0x{frame.flags:02x} "
+        f"opcode=0x{frame.opcode:04x} stream_id={frame.stream_id} "
+        f"length={frame.length}"
+    )
+
+
+def _recv_failed(
+    sock: socket.socket,
+    exc: OSError,
+    got: int,
+    n: int,
+    what: str,
+    header: Frame | None,
+) -> TazConnectionLost:
+    # Before the first header byte nothing of a frame has arrived, so a
+    # timeout there is not a stall inside a frame.
+    if isinstance(exc, TimeoutError) and (header is not None or got > 0):
+        timeout = sock.gettimeout()
+        waited = f": no data for {timeout:g} s" if timeout else ""
+        return TazConnectionLost(
+            f"connection stalled mid-frame{waited}"
+            f" (received {got} of {n} {what} bytes)",
+            _header_detail(header) if header else "",
+        )
+    return _connection_lost(exc)
+
+
+def _closed_by_peer(
+    got: int, n: int, what: str, header: Frame | None
+) -> TazConnectionLost:
+    if header is None and got == 0:
+        return TazConnectionLost("connection closed by peer")
+    return TazConnectionLost(
+        f"connection closed by peer mid-frame (received {got} of {n} {what} bytes)",
+        _header_detail(header) if header else "",
+    )
+
+
+def _recv_exact(
+    sock: socket.socket, n: int, what: str, header: Frame | None = None
+) -> bytes:
+    """Read exactly ``n`` bytes of a frame's ``what`` ("header" or "payload").
+
+    ``header`` is the frame's unpacked header once known (the payload read);
+    failures then carry its fields in ``detail``. Messages are formatted only
+    on the error path.
+    """
     if n == 0:
         return b""
     try:
         first = sock.recv(min(n, _RECV_CAP))
-    except TimeoutError as exc:
-        raise TazConnectionLost(
-            f"connection timed out mid-frame (received 0 of {n} {what} bytes)"
-        ) from exc
     except OSError as exc:
-        raise _connection_lost(exc) from exc
+        raise _recv_failed(sock, exc, 0, n, what, header) from exc
     if len(first) == n:
         return first
     parts, got = [first], len(first)
     while got < n:
         if not parts[-1]:
-            raise TazConnectionLost(
-                f"connection closed by peer mid-frame"
-                f" (received {got} of {n} {what} bytes)"
-            )
+            raise _closed_by_peer(got, n, what, header)
         try:
             piece = sock.recv(min(n - got, _RECV_CAP))
-        except TimeoutError as exc:
-            raise TazConnectionLost(
-                f"connection timed out mid-frame (received {got} of {n} {what} bytes)"
-            ) from exc
         except OSError as exc:
-            raise _connection_lost(exc) from exc
+            raise _recv_failed(sock, exc, got, n, what, header) from exc
         parts.append(piece)
         got += len(piece)
     return b"".join(parts)
@@ -172,16 +209,11 @@ def recv_frame(
         else:
             limit = max(limits.get(t, d) for t, d in DEFAULT_MAX_PAYLOAD.items())
             frame_name = f"type 0x{frame.type:02x}"
-        detail = (
-            f"type=0x{frame.type:02x} flags=0x{frame.flags:02x} "
-            f"opcode=0x{frame.opcode:04x} stream_id={frame.stream_id} "
-            f"length={frame.length} limit={limit}"
-        )
         raise TazProtocolError(
             f"{frame_name} payload {frame.length} bytes exceeds limit {limit}",
-            detail,
+            f"{_header_detail(frame)} limit={limit}",
         )
-    frame.payload = _recv_exact(sock, frame.length, "payload")
+    frame.payload = _recv_exact(sock, frame.length, "payload", frame)
     return frame
 
 

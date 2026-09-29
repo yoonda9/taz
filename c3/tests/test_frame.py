@@ -38,6 +38,7 @@ def _sock(*chunks: bytes | OSError) -> MagicMock:
     MSG_PEEK returns the first byte without consuming it from the queue.
     When a chunk is consumed in full, the original bytes object is returned
     (enabling identity checks in _recv_exact single-read tests).
+    gettimeout() reports 30 s, the client's default socket timeout.
     """
     pending = list(chunks)
 
@@ -59,6 +60,7 @@ def _sock(*chunks: bytes | OSError) -> MagicMock:
 
     sock = MagicMock(spec=socket.socket)
     sock.recv.side_effect = recv
+    sock.gettimeout.return_value = 30.0
     return sock
 
 
@@ -814,6 +816,60 @@ class TestRecvExact:
         msg = str(exc_info.value)
         assert "mid-frame" in msg
         assert isinstance(exc_info.value.__cause__, TimeoutError)
+
+    def test_eof_at_frame_boundary_is_not_mid_frame(self) -> None:
+        """EOF before the first header byte: plain 'connection closed by peer'."""
+        with pytest.raises(TazConnectionLost) as exc_info:
+            frame.recv_frame(_sock(), frame.DEFAULT_MAX_PAYLOAD)
+        assert str(exc_info.value) == "connection closed by peer"
+        assert exc_info.value.detail == ""
+
+    def test_timeout_at_frame_boundary_is_not_mid_frame(self) -> None:
+        """Timeout before the first header byte: 'connection timed out', no stall."""
+        with pytest.raises(TazConnectionLost) as exc_info:
+            frame.recv_frame(
+                _sock(TimeoutError("timed out")), frame.DEFAULT_MAX_PAYLOAD
+            )
+        assert str(exc_info.value) == "connection timed out"
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
+
+    def test_timeout_mid_header_reports_stall_and_wait(self) -> None:
+        """Timeout after part of the header: the stall message names the wait."""
+        chunks: list[bytes | OSError] = [b"x" * 5, TimeoutError("timed out")]
+        with pytest.raises(TazConnectionLost) as exc_info:
+            frame.recv_frame(_sock(*chunks), frame.DEFAULT_MAX_PAYLOAD)
+        assert str(exc_info.value) == (
+            "connection stalled mid-frame: no data for 30 s"
+            " (received 5 of 12 header bytes)"
+        )
+        assert exc_info.value.detail == ""  # the header is not known yet
+
+    @pytest.mark.parametrize(
+        "failure", [None, TimeoutError("timed out")], ids=["eof", "timeout"]
+    )
+    def test_mid_payload_failure_detail_has_header_fields(
+        self, failure: TimeoutError | None
+    ) -> None:
+        """Once the header is known, a mid-payload failure carries its fields."""
+        header = frame.pack_header(
+            frame.Frame(
+                type=common_pb2.FRAME_TYPE_RESPONSE,
+                flags=0,
+                opcode=0x0002,
+                length=10,
+                stream_id=42,
+            )
+        )
+        chunks: list[bytes | OSError] = [header, b"x" * 4]
+        if failure is not None:
+            chunks.append(failure)
+        with pytest.raises(TazConnectionLost) as exc_info:
+            frame.recv_frame(_sock(*chunks), frame.DEFAULT_MAX_PAYLOAD)
+        assert "mid-frame" in str(exc_info.value)
+        assert "received 4 of 10 payload bytes" in str(exc_info.value)
+        assert exc_info.value.detail == (
+            "type=0x02 flags=0x00 opcode=0x0002 stream_id=42 length=10"
+        )
 
     @pytest.mark.skipif(sys.platform != "linux", reason="RSS check is Linux-only")
     def test_no_prealloc_for_large_claimed_payload(self) -> None:
