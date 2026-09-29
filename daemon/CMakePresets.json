@@ -125,6 +125,20 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "TAZ_SANITIZER": "address"
       }
+    },
+    {
+      "name": "linux-fuzz",
+      "displayName": "Linux libFuzzer (Clang + ASan + UBSan)",
+      "description": "Builds fuzz harnesses with -fsanitize=fuzzer,address,undefined. Use: just fuzz [seconds]",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "TAZ_SANITIZER": "address",
+        "TAZ_BUILD_FUZZ": "ON",
+        "TAZ_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -136,6 +150,7 @@
     { "name": "windows-analyze", "configurePreset": "windows-analyze" },
     { "name": "linux-asan", "configurePreset": "linux-asan" },
     { "name": "linux-tsan", "configurePreset": "linux-tsan" },
+    { "name": "linux-fuzz", "configurePreset": "linux-fuzz" },
     { "name": "windows-debug", "configurePreset": "windows-debug" },
     { "name": "windows-release", "configurePreset": "windows-release" },
     { "name": "windows-asan", "configurePreset": "windows-asan" }

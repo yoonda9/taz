@@ -241,6 +241,7 @@ add_library(
     src/error.c
     src/server.c
     src/dispatch.c
+    src/connection.c
     src/handlers/version.c
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
@@ -259,6 +260,16 @@ add_executable(tazd src/main.c)
 target_link_libraries(tazd PRIVATE taz_warnings taz_core)
 
 install(TARGETS tazd)
+
+# ---------------------------------------------------------------------------
+# Fuzz harnesses (linux-fuzz preset only)
+# ---------------------------------------------------------------------------
+option(TAZ_BUILD_FUZZ
+       "Build the libFuzzer harnesses (requires Clang + -fsanitize=fuzzer)"
+       OFF)
+if(TAZ_BUILD_FUZZ)
+    add_subdirectory(fuzz)
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests

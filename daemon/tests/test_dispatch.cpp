@@ -66,7 +66,7 @@ TEST(Dispatch, PingProducesPong)
     taz_dispatch_init(&d);
     WriteCtx wctx;
 
-    taz_frame_header_t h =
+    const taz_frame_header_t h =
         MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_PING), 0U,
                    7U);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
@@ -90,7 +90,7 @@ TEST(Dispatch, VersionOpcodeProducesResponse)
     taz_dispatch_init(&d);
     WriteCtx wctx;
 
-    taz_frame_header_t h = MakeHeader(
+    const taz_frame_header_t h = MakeHeader(
         static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
         static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), 1U);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
@@ -126,7 +126,7 @@ TEST(Dispatch, UnknownTypeProducesNotSupported)
     taz_dispatch_init(&d);
     WriteCtx wctx;
 
-    taz_frame_header_t h = MakeHeader(
+    const taz_frame_header_t h = MakeHeader(
         static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_UNSPECIFIED), 0U, 3U);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_UNKNOWN_TYPE, capture_write,
                        &wctx);
@@ -153,7 +153,7 @@ TEST(Dispatch, UnknownOpcodeProducesNotSupported)
     taz_dispatch_init(&d);
     WriteCtx wctx;
 
-    taz_frame_header_t h = MakeHeader(
+    const taz_frame_header_t h = MakeHeader(
         static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST), 0xFFFFU, 5U);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
 
@@ -187,7 +187,7 @@ TEST(Dispatch, DuplicateStreamIdProducesInvalidRequest)
     d.active_streams[0] = sid;
     d.active_count = 1U;
 
-    taz_frame_header_t h = MakeHeader(
+    const taz_frame_header_t h = MakeHeader(
         static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
         static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), sid);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
@@ -218,7 +218,7 @@ TEST(Dispatch, OversizedVerdictIsNoOp)
     taz_dispatch_init(&d);
     WriteCtx wctx;
 
-    taz_frame_header_t h = MakeHeader(
+    const taz_frame_header_t h = MakeHeader(
         static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
         static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), 99U);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OVERSIZED, capture_write,

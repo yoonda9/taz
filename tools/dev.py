@@ -52,10 +52,15 @@ NANOPB_GENERATOR = (
     ROOT / "daemon" / "third_party" / "nanopb" / "generator" / "nanopb_generator.py"
 )
 DAEMON_C_DIRS = (ROOT / "daemon" / "src", ROOT / "daemon" / "include")
+# Fuzz harnesses use the libFuzzer API (LLVMFuzzerTestOneInput), which has a
+# fixed external-linkage name that cannot conform to the project naming rules.
+# They are formatted with clang-format but excluded from clang-tidy.
+DAEMON_FUZZ_DIRS = (ROOT / "daemon" / "fuzz",)
 DAEMON_CXX_DIRS = (ROOT / "daemon" / "tests",)
 CMAKE_FILES = (
     ROOT / "daemon" / "CMakeLists.txt",
     ROOT / "daemon" / "tests" / "CMakeLists.txt",
+    ROOT / "daemon" / "fuzz" / "CMakeLists.txt",
 )
 GENERATED_PATHS = (PY_OUT / PROTO_PACKAGE_DIR, C_OUT)
 
@@ -212,7 +217,7 @@ def host_profiles_for(preset: str) -> list[str]:
     """Host profile chain for a preset: detected base first, then our partials."""
     if preset.startswith("windows-"):
         return ["default", str(PROFILES_DIR / "windows-static")]
-    if preset.startswith("linux-clang"):
+    if preset.startswith("linux-fuzz") or preset.startswith("linux-clang"):
         return [
             "clang",
             str(PROFILES_DIR / "linux-static"),
@@ -404,8 +409,10 @@ def cmd_proto(check: bool) -> None:
 # C tooling
 # ---------------------------------------------------------------------------
 def cmd_clang_format(check: bool) -> None:
-    sources = files_under(DAEMON_C_DIRS, (".c", ".h")) + files_under(
-        DAEMON_CXX_DIRS, (".cpp", ".hpp", ".h")
+    sources = (
+        files_under(DAEMON_C_DIRS, (".c", ".h"))
+        + files_under(DAEMON_FUZZ_DIRS, (".c", ".h"))
+        + files_under(DAEMON_CXX_DIRS, (".cpp", ".hpp", ".h"))
     )
     if not sources:
         print("clang-format: no sources")
@@ -700,6 +707,34 @@ def cmd_doctor() -> None:
 
 
 # ---------------------------------------------------------------------------
+# fuzz
+# ---------------------------------------------------------------------------
+def cmd_fuzz(build_dir: Path, seconds: int) -> None:
+    """Run each libFuzzer harness from its seed corpus."""
+    fuzz_dir = ROOT / "daemon" / "fuzz"
+    corpus_dir = fuzz_dir / "corpus"
+    harnesses = ["fuzz_reassembly", "fuzz_decode"]
+    for harness in harnesses:
+        binary = build_dir / harness
+        if not binary.exists():
+            sys.exit(f"error: fuzz binary not found: {binary}")
+        harness_corpus = corpus_dir / harness
+        harness_corpus.mkdir(parents=True, exist_ok=True)
+        print(f"$ {binary} {harness_corpus} -max_total_time={seconds}")
+        rc = subprocess.run(
+            [
+                str(binary),
+                str(harness_corpus),
+                f"-max_total_time={seconds}",
+                "-error_exitcode=1",
+            ],
+            cwd=ROOT,
+        ).returncode
+        if rc != 0:
+            sys.exit(f"error: {harness} reported a failure (exit {rc})")
+
+
+# ---------------------------------------------------------------------------
 # clean / verify-static
 # ---------------------------------------------------------------------------
 def cmd_clean() -> None:
@@ -784,6 +819,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--build-dir", type=Path, required=True)
     p = sub.add_parser("coverage")
     p.add_argument("--build-dir", type=Path, required=True)
+    p = sub.add_parser("fuzz")
+    p.add_argument("--build-dir", type=Path, required=True)
+    p.add_argument("--seconds", type=int, default=60)
     sub.add_parser("doctor")
     sub.add_parser("clean")
     p = sub.add_parser("verify-static")
@@ -826,6 +864,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             cmd_valgrind(args.build_dir.resolve())
         case "coverage":
             cmd_coverage(args.build_dir.resolve())
+        case "fuzz":
+            cmd_fuzz(args.build_dir.resolve(), args.seconds)
         case "doctor":
             cmd_doctor()
         case "clean":

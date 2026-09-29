@@ -94,6 +94,11 @@ test-sanitizers: (test-c "windows-asan")
 test-valgrind preset=preset: (build preset)
     {{ dev }} valgrind --build-dir daemon/build/{{ preset }}
 
+# Run each libFuzzer harness from its seed corpus for [seconds] seconds
+[unix]
+fuzz seconds="60": (build "linux-fuzz")
+    {{ dev }} fuzz --build-dir daemon/build/linux-fuzz --seconds {{ seconds }}
+
 # Build with the compiler's static analyzer (GCC -fanalyzer); findings are errors
 [unix]
 analyze: (build "linux-analyze")
