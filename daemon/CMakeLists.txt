@@ -233,8 +233,9 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/build_info.c.in
 # ---------------------------------------------------------------------------
 # Core logic library (frame pack/unpack/validate; shared by daemon and tests)
 # ---------------------------------------------------------------------------
-add_library(taz_core STATIC src/frame.c src/reassembly.c
-                            ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
+add_library(
+    taz_core STATIC src/frame.c src/reassembly.c src/payload.c src/error.c
+                    ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
 # taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
 # to the C++ GoogleTest target that links taz_core.
