@@ -14,7 +14,7 @@ namespace
 {
 
 // Default per-type payload limit for REQUEST/RESPONSE/FILE_CHUNK (§6).
-static constexpr uint32_t kDefaultFrameLimit = 65536U;
+constexpr uint32_t kDefaultFrameLimit = 65536U;
 
 TEST(Proto, OpcodeValuesMatchSpecification)
 {

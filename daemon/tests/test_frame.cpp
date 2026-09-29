@@ -181,7 +181,7 @@ TEST(Frame, MaxPayloadMatchesSpec)
 TEST(Frame, MaxPayloadUnknownTypeBoundIs65536)
 {
     // UNSPECIFIED and reserved types use the 64 KiB bound (§10.1).
-    for (uint8_t t : kUnknownTypes)
+    for (const uint8_t t : kUnknownTypes)
     {
         EXPECT_EQ(taz_frame_max_payload(t), 65536U) << "type=" << +t;
     }
@@ -207,7 +207,7 @@ TEST(Frame, ValidateUnknownTypesAgainst64KiBBound)
 {
     // Within the bound an unknown type is skippable; over it, oversized
     // (§10.1).
-    for (uint8_t t : kUnknownTypes)
+    for (const uint8_t t : kUnknownTypes)
     {
         EXPECT_EQ(Validate(t, 0U), TAZ_FRAME_UNKNOWN_TYPE) << "type=" << +t;
         EXPECT_EQ(Validate(t, 65536U), TAZ_FRAME_UNKNOWN_TYPE) << "type=" << +t;

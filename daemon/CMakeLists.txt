@@ -88,6 +88,30 @@ else()
     endif()
 endif()
 
+# C++ test targets get the same base warnings but without -Wstrict-prototypes
+# and -Wmissing-prototypes (C-only flags invalid in C++ TUs). No analyzer or
+# coverage flags here so linux-analyze and linux-coverage do not instrument
+# gtest code.
+add_library(taz_cxx_warnings INTERFACE)
+if(MSVC)
+    target_compile_options(taz_cxx_warnings INTERFACE /W4 /permissive-)
+    if(TAZ_WARNINGS_AS_ERRORS)
+        target_compile_options(taz_cxx_warnings INTERFACE /WX)
+    endif()
+else()
+    target_compile_options(
+        taz_cxx_warnings
+        INTERFACE -Wall
+                  -Wextra
+                  -Wpedantic
+                  -Wshadow
+                  -Wconversion
+                  -Wsign-conversion)
+    if(TAZ_WARNINGS_AS_ERRORS)
+        target_compile_options(taz_cxx_warnings INTERFACE -Werror)
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Compiler static analysis and coverage (first-party targets only, via the
 # taz_warnings interface target)
@@ -165,6 +189,13 @@ endif()
 # generators folder to CMAKE_PREFIX_PATH)
 # ---------------------------------------------------------------------------
 find_package(libuv REQUIRED CONFIG)
+# libuv documents _GNU_SOURCE on Linux: strict -std=c11 hides POSIX
+# declarations (pthread_rwlock_t, pthread_barrier_t) that libuv headers need.
+# Propagate via libuv's INTERFACE so every target linking libuv::uv_a gets it.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_property(TARGET libuv::uv_a APPEND PROPERTY
+                 INTERFACE_COMPILE_DEFINITIONS _GNU_SOURCE)
+endif()
 
 # nanopb runtime, vendored as a git submodule pinned to the same release as the
 # generator used by `just proto`.
@@ -200,11 +231,6 @@ add_library(taz::proto ALIAS taz_proto)
 # ---------------------------------------------------------------------------
 add_library(taz_core STATIC src/frame.c)
 target_include_directories(taz_core PUBLIC include)
-# Strict -std=c11 hides POSIX declarations that libuv's headers rely on
-# (pthread_rwlock_t, pthread_barrier_t); libuv documents _GNU_SOURCE on Linux.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_compile_definitions(taz_core PUBLIC _GNU_SOURCE)
-endif()
 # taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
 # to the C++ GoogleTest target that links taz_core.
 target_link_libraries(

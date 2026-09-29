@@ -5,6 +5,8 @@ find_package(GTest REQUIRED CONFIG)
 include(GoogleTest)
 
 add_executable(taz_tests test_proto.cpp test_frame.cpp)
-target_link_libraries(taz_tests PRIVATE taz_core taz::proto GTest::gtest_main)
+# taz::proto comes in transitively via taz_core; taz_cxx_warnings carries C++
+# warning flags without the C-only -Wstrict-prototypes/-Wmissing-prototypes.
+target_link_libraries(taz_tests PRIVATE taz_core taz_cxx_warnings GTest::gtest_main)
 
 gtest_discover_tests(taz_tests)

@@ -1,0 +1,6 @@
+InheritParentConfig: true
+Checks: >
+  -readability-identifier-naming,
+  -readability-magic-numbers,
+  -performance-enum-size
+HeaderFilterRegex: ".*/daemon/(src|include|tests)/.*"

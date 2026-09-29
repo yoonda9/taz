@@ -418,7 +418,9 @@ def cmd_clang_tidy(build_dir: Path) -> None:
     compile_db = build_dir / "compile_commands.json"
     if not compile_db.exists():
         sys.exit(f"error: {compile_db} not found. Run `just configure` first.")
-    sources = files_under(DAEMON_C_DIRS, (".c",))
+    sources = files_under(DAEMON_C_DIRS, (".c",)) + files_under(
+        DAEMON_CXX_DIRS, (".cpp",)
+    )
     if not sources:
         print("clang-tidy: no sources")
         return
