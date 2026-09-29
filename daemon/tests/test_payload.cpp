@@ -32,8 +32,10 @@ TEST(Payload, CapabilityRoundTrip)
 
     EXPECT_EQ(cap.protocol_major, 1U);
     EXPECT_EQ(cap.protocol_minor, 0U);
-    ASSERT_EQ(cap.operations_count, 1U);
+    ASSERT_EQ(cap.operations_count, 2U);
     EXPECT_EQ(cap.operations[0],
+              static_cast<uint32_t>(taz_v1_Opcode_OPCODE_PING));
+    EXPECT_EQ(cap.operations[1],
               static_cast<uint32_t>(taz_v1_Opcode_OPCODE_VERSION));
     ASSERT_GE(cap.compression_count, 1U);
     EXPECT_STREQ(cap.compression[0], "NONE");

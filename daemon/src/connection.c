@@ -196,17 +196,20 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
  * CAPABILITY frame helper
  * ------------------------------------------------------------------------- */
 
-static void send_capability(taz_conn_t *conn)
+size_t taz_conn_capability_frame(uint8_t *buf, size_t bufsize)
 {
-    uint8_t payload[TAZ_FRAME_MAX_PAYLOAD_CAPABILITY];
-    uint8_t frame[TAZ_FRAME_HEADER_SIZE + TAZ_FRAME_MAX_PAYLOAD_CAPABILITY];
     taz_frame_header_t h;
     size_t pay_len;
 
-    pay_len = taz_payload_capability(payload, sizeof(payload));
+    if (bufsize < (size_t)TAZ_FRAME_HEADER_SIZE)
+    {
+        return 0U;
+    }
+    pay_len = taz_payload_capability(buf + TAZ_FRAME_HEADER_SIZE,
+                                     bufsize - (size_t)TAZ_FRAME_HEADER_SIZE);
     if (pay_len == 0U)
     {
-        return;
+        return 0U;
     }
 
     h.type = (uint8_t)taz_v1_FrameType_FRAME_TYPE_CAPABILITY;
@@ -214,10 +217,19 @@ static void send_capability(taz_conn_t *conn)
     h.opcode = 0U;
     h.length = (uint32_t)pay_len;
     h.stream_id = 0U;
-    taz_frame_pack_header(&h, frame);
-    (void)memcpy(frame + TAZ_FRAME_HEADER_SIZE, payload, pay_len);
+    taz_frame_pack_header(&h, buf);
+    return (size_t)TAZ_FRAME_HEADER_SIZE + pay_len;
+}
 
-    conn_write_fn(frame, (size_t)TAZ_FRAME_HEADER_SIZE + pay_len, conn);
+static void send_capability(taz_conn_t *conn)
+{
+    uint8_t frame[TAZ_FRAME_HEADER_SIZE + TAZ_FRAME_MAX_PAYLOAD_CAPABILITY];
+    const size_t len = taz_conn_capability_frame(frame, sizeof(frame));
+
+    if (len > 0U)
+    {
+        conn_write_fn(frame, len, conn);
+    }
 }
 
 /* -------------------------------------------------------------------------

@@ -13,6 +13,7 @@
 #include "taz/frame.h"
 #include "taz/reassembly.h"
 #include "taz/v1/common.pb.h"
+#include "taz/v1/daemon_control.pb.h"
 
 namespace
 {
@@ -261,6 +262,35 @@ TEST(Connection, OversizedViaReassemblyProducesClose)
     taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
     ASSERT_TRUE(DecodeErrorInfo(wctx.frames[0], &err));
     EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_PROTOCOL_ERROR);
+}
+
+TEST(Connection, CapabilityFrameIsStreamZeroOpcodeZero)
+{
+    uint8_t buf[TAZ_FRAME_HEADER_SIZE + TAZ_FRAME_MAX_PAYLOAD_CAPABILITY];
+    const size_t n = taz_conn_capability_frame(buf, sizeof(buf));
+    ASSERT_GT(n, static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+
+    taz_frame_header_t h{};
+    taz_frame_unpack_header(buf, &h);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_CAPABILITY));
+    EXPECT_EQ(h.flags, 0U);
+    EXPECT_EQ(h.opcode, 0U);
+    EXPECT_EQ(h.stream_id, 0U);
+    EXPECT_EQ(h.length, n - TAZ_FRAME_HEADER_SIZE);
+    EXPECT_EQ(taz_frame_validate_header(&h), TAZ_FRAME_OK);
+
+    taz_v1_CapabilityPayload cap = taz_v1_CapabilityPayload_init_zero;
+    pb_istream_t stream =
+        pb_istream_from_buffer(buf + TAZ_FRAME_HEADER_SIZE, h.length);
+    ASSERT_TRUE(pb_decode(&stream, taz_v1_CapabilityPayload_fields, &cap));
+    EXPECT_EQ(cap.protocol_major, 1U);
+}
+
+TEST(Connection, CapabilityFrameNeedsRoomForHeader)
+{
+    uint8_t buf[TAZ_FRAME_HEADER_SIZE - 1];
+    EXPECT_EQ(taz_conn_capability_frame(buf, sizeof(buf)), 0U);
 }
 
 } // namespace

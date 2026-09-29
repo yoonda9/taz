@@ -24,8 +24,11 @@ size_t taz_payload_capability(uint8_t *buf, size_t bufsize)
     taz_v1_CapabilityPayload msg = taz_v1_CapabilityPayload_init_zero;
     msg.protocol_major = (uint32_t)TAZ_PROTOCOL_MAJOR;
     msg.protocol_minor = (uint32_t)TAZ_PROTOCOL_MINOR;
-    msg.operations_count = 1U;
-    msg.operations[0] = (uint32_t)taz_v1_Opcode_OPCODE_VERSION;
+    /* PING is answered at the frame layer (api.md §1.1) but is still an
+     * operation this daemon implements (protocol §9). */
+    msg.operations_count = 2U;
+    msg.operations[0] = (uint32_t)taz_v1_Opcode_OPCODE_PING;
+    msg.operations[1] = (uint32_t)taz_v1_Opcode_OPCODE_VERSION;
     msg.compression_count = 1U;
     (void)strncpy(msg.compression[0], "NONE", sizeof(msg.compression[0]) - 1U);
 

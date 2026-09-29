@@ -31,6 +31,11 @@ extern "C"
         uint8_t read_buf[TAZ_CONN_READ_BUF_SIZE];
     } taz_conn_t;
 
+    /* Write the CAPABILITY frame sent first on every connection (header and
+     * payload, stream_id 0, opcode 0) into buf. Returns its length, or 0 if
+     * buf is too small or encoding fails. */
+    size_t taz_conn_capability_frame(uint8_t *buf, size_t bufsize);
+
     /* Passed to uv_listen as on_connect: accepts, allocates taz_conn_t,
      * sends CAPABILITY, starts reading. */
     void taz_conn_on_new_connection(uv_stream_t *server, int status);
