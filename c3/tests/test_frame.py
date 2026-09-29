@@ -389,6 +389,38 @@ class TestSendFrame:
     @pytest.mark.skipif(
         not frame._HAS_SENDMSG, reason="sendmsg not available on this platform"
     )
+    @pytest.mark.parametrize(
+        "chunk_size", [5, 12, 64], ids=["partial", "exact", "whole"]
+    )
+    def test_send_frame_sendmsg_empty_payload_sends_header_once(
+        self, monkeypatch: pytest.MonkeyPatch, chunk_size: int
+    ) -> None:
+        """An empty payload sends the header and returns (PING, empty REQUEST).
+
+        A real sendmsg returns 0 when asked to send only empty buffers, which
+        spun _sendmsg_all forever; the mock fails such a call instead.
+        """
+        monkeypatch.setattr(frame, "_HAS_SENDMSG", True)
+        f = _frame(common_pb2.FRAME_TYPE_PING, 0)
+        collected = bytearray()
+
+        def mock_sendmsg(views: list[memoryview]) -> int:
+            total = sum(len(v) for v in views)
+            assert total > 0, "sendmsg called with nothing to send"
+            sent = min(chunk_size, total)
+            collected.extend(b"".join(bytes(v) for v in views)[:sent])
+            return sent
+
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.sendmsg.side_effect = mock_sendmsg
+
+        frame.send_frame(mock_sock, f)
+
+        assert bytes(collected) == frame.pack_header(f)
+
+    @pytest.mark.skipif(
+        not frame._HAS_SENDMSG, reason="sendmsg not available on this platform"
+    )
     def test_send_frame_fallback_path_same_bytes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

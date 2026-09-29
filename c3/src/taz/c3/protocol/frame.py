@@ -221,6 +221,9 @@ def _sendmsg_all(sock: socket.socket, views: list[memoryview]) -> None:
     """Send all bytes from multiple buffers via sendmsg, retrying partial sends."""
     if sys.platform == "win32":
         raise NotImplementedError("sendmsg is not available on Windows")
+    # An empty buffer (a PING, or any frame without payload) would stay at the
+    # head of the list: sendmsg returns 0 for it and the loop never ends.
+    views = [v for v in views if len(v)]
     while views:
         sent = sock.sendmsg(views)
         remaining = sent
