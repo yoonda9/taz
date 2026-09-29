@@ -14,7 +14,11 @@
 
 static void usage(const char *prog)
 {
-    (void)fprintf(stderr, "Usage: %s [--host HOST] [--port PORT] [--version]\n",
+    (void)fprintf(stderr,
+                  "Usage: %s [--host HOST] [--port PORT] [--version]\n"
+                  "  --host HOST  IPv4 or IPv6 literal to listen on (default "
+                  "127.0.0.1; 0.0.0.0 or :: accept remote clients)\n"
+                  "  --port PORT  TCP port (default 0: any free port)\n",
                   prog);
 }
 

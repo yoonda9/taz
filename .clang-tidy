@@ -4,6 +4,11 @@
 # Run via `just lint-c`, which first produces compile_commands.json with
 # `just configure`. Generated protobuf code and third-party sources are
 # excluded by the file list and HeaderFilterRegex below.
+#
+# Disabled checks, and why:
+# - clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+#   flags every memcpy/memset and asks for the C11 Annex K *_s functions,
+#   which glibc and musl do not provide; bounds are checked at each call.
 ---
 Checks: >
   bugprone-*,
