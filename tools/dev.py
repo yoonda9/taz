@@ -714,27 +714,40 @@ def cmd_doctor() -> None:
 # ---------------------------------------------------------------------------
 # fuzz
 # ---------------------------------------------------------------------------
+# libFuzzer's input-size limit per harness. Left to itself libFuzzer caps
+# inputs at 4 KiB, which never reaches the end of the 64 KiB reassembly buffer.
+FUZZ_FRAME_MAX = 12 + 64 * 1024  # header + largest payload
+FUZZ_MAX_LEN = {
+    "fuzz_reassembly": 2 + 2 * FUZZ_FRAME_MAX,  # read-size bytes + two frames
+    "fuzz_decode": 1 + 64 * 1024,  # type byte + a REQUEST payload
+}
+
+
 def cmd_fuzz(build_dir: Path, seconds: int) -> None:
-    """Run each libFuzzer harness from its seed corpus."""
-    fuzz_dir = ROOT / "daemon" / "fuzz"
-    corpus_dir = fuzz_dir / "corpus"
-    harnesses = ["fuzz_reassembly", "fuzz_decode"]
-    for harness in harnesses:
+    """Run each libFuzzer harness for `seconds` from its checked-in seeds.
+
+    New inputs go to a scratch corpus in the build directory: libFuzzer writes
+    to the first corpus directory it is given and only reads the others, so
+    the seeds in daemon/fuzz/corpus/ stay as committed.
+    """
+    seeds_dir = ROOT / "daemon" / "fuzz" / "corpus"
+    for harness, max_len in FUZZ_MAX_LEN.items():
         binary = build_dir / "fuzz" / harness
         if not binary.exists():
             sys.exit(f"error: fuzz binary not found: {binary}")
-        harness_corpus = corpus_dir / harness
-        harness_corpus.mkdir(parents=True, exist_ok=True)
-        print(f"$ {binary} {harness_corpus} -max_total_time={seconds}")
-        rc = subprocess.run(
+        scratch = build_dir / "fuzz-corpus" / harness
+        scratch.mkdir(parents=True, exist_ok=True)
+        rc = run(
             [
-                str(binary),
-                str(harness_corpus),
+                binary,
+                scratch,
+                seeds_dir / harness,
                 f"-max_total_time={seconds}",
+                f"-max_len={max_len}",
                 "-error_exitcode=1",
             ],
-            cwd=ROOT,
-        ).returncode
+            check=False,
+        )
         if rc != 0:
             sys.exit(f"error: {harness} reported a failure (exit {rc})")
 

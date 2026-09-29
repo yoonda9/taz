@@ -32,15 +32,36 @@ static void on_frame(const taz_frame_header_t *header, const uint8_t *payload,
     (void)close_out;
 }
 
+/* The first two input bytes (big-endian) choose the read size, 1..65536; the
+ * rest is fed in reads of that size, so frames split across reads are fuzzed
+ * as well as coalesced ones. `just fuzz` raises libFuzzer's input limit so
+ * payloads can reach the end of the 64 KiB reassembly buffer. */
+#define READ_SIZE_BYTES 2U
+#define BITS_PER_BYTE   8U
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     taz_reassembly_state_t state;
     fuzz_ctx_t fctx;
+    size_t read_size;
+    size_t pos;
+
+    if (size < READ_SIZE_BYTES)
+    {
+        return 0;
+    }
+    read_size = (((size_t)data[0] << BITS_PER_BYTE) | (size_t)data[1]) + 1U;
+    data += READ_SIZE_BYTES;
+    size -= READ_SIZE_BYTES;
 
     taz_reassembly_init(&state);
     taz_dispatch_init(&fctx.dispatch);
 
-    taz_reassembly_feed(&state, data, size, on_frame, &fctx);
+    for (pos = 0U; pos < size; pos += read_size)
+    {
+        size_t n = ((size - pos) < read_size) ? (size - pos) : read_size;
+        taz_reassembly_feed(&state, &data[pos], n, on_frame, &fctx);
+    }
     return 0;
 }
