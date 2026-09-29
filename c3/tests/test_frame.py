@@ -761,6 +761,23 @@ class TestRecvExact:
         for call in mock_sock.recv.call_args_list:
             assert call.args[0] <= frame._RECV_CAP
 
+    def test_loop_requests_remaining_not_total_bytes(self) -> None:
+        """Each recv in the loop asks for n-got (remaining) bytes, not n."""
+        chunk = 100
+        data = b"a" * chunk + b"b" * chunk + b"c" * chunk + b"d" * chunk
+        n = len(data)  # 400
+        mock_sock = _sock(
+            data[:chunk],
+            data[chunk : chunk * 2],
+            data[chunk * 2 : chunk * 3],
+            data[chunk * 3 :],
+        )
+        result = frame._recv_exact(mock_sock, n, "payload")
+        assert result == data
+        calls = [call.args[0] for call in mock_sock.recv.call_args_list]
+        expected = [min(n - i * chunk, frame._RECV_CAP) for i in range(4)]
+        assert calls == expected, f"expected {expected}, got {calls}"
+
     def test_zero_bytes_makes_no_recv_call(self) -> None:
         """_recv_exact(n=0) returns b'' without calling recv."""
         mock_sock = MagicMock(spec=socket.socket)
