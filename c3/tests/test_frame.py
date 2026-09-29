@@ -253,36 +253,53 @@ class TestValidateHeader:
 class TestSendFrame:
     """Test send_frame operation."""
 
-    def test_send_frame_sets_length_and_sends_all_data(self) -> None:
-        """send_frame sets length from payload and sends header+payload."""
+    def test_send_frame_does_not_mutate_caller_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """send_frame does not mutate the caller's frame.length."""
+        monkeypatch.setattr(frame, "_HAS_SENDMSG", False)
         mock_sock = MagicMock(spec=socket.socket)
-        f = _frame(common_pb2.FRAME_TYPE_REQUEST, opcode=1, stream_id=1)
+        f = _frame(common_pb2.FRAME_TYPE_REQUEST, 999, opcode=1, stream_id=1)
         f.payload = b"test_payload"
 
         frame.send_frame(mock_sock, f)
 
-        assert f.length == len(b"test_payload")
-        mock_sock.sendall.assert_called_once_with(
-            frame.pack_header(f) + b"test_payload"
+        assert f.length == 999  # unchanged; send_frame must not mutate the caller
+        expected_header = frame.pack_header(
+            frame.Frame(
+                type=f.type,
+                flags=f.flags,
+                opcode=f.opcode,
+                length=len(b"test_payload"),
+                stream_id=f.stream_id,
+            )
         )
+        mock_sock.sendall.assert_called_once_with(expected_header + b"test_payload")
 
-    def test_send_frame_with_empty_payload(self) -> None:
-        """send_frame handles empty payload."""
+    def test_send_frame_with_empty_payload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """send_frame handles empty payload; caller's length is not changed."""
+        monkeypatch.setattr(frame, "_HAS_SENDMSG", False)
         mock_sock = MagicMock(spec=socket.socket)
-        f = _frame(common_pb2.FRAME_TYPE_PING)
+        f = _frame(common_pb2.FRAME_TYPE_PING, 42)  # stale length
 
         frame.send_frame(mock_sock, f)
 
-        assert f.length == 0
-        mock_sock.sendall.assert_called_once_with(frame.pack_header(f))
+        assert f.length == 42  # not mutated
+        expected_header = frame.pack_header(
+            frame.Frame(f.type, f.flags, f.opcode, 0, f.stream_id)
+        )
+        mock_sock.sendall.assert_called_once_with(expected_header)
 
     @pytest.mark.parametrize(
         "error", [BrokenPipeError(32, "Broken pipe"), TimeoutError("timed out")]
     )
-    def test_send_frame_socket_error_raises_connection_lost(
-        self, error: OSError
+    def test_send_frame_sendall_error_raises_connection_lost(
+        self, error: OSError, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A failed or timed-out sendall surfaces as TazConnectionLost."""
+        """A failed sendall surfaces as TazConnectionLost."""
+        monkeypatch.setattr(frame, "_HAS_SENDMSG", False)
         mock_sock = MagicMock(spec=socket.socket)
         mock_sock.sendall.side_effect = error
 
@@ -291,6 +308,114 @@ class TestSendFrame:
 
         assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
         assert exc_info.value.__cause__ is error
+
+    @pytest.mark.parametrize(
+        "error", [BrokenPipeError(32, "Broken pipe"), TimeoutError("timed out")]
+    )
+    def test_send_frame_sendmsg_error_raises_connection_lost(
+        self, error: OSError, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed sendmsg surfaces as TazConnectionLost."""
+        monkeypatch.setattr(frame, "_HAS_SENDMSG", True)
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.sendmsg.side_effect = error
+
+        with pytest.raises(TazConnectionLost) as exc_info:
+            frame.send_frame(mock_sock, _frame(common_pb2.FRAME_TYPE_PING))
+
+        assert exc_info.value.code == common_pb2.ERROR_CODE_CONNECTION_LOST
+        assert exc_info.value.__cause__ is error
+
+    def test_send_frame_bytes_via_socketpair(self) -> None:
+        """Bytes received by peer equal header+payload regardless of path taken."""
+        a, b = socket.socketpair()
+        try:
+            payload = b"hello_socketpair"
+            f = _frame(common_pb2.FRAME_TYPE_REQUEST, 0, opcode=7, stream_id=42)
+            f.payload = payload
+            frame.send_frame(a, f)
+            a.shutdown(socket.SHUT_WR)
+            received = b""
+            while chunk := b.recv(4096):
+                received += chunk
+        finally:
+            a.close()
+            b.close()
+
+        expected_header = frame.pack_header(
+            frame.Frame(f.type, f.flags, f.opcode, len(payload), f.stream_id)
+        )
+        assert received == expected_header + payload
+
+    def test_send_frame_sendmsg_partial_sends_deliver_all_bytes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_sendmsg_all retries correctly when sendmsg returns short counts."""
+        monkeypatch.setattr(frame, "_HAS_SENDMSG", True)
+
+        payload = b"hello_world_0123456789"
+        f = _frame(common_pb2.FRAME_TYPE_REQUEST, 0, opcode=1, stream_id=42)
+        f.payload = payload
+
+        expected_header = frame.pack_header(
+            frame.Frame(f.type, f.flags, f.opcode, len(payload), f.stream_id)
+        )
+        all_bytes = expected_header + payload
+
+        # sendmsg sends 5 bytes at a time to exercise partial-send retry
+        chunk_size = 5
+        collected = bytearray()
+
+        def mock_sendmsg(views: list[memoryview]) -> int:
+            to_send = min(chunk_size, sum(len(v) for v in views))
+            remaining = to_send
+            for v in views:
+                take = min(remaining, len(v))
+                collected.extend(bytes(v[:take]))
+                remaining -= take
+                if remaining == 0:
+                    break
+            return to_send
+
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.sendmsg.side_effect = mock_sendmsg
+
+        frame.send_frame(mock_sock, f)
+
+        assert bytes(collected) == all_bytes
+
+    def test_send_frame_fallback_path_same_bytes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With _HAS_SENDMSG=False the concatenation path produces the same bytes."""
+        payload = b"fallback_test"
+        f = _frame(common_pb2.FRAME_TYPE_RESPONSE, 0, opcode=2, stream_id=7)
+        f.payload = payload
+
+        expected_header = frame.pack_header(
+            frame.Frame(f.type, f.flags, f.opcode, len(payload), f.stream_id)
+        )
+
+        monkeypatch.setattr(frame, "_HAS_SENDMSG", True)
+        mock_sendmsg = MagicMock(spec=socket.socket)
+        collected_sendmsg = bytearray()
+
+        def capture_sendmsg(views: list[memoryview]) -> int:
+            total = sum(len(v) for v in views)
+            for v in views:
+                collected_sendmsg.extend(bytes(v))
+            return total
+
+        mock_sendmsg.sendmsg.side_effect = capture_sendmsg
+        frame.send_frame(mock_sendmsg, f)
+
+        monkeypatch.setattr(frame, "_HAS_SENDMSG", False)
+        mock_sendall = MagicMock(spec=socket.socket)
+        frame.send_frame(mock_sendall, f)
+        collected_sendall = mock_sendall.sendall.call_args[0][0]
+
+        assert bytes(collected_sendmsg) == collected_sendall
+        assert collected_sendall == expected_header + payload
 
 
 class TestRecvFrame:
@@ -528,3 +653,73 @@ class TestRecvFrame:
         assert f.type == common_pb2.FRAME_TYPE_RESPONSE
         assert f.length == payload_size
         assert f.payload == payload
+
+
+# ---------------------------------------------------------------------------
+# pack_header range validation (Step 3)
+# ---------------------------------------------------------------------------
+
+
+class TestPackHeaderRanges:
+    """pack_header raises ValueError for any field value outside its wire range."""
+
+    @pytest.mark.parametrize(
+        ("overrides", "field_name"),
+        [
+            ({"type": -1}, "type"),
+            ({"type": 0x100}, "type"),
+            ({"flags": -1}, "flags"),
+            ({"flags": 0x100}, "flags"),
+            ({"opcode": -1}, "opcode"),
+            ({"opcode": 0x10000}, "opcode"),
+            ({"length": -1}, "length"),
+            ({"length": 0x1_0000_0000}, "length"),
+            ({"stream_id": -1}, "stream_id"),
+            ({"stream_id": 0x1_0000_0000}, "stream_id"),
+        ],
+    )
+    def test_field_out_of_range_raises_value_error(
+        self, overrides: dict[str, int], field_name: str
+    ) -> None:
+        base = dict(type=1, flags=0, opcode=0, length=0, stream_id=0)
+        f = frame.Frame(**{**base, **overrides})  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match=field_name):
+            frame.pack_header(f)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            dict(type=0, flags=0, opcode=0, length=0, stream_id=0),
+            dict(type=0xFF, flags=0xFF, opcode=0xFFFF, length=0xFFFF_FFFF,
+                 stream_id=0xFFFF_FFFF),
+        ],
+        ids=["min-bounds", "max-bounds"],
+    )
+    def test_exact_bounds_pack_without_error(self, kwargs: dict[str, int]) -> None:
+        """Exact boundary values (0 and max for each field) must pack cleanly."""
+        frame.pack_header(frame.Frame(**kwargs))  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Frame cleanups (Step 3)
+# ---------------------------------------------------------------------------
+
+
+class TestFrameCleanups:
+    """Frame uses __slots__ and Verdict uses enum.auto()."""
+
+    def test_frame_has_slots(self) -> None:
+        """Frame with slots=True rejects arbitrary attribute assignment."""
+        f = _frame(common_pb2.FRAME_TYPE_PING)
+        with pytest.raises(AttributeError):
+            f.unknown_attribute = "x"  # type: ignore[attr-defined]
+
+    def test_verdict_members_are_distinct(self) -> None:
+        """All three Verdict members are unequal to each other."""
+        members = list(frame.Verdict)
+        assert len(members) == 3
+        assert len(set(members)) == len(members)
+
+    def test_verdict_ok_is_not_a_string(self) -> None:
+        """Verdict.OK is not a string (migrated from string-valued enum)."""
+        assert not isinstance(frame.Verdict.OK.value, str)

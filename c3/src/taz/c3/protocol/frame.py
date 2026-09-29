@@ -7,7 +7,7 @@ import socket
 import struct
 import types
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from taz.c3.errors import TazConnectionLost, TazProtocolError
 from taz.v1 import common_pb2
@@ -30,14 +30,16 @@ DEFAULT_MAX_PAYLOAD: Mapping[int, int] = types.MappingProxyType(
     }
 )
 
+_HAS_SENDMSG = hasattr(socket.socket, "sendmsg")
+
 
 class Verdict(enum.Enum):
-    OK = "ok"
-    UNKNOWN_TYPE = "unknown_type"
-    OVERSIZED = "oversized"
+    OK = enum.auto()
+    UNKNOWN_TYPE = enum.auto()
+    OVERSIZED = enum.auto()
 
 
-@dataclass
+@dataclass(slots=True)
 class Frame:
     type: int
     flags: int
@@ -49,6 +51,16 @@ class Frame:
 
 
 def pack_header(frame: Frame) -> bytes:
+    if not (0 <= frame.type <= 0xFF):
+        raise ValueError(f"type out of range: {frame.type!r}")
+    if not (0 <= frame.flags <= 0xFF):
+        raise ValueError(f"flags out of range: {frame.flags!r}")
+    if not (0 <= frame.opcode <= 0xFFFF):
+        raise ValueError(f"opcode out of range: {frame.opcode!r}")
+    if not (0 <= frame.length <= 0xFFFFFFFF):
+        raise ValueError(f"length out of range: {frame.length!r}")
+    if not (0 <= frame.stream_id <= 0xFFFFFFFF):
+        raise ValueError(f"stream_id out of range: {frame.stream_id!r}")
     return _STRUCT.pack(
         frame.type, frame.flags, frame.opcode, frame.length, frame.stream_id
     )
@@ -129,10 +141,27 @@ def recv_frame(
     return frame
 
 
+def _sendmsg_all(sock: socket.socket, views: list[memoryview]) -> None:
+    """Send all bytes from multiple buffers via sendmsg, retrying partial sends."""
+    while views:
+        sent = sock.sendmsg(views)
+        remaining = sent
+        while views and remaining > 0:
+            if remaining >= len(views[0]):
+                remaining -= len(views[0])
+                views.pop(0)
+            else:
+                views[0] = views[0][remaining:]
+                remaining = 0
+
+
 def send_frame(sock: socket.socket, frame: Frame) -> None:
-    frame.length = len(frame.payload)
-    data = pack_header(frame) + frame.payload
+    out = replace(frame, length=len(frame.payload))
+    header = pack_header(out)
     try:
-        sock.sendall(data)
+        if _HAS_SENDMSG:
+            _sendmsg_all(sock, [memoryview(header), memoryview(frame.payload)])
+        else:
+            sock.sendall(header + frame.payload)
     except OSError as exc:  # timeout (possibly mid-frame), reset, broken pipe
         raise _connection_lost(exc) from exc
