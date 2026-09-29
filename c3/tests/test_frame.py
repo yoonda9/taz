@@ -801,6 +801,8 @@ class TestRecvExact:
     @pytest.mark.skipif(sys.platform != "linux", reason="RSS check is Linux-only")
     def test_no_prealloc_for_large_claimed_payload(self) -> None:
         """Claimed payload far exceeds what arrives: RSS growth stays small."""
+        if sys.platform != "linux":
+            return  # unreachable at runtime; gives mypy the platform narrowing
         import resource
 
         size = 64 * 1024 * 1024  # 64 MiB

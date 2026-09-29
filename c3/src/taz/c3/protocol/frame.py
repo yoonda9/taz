@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import socket
 import struct
+import sys
 import types
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -186,6 +187,8 @@ def recv_frame(
 
 def _sendmsg_all(sock: socket.socket, views: list[memoryview]) -> None:
     """Send all bytes from multiple buffers via sendmsg, retrying partial sends."""
+    if sys.platform == "win32":
+        raise NotImplementedError("sendmsg is not available on Windows")
     while views:
         sent = sock.sendmsg(views)
         remaining = sent
