@@ -245,6 +245,12 @@ add_library(
     src/handlers/version.c
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
+# Stop <windows.h> from including the old <winsock.h>, which clashes with the
+# <winsock2.h> that uv.h includes. clang-format sorts <windows.h> ahead of our
+# own headers, so include order alone cannot prevent it.
+if(WIN32)
+    target_compile_definitions(taz_core PUBLIC WIN32_LEAN_AND_MEAN)
+endif()
 # taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
 # to the C++ GoogleTest target that links taz_core.
 target_link_libraries(
