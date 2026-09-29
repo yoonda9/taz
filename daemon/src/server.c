@@ -1,20 +1,59 @@
 #include "taz/server.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #define TAZ_SERVER_LISTEN_BACKLOG 128
+
+/* Design §4.3: raised from libuv's 4 so long file and process work does not
+ * starve the pool. An explicit UV_THREADPOOL_SIZE in the environment wins. */
+#define TAZ_THREADPOOL_ENV     "UV_THREADPOOL_SIZE"
+#define TAZ_THREADPOOL_DEFAULT "8"
+#define TAZ_ENV_VALUE_MAX      32U
+
+void taz_server_default_threadpool(void)
+{
+    char value[TAZ_ENV_VALUE_MAX];
+    size_t size = sizeof(value);
+
+    /* UV_ENOENT means unset; UV_ENOBUFS means set, to something long. */
+    if (uv_os_getenv(TAZ_THREADPOOL_ENV, value, &size) == UV_ENOENT)
+    {
+        (void)uv_os_setenv(TAZ_THREADPOOL_ENV, TAZ_THREADPOOL_DEFAULT);
+    }
+}
+
+/* An IPv4 or IPv6 literal. No name lookup: resolvers are NSS-backed on glibc
+ * and break the static build (design §9.1). */
+static int parse_host(const char *host, int port, struct sockaddr_storage *addr)
+{
+    (void)memset(addr, 0, sizeof(*addr));
+    if (uv_ip4_addr(host, port, (struct sockaddr_in *)addr) == 0)
+    {
+        return 0;
+    }
+    return uv_ip6_addr(host, port, (struct sockaddr_in6 *)addr);
+}
+
+static int bound_port(const struct sockaddr_storage *addr)
+{
+    if (addr->ss_family == AF_INET6)
+    {
+        return (int)ntohs(((const struct sockaddr_in6 *)addr)->sin6_port);
+    }
+    return (int)ntohs(((const struct sockaddr_in *)addr)->sin_port);
+}
 
 int taz_server_start(taz_server_t *server, const char *host, int port,
                      uv_connection_cb on_connect)
 {
     int rc;
-    struct sockaddr_in bind_addr;
-    struct sockaddr_in actual_addr;
+    struct sockaddr_storage bind_addr;
+    struct sockaddr_storage actual_addr;
     int addrlen;
-    int actual_port;
 
-    /* Set the thread-pool size before libuv creates its first worker. */
-    (void)uv_os_setenv("UV_THREADPOOL_SIZE", "4");
+    /* Before libuv creates its first worker. */
+    taz_server_default_threadpool();
 
     rc = uv_loop_init(&server->loop);
     if (rc != 0)
@@ -30,7 +69,7 @@ int taz_server_start(taz_server_t *server, const char *host, int port,
     }
     server->handle.data = server;
 
-    rc = uv_ip4_addr(host, port, &bind_addr);
+    rc = parse_host(host, port, &bind_addr);
     if (rc != 0)
     {
         goto cleanup;
@@ -57,8 +96,7 @@ int taz_server_start(taz_server_t *server, const char *host, int port,
         goto cleanup;
     }
 
-    actual_port = (int)(unsigned int)ntohs(actual_addr.sin_port);
-    (void)printf("LISTENING port=%d\n", actual_port);
+    (void)printf("LISTENING port=%d\n", bound_port(&actual_addr));
     (void)fflush(stdout);
     return 0;
 
