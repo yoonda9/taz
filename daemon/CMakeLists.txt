@@ -255,7 +255,15 @@ target_link_libraries(
 # ---------------------------------------------------------------------------
 # Daemon executable
 # ---------------------------------------------------------------------------
-add_executable(tazd src/main.c)
+# Platform-specific signal handling and I/O flushing live in separate files so
+# Win32 and POSIX code are never compiled together.
+if(WIN32)
+    set(TAZ_PLATFORM_SRC src/platform_win32.c)
+else()
+    set(TAZ_PLATFORM_SRC src/platform_posix.c)
+endif()
+
+add_executable(tazd src/main.c ${TAZ_PLATFORM_SRC})
 # include/, _GNU_SOURCE, taz::proto, and libuv::uv_a come in transitively.
 target_link_libraries(tazd PRIVATE taz_warnings taz_core)
 
