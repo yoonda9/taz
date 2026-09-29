@@ -100,13 +100,8 @@ if(MSVC)
     endif()
 else()
     target_compile_options(
-        taz_cxx_warnings
-        INTERFACE -Wall
-                  -Wextra
-                  -Wpedantic
-                  -Wshadow
-                  -Wconversion
-                  -Wsign-conversion)
+        taz_cxx_warnings INTERFACE -Wall -Wextra -Wpedantic -Wshadow
+                                   -Wconversion -Wsign-conversion)
     if(TAZ_WARNINGS_AS_ERRORS)
         target_compile_options(taz_cxx_warnings INTERFACE -Werror)
     endif()
@@ -193,8 +188,10 @@ find_package(libuv REQUIRED CONFIG)
 # declarations (pthread_rwlock_t, pthread_barrier_t) that libuv headers need.
 # Propagate via libuv's INTERFACE so every target linking libuv::uv_a gets it.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set_property(TARGET libuv::uv_a APPEND PROPERTY
-                 INTERFACE_COMPILE_DEFINITIONS _GNU_SOURCE)
+    set_property(
+        TARGET libuv::uv_a
+        APPEND
+        PROPERTY INTERFACE_COMPILE_DEFINITIONS _GNU_SOURCE)
 endif()
 
 # nanopb runtime, vendored as a git submodule pinned to the same release as the
