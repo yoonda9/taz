@@ -60,13 +60,11 @@ taz_v1_ErrorCode taz_error_from_win32(unsigned long err)
     switch (err)
     {
         case ERROR_FILE_NOT_FOUND:
-            return taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
         case ERROR_PATH_NOT_FOUND:
             return taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
         case ERROR_ACCESS_DENIED:
             return taz_v1_ErrorCode_ERROR_CODE_PERMISSION_DENIED;
         case ERROR_ALREADY_EXISTS:
-            return taz_v1_ErrorCode_ERROR_CODE_ALREADY_EXISTS;
         case ERROR_FILE_EXISTS:
             return taz_v1_ErrorCode_ERROR_CODE_ALREADY_EXISTS;
         default:
