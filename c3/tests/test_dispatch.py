@@ -487,3 +487,111 @@ class TestKeepalive:
         d.recv_response(1, Keepalive(idle=5.0, timeout=11.0))
         assert wait_calls[0] == 5.0  # idle
         assert wait_calls[1] == 11.0  # probe timeout
+
+
+# ---------------------------------------------------------------------------
+# TestContinuationMerge: RESPONSE frames with FRAME_FLAG_CONTINUATION
+# ---------------------------------------------------------------------------
+
+
+def _continuation_response(
+    payload: bytes,
+    *,
+    stream_id: int = 1,
+    opcode: int = common_pb2.OPCODE_CONFIGURATION_GET,
+    final: bool = False,
+) -> bytes:
+    flags = 0 if final else common_pb2.FRAME_FLAG_CONTINUATION
+    return _frame_bytes(
+        common_pb2.FRAME_TYPE_RESPONSE,
+        payload,
+        opcode=opcode,
+        stream_id=stream_id,
+        flags=flags,
+    )
+
+
+class TestContinuationMerge:
+    def test_three_continuation_frames_reassemble(self) -> None:
+        """Three RESPONSE+CONTINUATION frames merge into one payload."""
+        from taz.v1 import daemon_control_pb2
+
+        # Build a ConfigurationGetResponse with three KeyValue entries and
+        # encode it in three separate RESPONSE frames (one entry per frame).
+        kv_parts: list[bytes] = []
+        for i in range(3):
+            part = daemon_control_pb2.ConfigurationGetResponse()
+            kv = part.config.add()
+            kv.key = f"key{i}"
+            kv.value = f"val{i}"
+            kv_parts.append(part.SerializeToString())
+
+        frames = (
+            _continuation_response(kv_parts[0])
+            + _continuation_response(kv_parts[1])
+            + _continuation_response(kv_parts[2], final=True)
+        )
+        _, _, d = _dispatcher(frames)
+
+        frame = d.recv_response(
+            1,
+            Keepalive.OFF,
+            expected_opcode=common_pb2.OPCODE_CONFIGURATION_GET,
+        )
+
+        # Merged payload must parse back to all three entries.
+        merged = daemon_control_pb2.ConfigurationGetResponse()
+        merged.ParseFromString(frame.payload)
+        assert len(merged.config) == 3
+        keys = {kv.key for kv in merged.config}
+        assert keys == {"key0", "key1", "key2"}
+
+    def test_single_frame_no_continuation_unchanged(self) -> None:
+        """A plain RESPONSE (no CONTINUATION) is returned as-is."""
+        from taz.v1 import daemon_control_pb2
+
+        resp_msg = daemon_control_pb2.ConfigurationGetResponse()
+        kv = resp_msg.config.add()
+        kv.key = "log.level"
+        kv.value = "INFO"
+        payload = resp_msg.SerializeToString()
+
+        frame_bytes = _continuation_response(payload, final=True)
+        _, _, d = _dispatcher(frame_bytes)
+
+        frame = d.recv_response(1, Keepalive.OFF)
+        assert frame.payload == payload
+
+    def test_continuation_interleaved_with_other_stream(self) -> None:
+        """Frames for other streams buffered while accumulating CONTINUATION."""
+        from taz.v1 import daemon_control_pb2
+
+        part1 = daemon_control_pb2.ConfigurationGetResponse()
+        kv1 = part1.config.add()
+        kv1.key = "log.level"
+        kv1.value = "INFO"
+
+        part2 = daemon_control_pb2.ConfigurationGetResponse()
+        kv2 = part2.config.add()
+        kv2.key = "compression"
+        kv2.value = "NONE"
+
+        # Interleave: cont frame 1, stream-2 frame, cont frame 2 (final)
+        cont1 = _continuation_response(part1.SerializeToString(), stream_id=1)
+        other = _response(opcode=common_pb2.OPCODE_VERSION, stream_id=2)
+        final = _continuation_response(
+            part2.SerializeToString(), stream_id=1, final=True
+        )
+
+        _, _, d = _dispatcher(cont1, other, final)
+        frame = d.recv_response(
+            1, Keepalive.OFF, expected_opcode=common_pb2.OPCODE_CONFIGURATION_GET
+        )
+
+        merged = daemon_control_pb2.ConfigurationGetResponse()
+        merged.ParseFromString(frame.payload)
+        assert len(merged.config) == 2
+
+        # Stream 2 must still be buffered.
+        frame2 = d.recv_response(2, Keepalive.OFF)
+        assert frame2.stream_id == 2

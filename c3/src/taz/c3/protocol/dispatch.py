@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
 import socket
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -172,10 +173,28 @@ class Dispatcher:
 
         Frames for other streams are buffered.  ``expected_opcode`` (if given)
         is validated against the echoed opcode on RESPONSE/ERROR frames.
+        RESPONSE frames with FRAME_FLAG_CONTINUATION are accumulated; the
+        payloads are concatenated before the merged frame is returned.
         """
-        buffered = self._pop_buffered(expected)
-        if buffered is not None:
-            return buffered
+        _flag_cont = common_pb2.FRAME_FLAG_CONTINUATION
+        _type_resp = common_pb2.FRAME_TYPE_RESPONSE
+        continuation_payloads: list[bytes] = []
+
+        # Drain any buffered CONTINUATION frames for this stream first, then
+        # return a non-continuation buffered frame if present.
+        while True:
+            buffered = self._pop_buffered(expected)
+            if buffered is None:
+                break
+            if buffered.type == _type_resp and buffered.flags & _flag_cont:
+                continuation_payloads.append(buffered.payload)
+            else:
+                if continuation_payloads:
+                    continuation_payloads.append(buffered.payload)
+                    return dataclasses.replace(
+                        buffered, payload=b"".join(continuation_payloads)
+                    )
+                return buffered
 
         sock = self._conn._sock
         if sock is None:
@@ -234,6 +253,15 @@ class Dispatcher:
                     raise TazProtocolError(
                         f"echoed opcode 0x{frame.opcode:04x} !="
                         f" expected 0x{expected_opcode:04x}"
+                    )
+                # Accumulate CONTINUATION RESPONSE frames; return on the last.
+                if frame.type == _type_resp and frame.flags & _flag_cont:
+                    continuation_payloads.append(frame.payload)
+                    continue
+                if continuation_payloads:
+                    continuation_payloads.append(frame.payload)
+                    return dataclasses.replace(
+                        frame, payload=b"".join(continuation_payloads)
                     )
                 return frame
 

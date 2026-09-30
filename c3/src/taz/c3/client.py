@@ -129,3 +129,49 @@ class TazClient:
     def capabilities(self) -> daemon_control_pb2.CapabilityPayload:
         """Return the CAPABILITY payload received during the handshake."""
         return self._conn.capabilities
+
+    def config_get(
+        self,
+        keys: list[str] | None = None,
+        keepalive: Keepalive | None = None,
+    ) -> dict[str, str]:
+        """Return the daemon's current configuration.
+
+        If ``keys`` is given, only those keys are returned.  Unknown keys are
+        silently omitted.  With no ``keys`` argument all keys are returned.
+        """
+        req = daemon_control_pb2.ConfigurationGetRequest()
+        if keys:
+            req.keys.extend(keys)
+        frame = self._call(
+            common_pb2.OPCODE_CONFIGURATION_GET,
+            req.SerializeToString(),
+            keepalive,
+        )
+        resp = daemon_control_pb2.ConfigurationGetResponse()
+        resp.ParseFromString(frame.payload)
+        return {kv.key: kv.value for kv in resp.config}
+
+    def config_update(
+        self,
+        config: dict[str, str],
+        keepalive: Keepalive | None = None,
+    ) -> daemon_control_pb2.ConfigurationUpdateResponse:
+        """Apply ``config`` key/value pairs to the daemon configuration.
+
+        Returns the full ``ConfigurationUpdateResponse`` so callers can inspect
+        ``applied`` and ``rejected`` lists.
+        """
+        req = daemon_control_pb2.ConfigurationUpdateRequest()
+        for key, value in config.items():
+            kv = req.config.add()
+            kv.key = key
+            kv.value = value
+        frame = self._call(
+            common_pb2.OPCODE_CONFIGURATION_UPDATE,
+            req.SerializeToString(),
+            keepalive,
+        )
+        resp = daemon_control_pb2.ConfigurationUpdateResponse()
+        resp.ParseFromString(frame.payload)
+        return resp

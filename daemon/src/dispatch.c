@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "handlers/config.h"
 #include "handlers/version.h"
 #include "taz/error.h"
 #include "taz/v1/common.pb.h"
@@ -133,6 +134,10 @@ typedef struct
 
 static const opcode_entry_t OPCODE_TABLE[] = {
     {(uint16_t)taz_v1_Opcode_OPCODE_VERSION, handle_version},
+    {(uint16_t)taz_v1_Opcode_OPCODE_CONFIGURATION_GET,
+     handle_configuration_get},
+    {(uint16_t)taz_v1_Opcode_OPCODE_CONFIGURATION_UPDATE,
+     handle_configuration_update},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))

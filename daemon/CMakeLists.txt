@@ -245,6 +245,7 @@ add_library(
     src/dispatch.c
     src/connection.c
     src/handlers/version.c
+    src/handlers/config.c
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
 # Stop <windows.h> from including the old <winsock.h>, which clashes with the

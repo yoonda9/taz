@@ -1,6 +1,7 @@
 // Tests for CAPABILITY, VersionResponse, and ERROR payload encoders.
 
 #include <cstring>
+#include <set>
 
 #include <gtest/gtest.h>
 #include <pb_decode.h>
@@ -32,11 +33,18 @@ TEST(Payload, CapabilityRoundTrip)
 
     EXPECT_EQ(cap.protocol_major, 1U);
     EXPECT_EQ(cap.protocol_minor, 0U);
-    ASSERT_EQ(cap.operations_count, 2U);
-    EXPECT_EQ(cap.operations[0],
-              static_cast<uint32_t>(taz_v1_Opcode_OPCODE_PING));
-    EXPECT_EQ(cap.operations[1],
-              static_cast<uint32_t>(taz_v1_Opcode_OPCODE_VERSION));
+    ASSERT_EQ(cap.operations_count, 4U);
+
+    // Collect operations into a set for order-independent verification.
+    const std::set<uint32_t> ops(cap.operations,
+                                 cap.operations + cap.operations_count);
+    EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_PING)));
+    EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_VERSION)));
+    EXPECT_TRUE(ops.count(
+        static_cast<uint32_t>(taz_v1_Opcode_OPCODE_CONFIGURATION_GET)));
+    EXPECT_TRUE(ops.count(
+        static_cast<uint32_t>(taz_v1_Opcode_OPCODE_CONFIGURATION_UPDATE)));
+
     ASSERT_GE(cap.compression_count, 1U);
     EXPECT_STREQ(cap.compression[0], "NONE");
 }

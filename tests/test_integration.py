@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
-from taz.c3 import TazClient, TazConnectionLost
+from taz.c3 import TazClient, TazConnectionLost, TazError
 from taz.v1 import common_pb2
 
 from tests.conftest import Daemon
@@ -70,3 +70,62 @@ class TestConnectionLost:
             with pytest.raises(TazConnectionLost) as exc_info:
                 client.version()
             assert isinstance(exc_info.value.__cause__, TazConnectionLost)
+
+
+class TestConfigGet:
+    def test_config_get_all_returns_defaults(self, taz_client: TazClient) -> None:
+        cfg = taz_client.config_get()
+        assert cfg == {
+            "log.level": "INFO",
+            "compression": "NONE",
+            "exec.max_output_bytes": "1048576",
+        }
+
+    def test_config_get_subset_returns_only_requested_key(
+        self, taz_client: TazClient
+    ) -> None:
+        cfg = taz_client.config_get(keys=["log.level"])
+        assert list(cfg.keys()) == ["log.level"]
+        assert cfg["log.level"] == "INFO"
+
+    def test_config_get_unknown_key_omitted(self, taz_client: TazClient) -> None:
+        cfg = taz_client.config_get(keys=["no.such.key"])
+        assert cfg == {}
+
+
+class TestConfigUpdate:
+    def test_config_update_then_get_reflects_change(
+        self, taz_client: TazClient
+    ) -> None:
+        result = taz_client.config_update({"log.level": "DEBUG"})
+        assert "log.level" in result.applied
+        assert len(result.rejected) == 0
+        cfg = taz_client.config_get(keys=["log.level"])
+        assert cfg["log.level"] == "DEBUG"
+
+    def test_config_update_invalid_key_in_rejected(self, taz_client: TazClient) -> None:
+        result = taz_client.config_update({"invalid.key": "x"})
+        assert len(result.applied) == 0
+        rejected_keys = [rk.key for rk in result.rejected]
+        assert "invalid.key" in rejected_keys
+
+    def test_config_update_bad_log_level_rejected(self, taz_client: TazClient) -> None:
+        result = taz_client.config_update({"log.level": "TRACE"})
+        assert len(result.applied) == 0
+        assert any(rk.key == "log.level" for rk in result.rejected)
+
+    def test_config_capabilities_advertised(self, taz_client: TazClient) -> None:
+        cap = taz_client.capabilities()
+        ops = set(cap.operations)
+        assert common_pb2.OPCODE_CONFIGURATION_GET in ops
+        assert common_pb2.OPCODE_CONFIGURATION_UPDATE in ops
+
+
+class TestUnsupportedOpcode:
+    def test_pipeline_opcode_raises_taz_error_not_supported(
+        self, taz_client: TazClient
+    ) -> None:
+        """Sending an opcode not advertised by the daemon raises TazError."""
+        with pytest.raises(TazError) as exc_info:
+            taz_client._conn.send_request(common_pb2.OPCODE_PIPELINE, b"")
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
