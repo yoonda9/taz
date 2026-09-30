@@ -240,6 +240,7 @@ add_library(
     src/payload.c
     src/error.c
     src/config.c
+    src/response.c
     src/server.c
     src/dispatch.c
     src/connection.c
