@@ -202,6 +202,23 @@ TEST_F(ConfigTest, RejectNegativeExecMaxOutputBytes)
     ASSERT_EQ(resp.rejected_count, 1);
 }
 
+TEST_F(ConfigTest, RejectExecMaxOutputBytesAboveUint32)
+{
+    taz_v1_ConfigurationUpdateRequest req =
+        taz_v1_ConfigurationUpdateRequest_init_zero;
+    req.config_count = 1;
+    std::strncpy(req.config[0].key, "exec.max_output_bytes",
+                 sizeof(req.config[0].key) - 1);
+    std::strncpy(req.config[0].value, "4294967296",
+                 sizeof(req.config[0].value) - 1);
+
+    taz_v1_ConfigurationUpdateResponse resp;
+    taz_config_update(&req, &resp);
+
+    EXPECT_EQ(resp.applied_count, 0);
+    ASSERT_EQ(resp.rejected_count, 1);
+}
+
 // ---- mixed valid + invalid batch ----------------------------------------
 
 TEST_F(ConfigTest, MixedBatchAppliesValidAndRejectsInvalid)
@@ -305,6 +322,23 @@ TEST_F(ConfigTest, ValidExecMaxOutputBytes)
     std::strncpy(req.config[0].key, "exec.max_output_bytes",
                  sizeof(req.config[0].key) - 1);
     std::strncpy(req.config[0].value, "65536", sizeof(req.config[0].value) - 1);
+
+    taz_v1_ConfigurationUpdateResponse resp;
+    taz_config_update(&req, &resp);
+
+    EXPECT_EQ(resp.applied_count, 1);
+    EXPECT_EQ(resp.rejected_count, 0);
+}
+
+TEST_F(ConfigTest, ValidExecMaxOutputBytesAtUint32Max)
+{
+    taz_v1_ConfigurationUpdateRequest req =
+        taz_v1_ConfigurationUpdateRequest_init_zero;
+    req.config_count = 1;
+    std::strncpy(req.config[0].key, "exec.max_output_bytes",
+                 sizeof(req.config[0].key) - 1);
+    std::strncpy(req.config[0].value, "4294967295",
+                 sizeof(req.config[0].value) - 1);
 
     taz_v1_ConfigurationUpdateResponse resp;
     taz_config_update(&req, &resp);

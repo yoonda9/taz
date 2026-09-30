@@ -129,14 +129,17 @@ static int validate_uint(const char *value)
     }
     char *end = NULL;
     errno = 0;
-    unsigned long ul = strtoul(value, &end, DECIMAL_BASE);
+    /* unsigned long is 32 bits on Windows; unsigned long long is at least 64
+     * everywhere, so the uint32 bound below is a real check on every
+     * platform. */
+    unsigned long long ull = strtoull(value, &end, DECIMAL_BASE);
     /* Must consume entire string and not overflow */
-    if (end == NULL || *end != '\0' || errno == ERANGE || ul == 0UL)
+    if (end == NULL || *end != '\0' || errno == ERANGE || ull == 0ULL)
     {
         return 0;
     }
     /* Must fit in a uint32 */
-    if (ul > (unsigned long)UINT32_MAX)
+    if (ull > (unsigned long long)UINT32_MAX)
     {
         return 0;
     }
