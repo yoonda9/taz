@@ -1,11 +1,15 @@
 // Tests for dispatch module: opcode routing, error responses.
 
 #include <cstring>
+#include <map>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 #include <pb_decode.h>
+#include <pb_encode.h>
 
+#include "taz/config.h"
 #include "taz/dispatch.h"
 #include "taz/frame.h"
 #include "taz/v1/common.pb.h"
@@ -225,6 +229,203 @@ TEST(Dispatch, OversizedVerdictIsNoOp)
 
     EXPECT_TRUE(wctx.frames.empty());
     EXPECT_EQ(d.active_count, 0U);
+}
+
+// ---------------------------------------------------------------------------
+// CONFIGURATION_GET / CONFIGURATION_UPDATE through the dispatch table
+// ---------------------------------------------------------------------------
+
+// Field 1 (length-delimited) claims five bytes but only two follow, so no
+// request message decodes from it.
+std::vector<uint8_t> TruncatedRequest()
+{
+    return {0x0AU, 0x05U, 'a', 'b'};
+}
+
+class DispatchConfig : public ::testing::Test
+{
+  protected:
+    void SetUp() override
+    {
+        taz_dispatch_init(&d_);
+        taz_config_reset();
+    }
+
+    void TearDown() override
+    {
+        taz_config_reset();
+    }
+
+    // Dispatch one REQUEST and return the single frame written in reply.
+    std::vector<uint8_t> Request(taz_v1_Opcode opcode,
+                                 const std::vector<uint8_t> &payload)
+    {
+        WriteCtx wctx;
+        const taz_frame_header_t h = MakeHeader(
+            static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+            static_cast<uint16_t>(opcode), 3U,
+            static_cast<uint32_t>(payload.size()));
+        taz_dispatch_frame(&d_, &h, payload.empty() ? nullptr : payload.data(),
+                           TAZ_FRAME_OK, capture_write, &wctx);
+        EXPECT_EQ(wctx.frames.size(), 1U);
+        // Sync handlers close the stream before returning.
+        EXPECT_EQ(d_.active_count, 0U);
+        if (wctx.frames.empty())
+        {
+            return {};
+        }
+        const auto resp = UnpackHeader(wctx.frames[0]);
+        EXPECT_EQ(resp.stream_id, 3U);
+        EXPECT_EQ(resp.opcode, static_cast<uint16_t>(opcode));
+        return wctx.frames[0];
+    }
+
+    std::map<std::string, std::string> Get(const std::vector<uint8_t> &payload)
+    {
+        const auto frame =
+            Request(taz_v1_Opcode_OPCODE_CONFIGURATION_GET, payload);
+        std::map<std::string, std::string> out;
+        taz_v1_ConfigurationGetResponse resp =
+            taz_v1_ConfigurationGetResponse_init_zero;
+        EXPECT_TRUE(IsResponse(frame));
+        EXPECT_TRUE(DecodePayload(frame, taz_v1_ConfigurationGetResponse_fields,
+                                  &resp));
+        for (pb_size_t i = 0; i < resp.config_count; i++)
+        {
+            out[resp.config[i].key] = resp.config[i].value;
+        }
+        return out;
+    }
+
+    static bool IsResponse(const std::vector<uint8_t> &frame)
+    {
+        return frame.size() >= static_cast<size_t>(TAZ_FRAME_HEADER_SIZE) &&
+               UnpackHeader(frame).type ==
+                   static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE);
+    }
+
+    static bool DecodePayload(const std::vector<uint8_t> &frame,
+                              const pb_msgdesc_t *fields, void *out)
+    {
+        if (frame.size() < static_cast<size_t>(TAZ_FRAME_HEADER_SIZE))
+        {
+            return false;
+        }
+        pb_istream_t stream = pb_istream_from_buffer(
+            frame.data() + TAZ_FRAME_HEADER_SIZE,
+            frame.size() - static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+        return pb_decode(&stream, fields, out);
+    }
+
+    static std::vector<uint8_t> Encode(const pb_msgdesc_t *fields,
+                                       const void *msg)
+    {
+        std::vector<uint8_t> buf(4096U);
+        pb_ostream_t stream = pb_ostream_from_buffer(buf.data(), buf.size());
+        EXPECT_TRUE(pb_encode(&stream, fields, msg));
+        buf.resize(stream.bytes_written);
+        return buf;
+    }
+
+    static std::vector<uint8_t> GetRequest(const char *key)
+    {
+        taz_v1_ConfigurationGetRequest req =
+            taz_v1_ConfigurationGetRequest_init_zero;
+        req.keys_count = 1;
+        std::strncpy(req.keys[0], key, sizeof(req.keys[0]) - 1U);
+        return Encode(taz_v1_ConfigurationGetRequest_fields, &req);
+    }
+
+    static std::vector<uint8_t> UpdateRequest(const char *key,
+                                              const char *value)
+    {
+        taz_v1_ConfigurationUpdateRequest req =
+            taz_v1_ConfigurationUpdateRequest_init_zero;
+        req.config_count = 1;
+        std::strncpy(req.config[0].key, key, sizeof(req.config[0].key) - 1U);
+        std::strncpy(req.config[0].value, value,
+                     sizeof(req.config[0].value) - 1U);
+        return Encode(taz_v1_ConfigurationUpdateRequest_fields, &req);
+    }
+
+    // Send UPDATE for one key; fill *resp from the RESPONSE frame.
+    void Update(const char *key, const char *value,
+                taz_v1_ConfigurationUpdateResponse *resp)
+    {
+        const auto frame = Request(taz_v1_Opcode_OPCODE_CONFIGURATION_UPDATE,
+                                   UpdateRequest(key, value));
+        ASSERT_TRUE(IsResponse(frame));
+        ASSERT_TRUE(DecodePayload(
+            frame, taz_v1_ConfigurationUpdateResponse_fields, resp));
+    }
+
+    static void ExpectInvalidRequest(const std::vector<uint8_t> &frame)
+    {
+        ASSERT_GE(frame.size(), static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+        EXPECT_EQ(UnpackHeader(frame).type,
+                  static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+        taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+        ASSERT_TRUE(DecodeErrorInfo(frame, &err));
+        EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    }
+
+  private:
+    taz_dispatch_t d_{};
+};
+
+TEST_F(DispatchConfig, GetWithEmptyPayloadReturnsAllDefaults)
+{
+    const std::map<std::string, std::string> expected = {
+        {"log.level", "INFO"},
+        {"compression", "NONE"},
+        {"exec.max_output_bytes", "1048576"},
+    };
+    EXPECT_EQ(Get({}), expected);
+}
+
+TEST_F(DispatchConfig, GetSubsetReturnsOnlyRequestedKey)
+{
+    const std::map<std::string, std::string> expected = {{"log.level", "INFO"}};
+    EXPECT_EQ(Get(GetRequest("log.level")), expected);
+}
+
+TEST_F(DispatchConfig, UpdateAppliesValidKeyAndGetReflectsIt)
+{
+    taz_v1_ConfigurationUpdateResponse resp =
+        taz_v1_ConfigurationUpdateResponse_init_zero;
+    Update("log.level", "DEBUG", &resp);
+    ASSERT_EQ(resp.applied_count, 1);
+    EXPECT_STREQ(resp.applied[0], "log.level");
+    EXPECT_EQ(resp.rejected_count, 0);
+
+    const std::map<std::string, std::string> expected = {
+        {"log.level", "DEBUG"}};
+    EXPECT_EQ(Get(GetRequest("log.level")), expected);
+}
+
+TEST_F(DispatchConfig, UpdateRejectsUnknownKey)
+{
+    taz_v1_ConfigurationUpdateResponse resp =
+        taz_v1_ConfigurationUpdateResponse_init_zero;
+    Update("invalid.key", "x", &resp);
+    EXPECT_EQ(resp.applied_count, 0);
+    ASSERT_EQ(resp.rejected_count, 1);
+    EXPECT_STREQ(resp.rejected[0].key, "invalid.key");
+    EXPECT_GT(std::strlen(resp.rejected[0].reason), 0U);
+}
+
+TEST_F(DispatchConfig, MalformedGetProducesInvalidRequest)
+{
+    ExpectInvalidRequest(
+        Request(taz_v1_Opcode_OPCODE_CONFIGURATION_GET, TruncatedRequest()));
+}
+
+TEST_F(DispatchConfig, MalformedUpdateProducesInvalidRequest)
+{
+    ExpectInvalidRequest(
+        Request(taz_v1_Opcode_OPCODE_CONFIGURATION_UPDATE, TruncatedRequest()));
+    // Nothing was applied.
+    EXPECT_EQ(Get(GetRequest("log.level")).at("log.level"), "INFO");
 }
 
 } // namespace
