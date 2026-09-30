@@ -8,6 +8,11 @@
 #include <pb_decode.h>
 #include <pb_encode.h>
 
+// MSVC's <stdio.h> defines stdout and stderr as macros, which rewrite the
+// CommandExecResponse fields of the same names. Nothing here uses the streams.
+#undef stdout
+#undef stderr
+
 #include "taz/frame.h"
 #include "taz/response.h"
 #include "taz/v1/command.pb.h"
