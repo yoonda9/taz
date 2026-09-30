@@ -96,6 +96,70 @@ bool encode_bytes_cb(pb_ostream_t *stream, const pb_field_iter_t *field,
 }
 
 // ---------------------------------------------------------------------------
+// Callback-based DirListResponse: no static-array cap on entry count
+// ---------------------------------------------------------------------------
+
+// Wrapper message with a callback field for `entries` (tag 1, wire type 2).
+struct DirListResponseCb
+{
+    pb_callback_t entries;
+};
+
+// clang-format off
+#define DirListResponseCb_FIELDLIST(X, a) \
+    X(a, CALLBACK, REPEATED, MESSAGE, entries, 1)
+// clang-format on
+
+#define DirListResponseCb_DEFAULT         NULL
+#define DirListResponseCb_CALLBACK        pb_default_field_callback
+#define DirListResponseCb_entries_MSGTYPE taz_v1_DirEntry
+
+PB_BIND(DirListResponseCb, DirListResponseCb, AUTO)
+
+// Encode callback: writes `count` DirEntry sub-messages.
+struct RepeatEntriesCtx
+{
+    int count;
+};
+
+bool encode_repeated_entries(pb_ostream_t *stream, const pb_field_iter_t *field,
+                             void *const *arg)
+{
+    const auto *ctx = static_cast<const RepeatEntriesCtx *>(*arg);
+    for (int i = 0; i < ctx->count; i++)
+    {
+        taz_v1_DirEntry entry = taz_v1_DirEntry_init_zero;
+        (void)memset(entry.name, 'a' + (i % 26), sizeof(entry.name) - 1U);
+        entry.kind = taz_v1_Kind_KIND_FILE;
+        entry.size =
+            static_cast<uint64_t>(static_cast<unsigned int>(i)) * 1000U;
+        if (!pb_encode_tag_for_field(stream, field))
+        {
+            return false;
+        }
+        if (!pb_encode_submessage(stream, taz_v1_DirEntry_fields, &entry))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Decode callback: appends each DirEntry to a vector.
+bool collect_decoded_entries(pb_istream_t *stream,
+                             const pb_field_iter_t * /*field*/, void **arg)
+{
+    auto *entries = static_cast<std::vector<taz_v1_DirEntry> *>(*arg);
+    taz_v1_DirEntry entry = taz_v1_DirEntry_init_zero;
+    if (!pb_decode(stream, taz_v1_DirEntry_fields, &entry))
+    {
+        return false;
+    }
+    entries->push_back(entry);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Test: single-frame fast path
 // ---------------------------------------------------------------------------
 
@@ -256,6 +320,79 @@ TEST(ResponseSplitter, RepeatedElementsKeptAtomic)
             << "entry " << i;
         EXPECT_EQ(decoded.entries[i].size, static_cast<uint64_t>(i) * 1000U)
             << "entry " << i;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test: repeated sub-message elements kept atomic on slow path (>64 KiB)
+// ---------------------------------------------------------------------------
+
+TEST(ResponseSplitter, RepeatedElementsKeptAtomicSlowPath)
+{
+    // 300 DirEntry sub-messages with 255-char names: each encodes to ~267 B,
+    // total ~80 KiB > 65 KiB, which forces the slow-path chunker.  Every
+    // element fits within one frame, so the chunker must place each one
+    // atomically — flushing the current frame first when needed — and must
+    // never split an element across a frame boundary.
+    static const int kCount = 300;
+
+    RepeatEntriesCtx ectx{kCount};
+    DirListResponseCb msg{};
+    msg.entries.funcs.encode = encode_repeated_entries;
+    msg.entries.arg = &ectx;
+
+    WriteCtx wctx;
+    taz_response_send(capture_write, &wctx, 8U,
+                      static_cast<uint16_t>(taz_v1_Opcode_OPCODE_DIR_LIST),
+                      &DirListResponseCb_msg, &msg);
+
+    // Slow path must have been taken: more than one frame.
+    ASSERT_GT(wctx.frames.size(), 1U);
+
+    // All but the last frame must carry CONTINUATION.
+    for (size_t i = 0U; i + 1U < wctx.frames.size(); i++)
+    {
+        const taz_frame_header_t h = unpack_header(wctx.frames[i]);
+        EXPECT_NE(h.flags & static_cast<uint8_t>(
+                                taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION),
+                  0U)
+            << "frame " << i << " missing CONTINUATION";
+    }
+    {
+        const taz_frame_header_t h =
+            unpack_header(wctx.frames[wctx.frames.size() - 1U]);
+        EXPECT_EQ(h.flags & static_cast<uint8_t>(
+                                taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION),
+                  0U)
+            << "last frame must not have CONTINUATION";
+    }
+
+    // Decode every frame and collect all DirEntry elements.
+    std::vector<taz_v1_DirEntry> decoded;
+    for (size_t fi = 0U; fi < wctx.frames.size(); fi++)
+    {
+        DirListResponseCb resp{};
+        resp.entries.funcs.decode = collect_decoded_entries;
+        resp.entries.arg = &decoded;
+        pb_istream_t stream = pb_istream_from_buffer(
+            wctx.frames[fi].data() + TAZ_FRAME_HEADER_SIZE,
+            wctx.frames[fi].size() -
+                static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+        ASSERT_TRUE(pb_decode(&stream, &DirListResponseCb_msg, &resp))
+            << "frame " << fi << " does not decode as a valid DirListResponse";
+    }
+
+    // All 300 elements must be present and bit-exact.
+    ASSERT_EQ(decoded.size(), static_cast<size_t>(kCount));
+    for (size_t i = 0U; i < static_cast<size_t>(kCount); i++)
+    {
+        char expected[sizeof(taz_v1_DirEntry::name)];
+        (void)memset(expected, 'a' + static_cast<int>(i % 26U),
+                     sizeof(expected) - 1U);
+        expected[sizeof(expected) - 1U] = '\0';
+        EXPECT_STREQ(decoded[i].name, expected) << "entry " << i;
+        EXPECT_EQ(decoded[i].kind, taz_v1_Kind_KIND_FILE) << "entry " << i;
+        EXPECT_EQ(decoded[i].size, i * 1000U) << "entry " << i;
     }
 }
 
