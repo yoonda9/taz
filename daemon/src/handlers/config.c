@@ -62,8 +62,7 @@ void handle_configuration_update(const taz_frame_header_t *header,
                                  const uint8_t *payload,
                                  taz_dispatch_write_fn_t write_fn, void *ctx)
 {
-    taz_v1_ConfigurationUpdateRequest req =
-        taz_v1_ConfigurationUpdateRequest_init_zero;
+    taz_v1_ConfigurationUpdateRequest *req;
     taz_v1_ConfigurationUpdateResponse *resp;
 
     if (payload == NULL || header->length == 0U)
@@ -74,12 +73,29 @@ void handle_configuration_update(const taz_frame_header_t *header,
         return;
     }
 
+    /* Both are heap-allocated: the request alone holds 32 key/value pairs
+     * (about 20 KiB). */
+    req = (taz_v1_ConfigurationUpdateRequest *)malloc(
+        sizeof(taz_v1_ConfigurationUpdateRequest));
+    resp = (taz_v1_ConfigurationUpdateResponse *)malloc(
+        sizeof(taz_v1_ConfigurationUpdateResponse));
+    if (req == NULL || resp == NULL)
+    {
+        free(req);
+        free(resp);
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
+                       NULL);
+        return;
+    }
+
     {
         pb_istream_t istream =
             pb_istream_from_buffer(payload, (size_t)header->length);
-        if (!pb_decode(&istream, taz_v1_ConfigurationUpdateRequest_fields,
-                       &req))
+        if (!pb_decode(&istream, taz_v1_ConfigurationUpdateRequest_fields, req))
         {
+            free(req);
+            free(resp);
             taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
                            taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
                            "decode ConfigurationUpdateRequest failed", NULL);
@@ -87,18 +103,9 @@ void handle_configuration_update(const taz_frame_header_t *header,
         }
     }
 
-    resp = (taz_v1_ConfigurationUpdateResponse *)malloc(
-        sizeof(taz_v1_ConfigurationUpdateResponse));
-    if (resp == NULL)
-    {
-        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
-                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
-                       NULL);
-        return;
-    }
-
-    taz_config_update(&req, resp);
+    taz_config_update(req, resp);
     taz_response_send(write_fn, ctx, header->stream_id, header->opcode,
                       taz_v1_ConfigurationUpdateResponse_fields, resp);
+    free(req);
     free(resp);
 }

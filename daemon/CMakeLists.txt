@@ -98,6 +98,8 @@ if(MSVC)
     if(TAZ_WARNINGS_AS_ERRORS)
         target_compile_options(taz_cxx_warnings INTERFACE /WX)
     endif()
+    target_compile_definitions(taz_cxx_warnings
+                               INTERFACE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(
         taz_cxx_warnings INTERFACE -Wall -Wextra -Wpedantic -Wshadow

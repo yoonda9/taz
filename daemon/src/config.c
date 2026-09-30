@@ -79,9 +79,7 @@ static void append_kv(taz_v1_ConfigurationGetResponse *out, const char *key,
 void taz_config_get(const char *const *keys, size_t nkeys,
                     taz_v1_ConfigurationGetResponse *out)
 {
-    taz_v1_ConfigurationGetResponse zero =
-        taz_v1_ConfigurationGetResponse_init_zero;
-    *out = zero;
+    (void)memset(out, 0, sizeof(*out));
 
     if (nkeys == 0)
     {
@@ -178,9 +176,7 @@ static void append_rejected(taz_v1_ConfigurationUpdateResponse *out,
 void taz_config_update(const taz_v1_ConfigurationUpdateRequest *req,
                        taz_v1_ConfigurationUpdateResponse *out)
 {
-    taz_v1_ConfigurationUpdateResponse zero =
-        taz_v1_ConfigurationUpdateResponse_init_zero;
-    *out = zero;
+    (void)memset(out, 0, sizeof(*out));
 
     for (pb_size_t i = 0; i < req->config_count; i++)
     {

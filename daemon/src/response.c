@@ -319,38 +319,38 @@ void taz_response_send(taz_dispatch_write_fn_t write_fn, void *ctx,
                        uint32_t stream_id, uint16_t opcode,
                        const pb_msgdesc_t *fields, const void *msg)
 {
-    /* Fast path: try to encode into a frame-sized stack buffer. */
-    uint8_t fast_buf[TAZ_FRAME_MAX_PAYLOAD_RESPONSE];
-    pb_ostream_t os = pb_ostream_from_buffer(fast_buf, sizeof(fast_buf));
-    if (pb_encode(&os, fields, msg))
-    {
-        flush_frame(write_fn, ctx, stream_id, opcode, fast_buf,
-                    os.bytes_written,
-                    (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE);
-        return;
-    }
-
-    /* Slow path: message exceeds the frame limit.  Encode to a heap buffer
-     * and split field-by-field. */
+    /* Size first and encode into the heap: a frame-sized stack buffer would
+     * be 64 KiB.  The spare byte keeps malloc from seeing 0 for a message
+     * whose fields are all default. */
     size_t encoded_size = 0U;
-    if (!pb_get_encoded_size(&encoded_size, fields, msg) || encoded_size == 0U)
+    if (!pb_get_encoded_size(&encoded_size, fields, msg))
     {
         return;
     }
 
-    uint8_t *encoded = (uint8_t *)malloc(encoded_size);
+    uint8_t *encoded = (uint8_t *)malloc(encoded_size + 1U);
     if (encoded == NULL)
     {
         return;
     }
 
-    os = pb_ostream_from_buffer(encoded, encoded_size);
+    pb_ostream_t os = pb_ostream_from_buffer(encoded, encoded_size);
     if (!pb_encode(&os, fields, msg))
     {
         free(encoded);
         return;
     }
 
-    send_chunked(write_fn, ctx, stream_id, opcode, encoded, os.bytes_written);
+    if (os.bytes_written <= TAZ_FRAME_MAX_PAYLOAD_RESPONSE)
+    {
+        flush_frame(write_fn, ctx, stream_id, opcode, encoded, os.bytes_written,
+                    (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE);
+    }
+    else
+    {
+        /* Too large for one frame: split field-by-field. */
+        send_chunked(write_fn, ctx, stream_id, opcode, encoded,
+                     os.bytes_written);
+    }
     free(encoded);
 }
