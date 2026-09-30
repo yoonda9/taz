@@ -83,8 +83,9 @@ extend-exclude = [
 select = ["E", "W", "F", "I", "N", "UP", "B", "A", "SIM", "S", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-# assert is the test idiom
-"tests/**" = ["S101"]
+# assert is the test idiom; subprocess.Popen in integration tests uses
+# known paths from fixtures, not untrusted input.
+"tests/**" = ["S101", "S603"]
 "c3/tests/**" = ["S101"]
 # tools/dev.py exists to run developer tools; its subprocess arguments are
 # constants and PATH lookups, never user input.

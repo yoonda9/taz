@@ -112,6 +112,8 @@ jobs:
       - if: contains(matrix.checks, 'main')
         run: just build
       - if: contains(matrix.checks, 'main')
+        env:
+          TAZ_DAEMON: daemon/build/linux-debug/tazd
         run: just test
       - if: contains(matrix.checks, 'main')
         run: just lint
@@ -126,6 +128,10 @@ jobs:
       # dependencies installed, so one red check never hides another.
       - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'asan') }}
         run: just test-c linux-asan
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'asan') }}
+        env:
+          TAZ_DAEMON: daemon/build/linux-asan/tazd
+        run: just test-py
 
       - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'tsan') }}
         run: just test-c linux-tsan
@@ -146,6 +152,8 @@ jobs:
 
       - id: coverage
         if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'coverage') }}
+        env:
+          TAZ_DAEMON: daemon/build/linux-debug/tazd
         run: just coverage
 
       - if: ${{ !cancelled() && steps.coverage.outcome == 'success' }}
@@ -241,6 +249,8 @@ jobs:
       - if: contains(matrix.checks, 'main')
         run: just build
       - if: contains(matrix.checks, 'main')
+        env:
+          TAZ_DAEMON: daemon/build/windows-debug/tazd.exe
         run: just test
       - if: contains(matrix.checks, 'main')
         run: just lint
