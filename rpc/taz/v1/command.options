@@ -8,5 +8,5 @@ taz.v1.CommandExecRequest.as_user      max_size:64
 
 # Output is streamed from the daemon's own buffers via encode callbacks rather
 # than copied into a fixed-size struct.
-taz.v1.CommandExecResponse.stdout      type:FT_CALLBACK
-taz.v1.CommandExecResponse.stderr      type:FT_CALLBACK
+taz.v1.CommandExecResponse.stdout_data type:FT_CALLBACK
+taz.v1.CommandExecResponse.stderr_data type:FT_CALLBACK

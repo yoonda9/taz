@@ -22,12 +22,15 @@ message CommandExecRequest {
 }
 
 // Large outputs may be delivered as several RESPONSE frames with the
-// CONTINUATION flag: receivers concatenate `stdout`/`stderr` across frames and
-// read the scalar fields from the final frame.
+// CONTINUATION flag: receivers concatenate `stdout_data`/`stderr_data` across
+// frames and read the scalar fields from the final frame.
 message CommandExecResponse {
   int32 exit_code = 1;
-  bytes stdout = 2;
-  bytes stderr = 3;
+  // Standard output and standard error. Not named `stdout`/`stderr`: C's
+  // <stdio.h> defines those as macros (function calls on MSVC), which would
+  // rewrite the fields in generated C code.
+  bytes stdout_data = 2;
+  bytes stderr_data = 3;
   // The command was killed because it exceeded its timeout.
   bool timed_out = 4;
   // Output exceeded the daemon's `exec.max_output_bytes` limit and was cut.

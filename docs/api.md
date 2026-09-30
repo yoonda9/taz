@@ -217,13 +217,13 @@ Run a command on the host and return its output.
 
 **Response:**
 
-| Field       | Type  | Description                                                                                                                        |
-| ----------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `exit_code` | int32 | Process exit code                                                                                                                  |
-| `stdout`    | bytes | Standard output                                                                                                                    |
-| `stderr`    | bytes | Standard error                                                                                                                     |
-| `timed_out` | bool  | Whether the command was killed due to timeout                                                                                      |
-| `truncated` | bool  | Whether `stdout`/`stderr` were truncated because combined output exceeded the daemon's `exec.max_output_bytes` configuration value |
+| Field         | Type  | Description                                                                                                                                  |
+| ------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `exit_code`   | int32 | Process exit code                                                                                                                            |
+| `stdout_data` | bytes | Standard output                                                                                                                              |
+| `stderr_data` | bytes | Standard error                                                                                                                               |
+| `timed_out`   | bool  | Whether the command was killed due to timeout                                                                                                |
+| `truncated`   | bool  | Whether `stdout_data`/`stderr_data` were truncated because combined output exceeded the daemon's `exec.max_output_bytes` configuration value |
 
 Output larger than a single `RESPONSE` frame is returned as a chunked response (`protocol.md` §6.1). A timeout kills the whole process tree of the command, not only the direct child.
 
@@ -252,11 +252,11 @@ The session is opened with `SHELL_OPEN`. That request's `stream_id` (call it `S`
 
 **Daemon stdout/stderr — subsequent RESPONSE frames on `S`, `CONTINUATION` set:**
 
-| Field       | Type  | Description                                   |
-| ----------- | ----- | --------------------------------------------- |
-| `stdout`    | bytes | Stdout bytes (may be empty)                   |
-| `stderr`    | bytes | Stderr bytes (may be empty)                   |
-| `exit_code` | int32 | Shell exit code (set only on the final frame) |
+| Field         | Type  | Description                                   |
+| ------------- | ----- | --------------------------------------------- |
+| `stdout_data` | bytes | Stdout bytes (may be empty)                   |
+| `stderr_data` | bytes | Stderr bytes (may be empty)                   |
+| `exit_code`   | int32 | Shell exit code (set only on the final frame) |
 
 When the shell exits (or `SHELL_CLOSE` is honored), the daemon sends one final RESPONSE frame on `S` with `CONTINUATION` cleared and `exit_code` set.
 
@@ -794,13 +794,13 @@ A chain of operations where each takes the output of the previous as input. Exec
 
 **Binding** — a small, closed set. There is no expression language and there is no implicit array→scalar reduction: bindings are **strictly scalar-to-scalar** and match only when the previous step's output field is of the required scalar type. Supported bindings:
 
-| Value   | Meaning                                                                                         | Allowed when previous → current is |
-| ------- | ----------------------------------------------------------------------------------------------- | ---------------------------------- |
-| `NONE`  | Step ignores previous output                                                                    | any                                |
-| `STDIN` | Previous step's `stdout` (bytes, scalar) becomes this step's stdin (via a pipe on the daemon)   | `COMMAND_EXEC` → `COMMAND_EXEC`    |
-| `PATH`  | Previous step's output file path (string, scalar) becomes this step's `path`/`src`/`dest` field | `FILE_*` → `FILE_*`                |
-| `PID`   | Previous step's scalar `pid` (uint32) becomes this step's `pid` field                           | `COMMAND_EXEC` → `PROCESS_*`       |
-| `BYTES` | Previous step's response bytes (scalar) are placed in this step's `content` field               | `FILE_GET` → `FILE_CREATE`, etc.   |
+| Value   | Meaning                                                                                            | Allowed when previous → current is |
+| ------- | -------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| `NONE`  | Step ignores previous output                                                                       | any                                |
+| `STDIN` | Previous step's `stdout_data` (bytes, scalar) becomes this step's stdin (via a pipe on the daemon) | `COMMAND_EXEC` → `COMMAND_EXEC`    |
+| `PATH`  | Previous step's output file path (string, scalar) becomes this step's `path`/`src`/`dest` field    | `FILE_*` → `FILE_*`                |
+| `PID`   | Previous step's scalar `pid` (uint32) becomes this step's `pid` field                              | `COMMAND_EXEC` → `PROCESS_*`       |
+| `BYTES` | Previous step's response bytes (scalar) are placed in this step's `content` field                  | `FILE_GET` → `FILE_CREATE`, etc.   |
 
 Explicitly disallowed:
 

@@ -532,23 +532,23 @@ class TestChunkedResponse:
         """bytes fields concatenate across frames; scalars ride the last."""
         original = command_pb2.CommandExecResponse(
             exit_code=3,
-            stdout=bytes(range(256)) * 600,
-            stderr=b"warning: output cut\n",
+            stdout_data=bytes(range(256)) * 600,
+            stderr_data=b"warning: output cut\n",
             truncated=True,
         )
-        out, err = original.stdout, original.stderr
+        out, err = original.stdout_data, original.stderr_data
         third = len(out) // 3
         frames = (
-            _chunk(command_pb2.CommandExecResponse(stdout=out[:third]))
+            _chunk(command_pb2.CommandExecResponse(stdout_data=out[:third]))
             + _chunk(
                 command_pb2.CommandExecResponse(
-                    stdout=out[third : 2 * third], stderr=err[:8]
+                    stdout_data=out[third : 2 * third], stderr_data=err[:8]
                 )
             )
             + _chunk(
                 command_pb2.CommandExecResponse(
-                    stdout=out[2 * third :],
-                    stderr=err[8:],
+                    stdout_data=out[2 * third :],
+                    stderr_data=err[8:],
                     exit_code=3,
                     truncated=True,
                 ),
@@ -628,18 +628,20 @@ class TestChunkedResponse:
     def test_scalars_come_from_final_frame(self) -> None:
         """An earlier frame's scalar does not survive a default in the last."""
         frames = _chunk(
-            command_pb2.CommandExecResponse(stdout=b"a", exit_code=1, timed_out=True)
-        ) + _chunk(command_pb2.CommandExecResponse(stdout=b"b"), final=True)
+            command_pb2.CommandExecResponse(
+                stdout_data=b"a", exit_code=1, timed_out=True
+            )
+        ) + _chunk(command_pb2.CommandExecResponse(stdout_data=b"b"), final=True)
         _, _, d = _dispatcher(frames)
 
         merged = _exec_response(_recv_exec(d))
 
-        assert merged.stdout == b"ab"
+        assert merged.stdout_data == b"ab"
         assert merged.exit_code == 0
         assert merged.timed_out is False
 
     def test_single_frame_returned_unchanged(self) -> None:
-        payload = command_pb2.CommandExecResponse(stdout=b"hi").SerializeToString()
+        payload = command_pb2.CommandExecResponse(stdout_data=b"hi").SerializeToString()
         _, _, d = _dispatcher(
             _response(opcode=common_pb2.OPCODE_COMMAND_EXEC, payload=payload)
         )
@@ -654,7 +656,7 @@ class TestChunkedResponse:
             code=common_pb2.ERROR_CODE_INTERNAL, message="spawn failed"
         )
         frames = _chunk(
-            command_pb2.CommandExecResponse(stdout=b"partial")
+            command_pb2.CommandExecResponse(stdout_data=b"partial")
         ) + _frame_bytes(
             common_pb2.FRAME_TYPE_ERROR,
             info.SerializeToString(),
@@ -670,21 +672,25 @@ class TestChunkedResponse:
         assert got == info
 
     def test_frames_for_other_streams_buffered_meanwhile(self) -> None:
-        first = _chunk(command_pb2.CommandExecResponse(stdout=b"one "), stream_id=1)
+        first = _chunk(
+            command_pb2.CommandExecResponse(stdout_data=b"one "), stream_id=1
+        )
         other = _response(opcode=common_pb2.OPCODE_VERSION, stream_id=2)
         last = _chunk(
-            command_pb2.CommandExecResponse(stdout=b"two"), stream_id=1, final=True
+            command_pb2.CommandExecResponse(stdout_data=b"two"), stream_id=1, final=True
         )
         _, _, d = _dispatcher(first, other, last)
 
-        assert _exec_response(_recv_exec(d)).stdout == b"one two"
+        assert _exec_response(_recv_exec(d)).stdout_data == b"one two"
         assert d.recv_response(2, Keepalive.OFF).stream_id == 2
 
     def test_buffered_chunks_merge(self) -> None:
         """Chunks buffered while another stream was awaited still merge."""
-        first = _chunk(command_pb2.CommandExecResponse(stdout=b"one "), stream_id=1)
+        first = _chunk(
+            command_pb2.CommandExecResponse(stdout_data=b"one "), stream_id=1
+        )
         last = _chunk(
-            command_pb2.CommandExecResponse(stdout=b"two", exit_code=7),
+            command_pb2.CommandExecResponse(stdout_data=b"two", exit_code=7),
             stream_id=1,
             final=True,
         )
@@ -694,13 +700,13 @@ class TestChunkedResponse:
         d.recv_response(2, Keepalive.OFF)
         merged = _exec_response(_recv_exec(d))
 
-        assert merged.stdout == b"one two"
+        assert merged.stdout_data == b"one two"
         assert merged.exit_code == 7
 
     def test_without_response_type_each_frame_returned(self) -> None:
         """A streamed response sees every CONTINUATION frame on its own."""
-        frames = _chunk(command_pb2.CommandExecResponse(stdout=b"a")) + _chunk(
-            command_pb2.CommandExecResponse(stdout=b"b"), final=True
+        frames = _chunk(command_pb2.CommandExecResponse(stdout_data=b"a")) + _chunk(
+            command_pb2.CommandExecResponse(stdout_data=b"b"), final=True
         )
         _, _, d = _dispatcher(frames)
 
@@ -708,6 +714,6 @@ class TestChunkedResponse:
         second = d.recv_response(1, Keepalive.OFF)
 
         assert first.flags & common_pb2.FRAME_FLAG_CONTINUATION
-        assert _exec_response(first).stdout == b"a"
+        assert _exec_response(first).stdout_data == b"a"
         assert not second.flags & common_pb2.FRAME_FLAG_CONTINUATION
-        assert _exec_response(second).stdout == b"b"
+        assert _exec_response(second).stdout_data == b"b"

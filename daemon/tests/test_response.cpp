@@ -8,11 +8,6 @@
 #include <pb_decode.h>
 #include <pb_encode.h>
 
-// MSVC's <stdio.h> defines stdout and stderr as macros, which rewrite the
-// CommandExecResponse fields of the same names. Nothing here uses the streams.
-#undef stdout
-#undef stderr
-
 #include "taz/frame.h"
 #include "taz/response.h"
 #include "taz/v1/command.pb.h"
@@ -204,8 +199,8 @@ TEST(ResponseSplitter, LargeBytesFieldYieldsFourFrames)
     taz_v1_CommandExecResponse msg = taz_v1_CommandExecResponse_init_zero;
     msg.exit_code = 42;
     msg.truncated = true;
-    msg.stdout.funcs.encode = encode_bytes_cb;
-    msg.stdout.arg = &bctx;
+    msg.stdout_data.funcs.encode = encode_bytes_cb;
+    msg.stdout_data.arg = &bctx;
 
     WriteCtx wctx;
     taz_response_send(capture_write, &wctx, 1U,
@@ -263,8 +258,8 @@ TEST(ResponseSplitter, LargeBytesFieldYieldsFourFrames)
     {
         taz_v1_CommandExecResponse partial =
             taz_v1_CommandExecResponse_init_zero;
-        partial.stdout.funcs.decode = collect_bytes_cb;
-        partial.stdout.arg = &merged_stdout;
+        partial.stdout_data.funcs.decode = collect_bytes_cb;
+        partial.stdout_data.arg = &merged_stdout;
         ASSERT_TRUE(decode_exec_response(wctx.frames[i], &partial));
     }
     ASSERT_EQ(merged_stdout.size(), kDataSize);
@@ -419,10 +414,10 @@ TEST(ResponseSplitter, TwoLargeBytesFields)
 
     taz_v1_CommandExecResponse msg = taz_v1_CommandExecResponse_init_zero;
     msg.exit_code = 0;
-    msg.stdout.funcs.encode = encode_bytes_cb;
-    msg.stdout.arg = &out_ctx;
-    msg.stderr.funcs.encode = encode_bytes_cb;
-    msg.stderr.arg = &err_ctx;
+    msg.stdout_data.funcs.encode = encode_bytes_cb;
+    msg.stdout_data.arg = &out_ctx;
+    msg.stderr_data.funcs.encode = encode_bytes_cb;
+    msg.stderr_data.arg = &err_ctx;
 
     WriteCtx wctx;
     taz_response_send(capture_write, &wctx, 2U,
@@ -456,10 +451,10 @@ TEST(ResponseSplitter, TwoLargeBytesFields)
     {
         taz_v1_CommandExecResponse partial =
             taz_v1_CommandExecResponse_init_zero;
-        partial.stdout.funcs.decode = collect_bytes_cb;
-        partial.stdout.arg = &merged_out;
-        partial.stderr.funcs.decode = collect_bytes_cb;
-        partial.stderr.arg = &merged_err;
+        partial.stdout_data.funcs.decode = collect_bytes_cb;
+        partial.stdout_data.arg = &merged_out;
+        partial.stderr_data.funcs.decode = collect_bytes_cb;
+        partial.stderr_data.arg = &merged_err;
         ASSERT_TRUE(decode_exec_response(frame, &partial));
     }
 
@@ -489,8 +484,8 @@ TEST(ResponseSplitter, AllFramesWithinPayloadLimit)
     BytesEncodeCtx bctx{data.data(), data.size()};
 
     taz_v1_CommandExecResponse msg = taz_v1_CommandExecResponse_init_zero;
-    msg.stdout.funcs.encode = encode_bytes_cb;
-    msg.stdout.arg = &bctx;
+    msg.stdout_data.funcs.encode = encode_bytes_cb;
+    msg.stdout_data.arg = &bctx;
 
     WriteCtx wctx;
     taz_response_send(capture_write, &wctx, 3U,

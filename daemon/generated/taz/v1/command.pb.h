@@ -29,12 +29,15 @@ typedef struct _taz_v1_CommandExecRequest {
 } taz_v1_CommandExecRequest;
 
 /* Large outputs may be delivered as several RESPONSE frames with the
- CONTINUATION flag: receivers concatenate `stdout`/`stderr` across frames and
- read the scalar fields from the final frame. */
+ CONTINUATION flag: receivers concatenate `stdout_data`/`stderr_data` across
+ frames and read the scalar fields from the final frame. */
 typedef struct _taz_v1_CommandExecResponse {
     int32_t exit_code;
-    pb_callback_t stdout;
-    pb_callback_t stderr;
+    /* Standard output and standard error. Not named `stdout`/`stderr`: C's
+ <stdio.h> defines those as macros (function calls on MSVC), which would
+ rewrite the fields in generated C code. */
+    pb_callback_t stdout_data;
+    pb_callback_t stderr_data;
     /* The command was killed because it exceeded its timeout. */
     bool timed_out;
     /* Output exceeded the daemon's `exec.max_output_bytes` limit and was cut. */
@@ -60,8 +63,8 @@ extern "C" {
 #define taz_v1_CommandExecRequest_timeout_ms_tag 5
 #define taz_v1_CommandExecRequest_as_user_tag    6
 #define taz_v1_CommandExecResponse_exit_code_tag 1
-#define taz_v1_CommandExecResponse_stdout_tag    2
-#define taz_v1_CommandExecResponse_stderr_tag    3
+#define taz_v1_CommandExecResponse_stdout_data_tag 2
+#define taz_v1_CommandExecResponse_stderr_data_tag 3
 #define taz_v1_CommandExecResponse_timed_out_tag 4
 #define taz_v1_CommandExecResponse_truncated_tag 5
 
@@ -79,8 +82,8 @@ X(a, STATIC,   SINGULAR, STRING,   as_user,           6)
 
 #define taz_v1_CommandExecResponse_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, INT32,    exit_code,         1) \
-X(a, CALLBACK, SINGULAR, BYTES,    stdout,            2) \
-X(a, CALLBACK, SINGULAR, BYTES,    stderr,            3) \
+X(a, CALLBACK, SINGULAR, BYTES,    stdout_data,       2) \
+X(a, CALLBACK, SINGULAR, BYTES,    stderr_data,       3) \
 X(a, STATIC,   SINGULAR, BOOL,     timed_out,         4) \
 X(a, STATIC,   SINGULAR, BOOL,     truncated,         5)
 #define taz_v1_CommandExecResponse_CALLBACK pb_default_field_callback

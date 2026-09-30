@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from taz.v1 import common_pb2 as taz_dot_v1_dot_common__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14taz/v1/command.proto\x12\x06taz.v1\x1a\x13taz/v1/common.proto\"\x8c\x01\n\x12\x43ommandExecRequest\x12\x0f\n\x07\x63ommand\x18\x01 \x01(\t\x12\x0c\n\x04\x61rgs\x18\x02 \x03(\t\x12\x1d\n\x03\x65nv\x18\x03 \x03(\x0b\x32\x10.taz.v1.KeyValue\x12\x13\n\x0bworking_dir\x18\x04 \x01(\t\x12\x12\n\ntimeout_ms\x18\x05 \x01(\r\x12\x0f\n\x07\x61s_user\x18\x06 \x01(\t\"n\n\x13\x43ommandExecResponse\x12\x11\n\texit_code\x18\x01 \x01(\x05\x12\x0e\n\x06stdout\x18\x02 \x01(\x0c\x12\x0e\n\x06stderr\x18\x03 \x01(\x0c\x12\x11\n\ttimed_out\x18\x04 \x01(\x08\x12\x11\n\ttruncated\x18\x05 \x01(\x08\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14taz/v1/command.proto\x12\x06taz.v1\x1a\x13taz/v1/common.proto\"\x8c\x01\n\x12\x43ommandExecRequest\x12\x0f\n\x07\x63ommand\x18\x01 \x01(\t\x12\x0c\n\x04\x61rgs\x18\x02 \x03(\t\x12\x1d\n\x03\x65nv\x18\x03 \x03(\x0b\x32\x10.taz.v1.KeyValue\x12\x13\n\x0bworking_dir\x18\x04 \x01(\t\x12\x12\n\ntimeout_ms\x18\x05 \x01(\r\x12\x0f\n\x07\x61s_user\x18\x06 \x01(\t\"x\n\x13\x43ommandExecResponse\x12\x11\n\texit_code\x18\x01 \x01(\x05\x12\x13\n\x0bstdout_data\x18\x02 \x01(\x0c\x12\x13\n\x0bstderr_data\x18\x03 \x01(\x0c\x12\x11\n\ttimed_out\x18\x04 \x01(\x08\x12\x11\n\ttruncated\x18\x05 \x01(\x08\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,5 +35,5 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_COMMANDEXECREQUEST']._serialized_start=54
   _globals['_COMMANDEXECREQUEST']._serialized_end=194
   _globals['_COMMANDEXECRESPONSE']._serialized_start=196
-  _globals['_COMMANDEXECRESPONSE']._serialized_end=306
+  _globals['_COMMANDEXECRESPONSE']._serialized_end=316
 # @@protoc_insertion_point(module_scope)

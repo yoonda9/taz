@@ -24,15 +24,15 @@ class CommandExecRequest(_message.Message):
     def __init__(self, command: _Optional[str] = ..., args: _Optional[_Iterable[str]] = ..., env: _Optional[_Iterable[_Union[_common_pb2.KeyValue, _Mapping]]] = ..., working_dir: _Optional[str] = ..., timeout_ms: _Optional[int] = ..., as_user: _Optional[str] = ...) -> None: ...
 
 class CommandExecResponse(_message.Message):
-    __slots__ = ("exit_code", "stdout", "stderr", "timed_out", "truncated")
+    __slots__ = ("exit_code", "stdout_data", "stderr_data", "timed_out", "truncated")
     EXIT_CODE_FIELD_NUMBER: _ClassVar[int]
-    STDOUT_FIELD_NUMBER: _ClassVar[int]
-    STDERR_FIELD_NUMBER: _ClassVar[int]
+    STDOUT_DATA_FIELD_NUMBER: _ClassVar[int]
+    STDERR_DATA_FIELD_NUMBER: _ClassVar[int]
     TIMED_OUT_FIELD_NUMBER: _ClassVar[int]
     TRUNCATED_FIELD_NUMBER: _ClassVar[int]
     exit_code: int
-    stdout: bytes
-    stderr: bytes
+    stdout_data: bytes
+    stderr_data: bytes
     timed_out: bool
     truncated: bool
-    def __init__(self, exit_code: _Optional[int] = ..., stdout: _Optional[bytes] = ..., stderr: _Optional[bytes] = ..., timed_out: _Optional[bool] = ..., truncated: _Optional[bool] = ...) -> None: ...
+    def __init__(self, exit_code: _Optional[int] = ..., stdout_data: _Optional[bytes] = ..., stderr_data: _Optional[bytes] = ..., timed_out: _Optional[bool] = ..., truncated: _Optional[bool] = ...) -> None: ...
