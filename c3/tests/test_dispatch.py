@@ -6,12 +6,13 @@ import socket
 from unittest.mock import MagicMock, patch
 
 import pytest
+from google.protobuf.message import Message
 from taz.c3.connection import Connection
 from taz.c3.errors import TazConnectionLost, TazProtocolError
 from taz.c3.protocol.dispatch import Dispatcher
 from taz.c3.protocol.frame import Frame, pack_header
 from taz.c3.settings import Backlog, Keepalive
-from taz.v1 import common_pb2, daemon_control_pb2
+from taz.v1 import command_pb2, common_pb2, daemon_control_pb2, process_pb2
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -490,108 +491,223 @@ class TestKeepalive:
 
 
 # ---------------------------------------------------------------------------
-# TestContinuationMerge: RESPONSE frames with FRAME_FLAG_CONTINUATION
+# TestChunkedResponse: RESPONSE frames with FRAME_FLAG_CONTINUATION (§6.1)
 # ---------------------------------------------------------------------------
 
 
-def _continuation_response(
-    payload: bytes,
+def _chunk(
+    msg: Message,
     *,
+    opcode: int = common_pb2.OPCODE_COMMAND_EXEC,
     stream_id: int = 1,
-    opcode: int = common_pb2.OPCODE_CONFIGURATION_GET,
     final: bool = False,
 ) -> bytes:
-    flags = 0 if final else common_pb2.FRAME_FLAG_CONTINUATION
+    """One RESPONSE frame of a chunked response, carrying ``msg``."""
     return _frame_bytes(
         common_pb2.FRAME_TYPE_RESPONSE,
-        payload,
+        msg.SerializeToString(),
         opcode=opcode,
         stream_id=stream_id,
-        flags=flags,
+        flags=0 if final else common_pb2.FRAME_FLAG_CONTINUATION,
     )
 
 
-class TestContinuationMerge:
-    def test_three_continuation_frames_reassemble(self) -> None:
-        """Three RESPONSE+CONTINUATION frames merge into one payload."""
-        from taz.v1 import daemon_control_pb2
+def _recv_exec(d: Dispatcher, stream_id: int = 1) -> Frame:
+    return d.recv_response(
+        stream_id,
+        Keepalive.OFF,
+        expected_opcode=common_pb2.OPCODE_COMMAND_EXEC,
+        response_type=command_pb2.CommandExecResponse,
+    )
 
-        # Build a ConfigurationGetResponse with three KeyValue entries and
-        # encode it in three separate RESPONSE frames (one entry per frame).
-        kv_parts: list[bytes] = []
-        for i in range(3):
-            part = daemon_control_pb2.ConfigurationGetResponse()
-            kv = part.config.add()
-            kv.key = f"key{i}"
-            kv.value = f"val{i}"
-            kv_parts.append(part.SerializeToString())
 
+def _exec_response(frame: Frame) -> command_pb2.CommandExecResponse:
+    msg = command_pb2.CommandExecResponse()
+    msg.ParseFromString(frame.payload)
+    return msg
+
+
+class TestChunkedResponse:
+    def test_three_frames_reassemble_to_original(self) -> None:
+        """bytes fields concatenate across frames; scalars ride the last."""
+        original = command_pb2.CommandExecResponse(
+            exit_code=3,
+            stdout=bytes(range(256)) * 600,
+            stderr=b"warning: output cut\n",
+            truncated=True,
+        )
+        out, err = original.stdout, original.stderr
+        third = len(out) // 3
         frames = (
-            _continuation_response(kv_parts[0])
-            + _continuation_response(kv_parts[1])
-            + _continuation_response(kv_parts[2], final=True)
+            _chunk(command_pb2.CommandExecResponse(stdout=out[:third]))
+            + _chunk(
+                command_pb2.CommandExecResponse(
+                    stdout=out[third : 2 * third], stderr=err[:8]
+                )
+            )
+            + _chunk(
+                command_pb2.CommandExecResponse(
+                    stdout=out[2 * third :],
+                    stderr=err[8:],
+                    exit_code=3,
+                    truncated=True,
+                ),
+                final=True,
+            )
+        )
+        _, _, d = _dispatcher(frames)
+
+        frame = _recv_exec(d)
+
+        assert _exec_response(frame) == original
+        assert frame.flags == 0
+        assert frame.length == len(frame.payload)
+
+    def test_string_repeated_and_submessage_fields_merge(self) -> None:
+        original = process_pb2.ProcessInfoResponse(
+            info=process_pb2.ProcessInfo(pid=42, name="python3", state="S"),
+            command_line="python3 -m http.server 8000",
+            start_time=1_790_000_000,
+            open_files=[f"/srv/www/f{i}" for i in range(6)],
+        )
+        frames = _chunk(
+            process_pb2.ProcessInfoResponse(
+                info=process_pb2.ProcessInfo(name="pyt"),
+                command_line="python3 -m ",
+                open_files=original.open_files[:4],
+            ),
+            opcode=common_pb2.OPCODE_PROCESS_INFO,
+        ) + _chunk(
+            process_pb2.ProcessInfoResponse(
+                info=process_pb2.ProcessInfo(pid=42, name="hon3", state="S"),
+                command_line="http.server 8000",
+                start_time=1_790_000_000,
+                open_files=original.open_files[4:],
+            ),
+            opcode=common_pb2.OPCODE_PROCESS_INFO,
+            final=True,
+        )
+        _, _, d = _dispatcher(frames)
+
+        frame = d.recv_response(
+            1, Keepalive.OFF, response_type=process_pb2.ProcessInfoResponse
+        )
+
+        merged = process_pb2.ProcessInfoResponse()
+        merged.ParseFromString(frame.payload)
+        assert merged == original
+
+    def test_repeated_messages_appended_in_frame_order(self) -> None:
+        keys = ["log.level", "compression", "exec.max_output_bytes"]
+        frames = b"".join(
+            _chunk(
+                daemon_control_pb2.ConfigurationGetResponse(
+                    config=[common_pb2.KeyValue(key=key, value=str(i))]
+                ),
+                opcode=common_pb2.OPCODE_CONFIGURATION_GET,
+                final=i == len(keys) - 1,
+            )
+            for i, key in enumerate(keys)
         )
         _, _, d = _dispatcher(frames)
 
         frame = d.recv_response(
             1,
             Keepalive.OFF,
-            expected_opcode=common_pb2.OPCODE_CONFIGURATION_GET,
+            response_type=daemon_control_pb2.ConfigurationGetResponse,
         )
 
-        # Merged payload must parse back to all three entries.
         merged = daemon_control_pb2.ConfigurationGetResponse()
         merged.ParseFromString(frame.payload)
-        assert len(merged.config) == 3
-        keys = {kv.key for kv in merged.config}
-        assert keys == {"key0", "key1", "key2"}
+        assert [(kv.key, kv.value) for kv in merged.config] == [
+            ("log.level", "0"),
+            ("compression", "1"),
+            ("exec.max_output_bytes", "2"),
+        ]
 
-    def test_single_frame_no_continuation_unchanged(self) -> None:
-        """A plain RESPONSE (no CONTINUATION) is returned as-is."""
-        from taz.v1 import daemon_control_pb2
+    def test_scalars_come_from_final_frame(self) -> None:
+        """An earlier frame's scalar does not survive a default in the last."""
+        frames = _chunk(
+            command_pb2.CommandExecResponse(stdout=b"a", exit_code=1, timed_out=True)
+        ) + _chunk(command_pb2.CommandExecResponse(stdout=b"b"), final=True)
+        _, _, d = _dispatcher(frames)
 
-        resp_msg = daemon_control_pb2.ConfigurationGetResponse()
-        kv = resp_msg.config.add()
-        kv.key = "log.level"
-        kv.value = "INFO"
-        payload = resp_msg.SerializeToString()
+        merged = _exec_response(_recv_exec(d))
 
-        frame_bytes = _continuation_response(payload, final=True)
-        _, _, d = _dispatcher(frame_bytes)
+        assert merged.stdout == b"ab"
+        assert merged.exit_code == 0
+        assert merged.timed_out is False
 
-        frame = d.recv_response(1, Keepalive.OFF)
+    def test_single_frame_returned_unchanged(self) -> None:
+        payload = command_pb2.CommandExecResponse(stdout=b"hi").SerializeToString()
+        _, _, d = _dispatcher(
+            _response(opcode=common_pb2.OPCODE_COMMAND_EXEC, payload=payload)
+        )
+
+        frame = _recv_exec(d)
+
         assert frame.payload == payload
 
-    def test_continuation_interleaved_with_other_stream(self) -> None:
-        """Frames for other streams buffered while accumulating CONTINUATION."""
-        from taz.v1 import daemon_control_pb2
+    def test_error_frame_ends_response(self) -> None:
+        """Chunks already received are dropped; the ERROR frame is returned."""
+        info = common_pb2.ErrorInfo(
+            code=common_pb2.ERROR_CODE_INTERNAL, message="spawn failed"
+        )
+        frames = _chunk(
+            command_pb2.CommandExecResponse(stdout=b"partial")
+        ) + _frame_bytes(
+            common_pb2.FRAME_TYPE_ERROR,
+            info.SerializeToString(),
+            opcode=common_pb2.OPCODE_COMMAND_EXEC,
+        )
+        _, _, d = _dispatcher(frames)
 
-        part1 = daemon_control_pb2.ConfigurationGetResponse()
-        kv1 = part1.config.add()
-        kv1.key = "log.level"
-        kv1.value = "INFO"
+        frame = _recv_exec(d)
 
-        part2 = daemon_control_pb2.ConfigurationGetResponse()
-        kv2 = part2.config.add()
-        kv2.key = "compression"
-        kv2.value = "NONE"
+        assert frame.type == common_pb2.FRAME_TYPE_ERROR
+        got = common_pb2.ErrorInfo()
+        got.ParseFromString(frame.payload)
+        assert got == info
 
-        # Interleave: cont frame 1, stream-2 frame, cont frame 2 (final)
-        cont1 = _continuation_response(part1.SerializeToString(), stream_id=1)
+    def test_frames_for_other_streams_buffered_meanwhile(self) -> None:
+        first = _chunk(command_pb2.CommandExecResponse(stdout=b"one "), stream_id=1)
         other = _response(opcode=common_pb2.OPCODE_VERSION, stream_id=2)
-        final = _continuation_response(
-            part2.SerializeToString(), stream_id=1, final=True
+        last = _chunk(
+            command_pb2.CommandExecResponse(stdout=b"two"), stream_id=1, final=True
         )
+        _, _, d = _dispatcher(first, other, last)
 
-        _, _, d = _dispatcher(cont1, other, final)
-        frame = d.recv_response(
-            1, Keepalive.OFF, expected_opcode=common_pb2.OPCODE_CONFIGURATION_GET
+        assert _exec_response(_recv_exec(d)).stdout == b"one two"
+        assert d.recv_response(2, Keepalive.OFF).stream_id == 2
+
+    def test_buffered_chunks_merge(self) -> None:
+        """Chunks buffered while another stream was awaited still merge."""
+        first = _chunk(command_pb2.CommandExecResponse(stdout=b"one "), stream_id=1)
+        last = _chunk(
+            command_pb2.CommandExecResponse(stdout=b"two", exit_code=7),
+            stream_id=1,
+            final=True,
         )
+        other = _response(opcode=common_pb2.OPCODE_VERSION, stream_id=2)
+        _, _, d = _dispatcher(first, last, other)
 
-        merged = daemon_control_pb2.ConfigurationGetResponse()
-        merged.ParseFromString(frame.payload)
-        assert len(merged.config) == 2
+        d.recv_response(2, Keepalive.OFF)
+        merged = _exec_response(_recv_exec(d))
 
-        # Stream 2 must still be buffered.
-        frame2 = d.recv_response(2, Keepalive.OFF)
-        assert frame2.stream_id == 2
+        assert merged.stdout == b"one two"
+        assert merged.exit_code == 7
+
+    def test_without_response_type_each_frame_returned(self) -> None:
+        """A streamed response sees every CONTINUATION frame on its own."""
+        frames = _chunk(command_pb2.CommandExecResponse(stdout=b"a")) + _chunk(
+            command_pb2.CommandExecResponse(stdout=b"b"), final=True
+        )
+        _, _, d = _dispatcher(frames)
+
+        first = d.recv_response(1, Keepalive.OFF)
+        second = d.recv_response(1, Keepalive.OFF)
+
+        assert first.flags & common_pb2.FRAME_FLAG_CONTINUATION
+        assert _exec_response(first).stdout == b"a"
+        assert not second.flags & common_pb2.FRAME_FLAG_CONTINUATION
+        assert _exec_response(second).stdout == b"b"

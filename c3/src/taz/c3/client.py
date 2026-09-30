@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import TracebackType
 
+from google.protobuf.message import Message
+
 from taz.c3.connection import Connection
 from taz.c3.errors import TazError
 from taz.c3.protocol.dispatch import Dispatcher
@@ -72,17 +74,18 @@ class TazClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _call(
+    def _call[M: Message](
         self,
         opcode: int,
         payload: bytes,
+        response_type: type[M],
         keepalive: Keepalive | None,
-    ) -> Frame:
+    ) -> M:
         kv = keepalive if keepalive is not None else self._keepalive
         stream_id = self._conn.send_request(opcode, payload)
         try:
             frame = self._dispatcher.recv_response(
-                stream_id, kv, expected_opcode=opcode
+                stream_id, kv, expected_opcode=opcode, response_type=response_type
             )
         except BaseException as exc:
             # wait_readable may raise outside Connection._io so ensure the
@@ -93,7 +96,9 @@ class TazClient:
             raise
         if frame.type == common_pb2.FRAME_TYPE_ERROR:
             _parse_error(frame)
-        return frame
+        resp = response_type()
+        resp.ParseFromString(frame.payload)
+        return resp
 
     # ------------------------------------------------------------------
     # Public API
@@ -119,12 +124,12 @@ class TazClient:
     ) -> daemon_control_pb2.VersionResponse:
         """Return the daemon's version information."""
         req = daemon_control_pb2.VersionRequest()
-        frame = self._call(
-            common_pb2.OPCODE_VERSION, req.SerializeToString(), keepalive
+        return self._call(
+            common_pb2.OPCODE_VERSION,
+            req.SerializeToString(),
+            daemon_control_pb2.VersionResponse,
+            keepalive,
         )
-        resp = daemon_control_pb2.VersionResponse()
-        resp.ParseFromString(frame.payload)
-        return resp
 
     def capabilities(self) -> daemon_control_pb2.CapabilityPayload:
         """Return the CAPABILITY payload received during the handshake."""
@@ -143,13 +148,12 @@ class TazClient:
         req = daemon_control_pb2.ConfigurationGetRequest()
         if keys:
             req.keys.extend(keys)
-        frame = self._call(
+        resp = self._call(
             common_pb2.OPCODE_CONFIGURATION_GET,
             req.SerializeToString(),
+            daemon_control_pb2.ConfigurationGetResponse,
             keepalive,
         )
-        resp = daemon_control_pb2.ConfigurationGetResponse()
-        resp.ParseFromString(frame.payload)
         return {kv.key: kv.value for kv in resp.config}
 
     def config_update(
@@ -167,11 +171,9 @@ class TazClient:
             kv = req.config.add()
             kv.key = key
             kv.value = value
-        frame = self._call(
+        return self._call(
             common_pb2.OPCODE_CONFIGURATION_UPDATE,
             req.SerializeToString(),
+            daemon_control_pb2.ConfigurationUpdateResponse,
             keepalive,
         )
-        resp = daemon_control_pb2.ConfigurationUpdateResponse()
-        resp.ParseFromString(frame.payload)
-        return resp

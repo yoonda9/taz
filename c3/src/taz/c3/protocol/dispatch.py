@@ -5,8 +5,11 @@ from __future__ import annotations
 import collections
 import dataclasses
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
+
+from google.protobuf.descriptor import FieldDescriptor
+from google.protobuf.message import Message
 
 from taz.c3.errors import TazConnectionLost, TazProtocolError
 from taz.c3.protocol.frame import DEFAULT_MAX_PAYLOAD, Frame, wait_readable
@@ -17,6 +20,48 @@ if TYPE_CHECKING:
     from taz.c3.connection import Connection
 
 _DEFAULT_BACKLOG: Backlog = Backlog()
+
+
+def merge_chunks[M: Message](message_type: type[M], payloads: Sequence[bytes]) -> M:
+    """Merge the payloads of a chunked response into one message (§6.1).
+
+    Each payload is a well-formed ``message_type``.  bytes and string fields
+    are concatenated and repeated fields appended in payload order; scalars
+    come from the final payload.  Singular sub-messages merge by the same rules.
+    """
+    parts: list[M] = []
+    for payload in payloads:
+        part = message_type()
+        part.ParseFromString(payload)
+        parts.append(part)
+    merged = message_type()
+    _merge_parts(merged, parts)
+    return merged
+
+
+def _merge_parts(dst: Message, parts: Sequence[Message]) -> None:
+    # Protobuf's own merge keeps only the last value of a singular bytes or
+    # string field, so each field is merged explicitly.
+    dst.CopyFrom(parts[-1])
+    for fd in dst.DESCRIPTOR.fields:
+        name = fd.name
+        if fd.is_repeated:
+            dst.ClearField(name)
+            repeated = getattr(dst, name)
+            for part in parts:
+                repeated.extend(getattr(part, name))
+        elif fd.type == FieldDescriptor.TYPE_BYTES:
+            data = [getattr(part, name) for part in parts]
+            if any(data):
+                setattr(dst, name, b"".join(data))
+        elif fd.type == FieldDescriptor.TYPE_STRING:
+            text = [getattr(part, name) for part in parts]
+            if any(text):
+                setattr(dst, name, "".join(text))
+        elif fd.type == FieldDescriptor.TYPE_MESSAGE:
+            present = [getattr(part, name) for part in parts if part.HasField(name)]
+            if present:
+                _merge_parts(getattr(dst, name), present)
 
 
 class Dispatcher:
@@ -168,33 +213,46 @@ class Dispatcher:
         keepalive: Keepalive,
         *,
         expected_opcode: int | None = None,
+        response_type: type[Message] | None = None,
     ) -> Frame:
         """Receive the next RESPONSE or ERROR frame for ``expected`` stream_id.
 
         Frames for other streams are buffered.  ``expected_opcode`` (if given)
         is validated against the echoed opcode on RESPONSE/ERROR frames.
-        RESPONSE frames with FRAME_FLAG_CONTINUATION are accumulated; the
-        payloads are concatenated before the merged frame is returned.
-        """
-        _flag_cont = common_pb2.FRAME_FLAG_CONTINUATION
-        _type_resp = common_pb2.FRAME_TYPE_RESPONSE
-        continuation_payloads: list[bytes] = []
 
-        # Drain any buffered CONTINUATION frames for this stream first, then
-        # return a non-continuation buffered frame if present.
-        while True:
-            buffered = self._pop_buffered(expected)
-            if buffered is None:
-                break
-            if buffered.type == _type_resp and buffered.flags & _flag_cont:
-                continuation_payloads.append(buffered.payload)
-            else:
-                if continuation_payloads:
-                    continuation_payloads.append(buffered.payload)
-                    return dataclasses.replace(
-                        buffered, payload=b"".join(continuation_payloads)
-                    )
-                return buffered
+        With ``response_type``, a chunked response is collected up to the
+        RESPONSE frame without FRAME_FLAG_CONTINUATION and merged per §6.1; the
+        final frame is returned carrying the merged message.  An ERROR frame
+        ends the response and is returned as it arrived.  Without
+        ``response_type`` every frame is returned on its own, as a streamed
+        response needs.
+        """
+        frame = self._next_frame(expected, keepalive, expected_opcode)
+        if response_type is None:
+            return frame
+        chunks: list[bytes] = []
+        while (
+            frame.type == common_pb2.FRAME_TYPE_RESPONSE
+            and frame.flags & common_pb2.FRAME_FLAG_CONTINUATION
+        ):
+            chunks.append(frame.payload)
+            frame = self._next_frame(expected, keepalive, expected_opcode)
+        if not chunks or frame.type != common_pb2.FRAME_TYPE_RESPONSE:
+            return frame
+        chunks.append(frame.payload)
+        payload = merge_chunks(response_type, chunks).SerializeToString()
+        return dataclasses.replace(frame, length=len(payload), payload=payload)
+
+    def _next_frame(
+        self,
+        expected: int,
+        keepalive: Keepalive,
+        expected_opcode: int | None,
+    ) -> Frame:
+        """Return the next frame for ``expected``, buffered or read."""
+        buffered = self._pop_buffered(expected)
+        if buffered is not None:
+            return buffered
 
         sock = self._conn._sock
         if sock is None:
@@ -253,15 +311,6 @@ class Dispatcher:
                     raise TazProtocolError(
                         f"echoed opcode 0x{frame.opcode:04x} !="
                         f" expected 0x{expected_opcode:04x}"
-                    )
-                # Accumulate CONTINUATION RESPONSE frames; return on the last.
-                if frame.type == _type_resp and frame.flags & _flag_cont:
-                    continuation_payloads.append(frame.payload)
-                    continue
-                if continuation_payloads:
-                    continuation_payloads.append(frame.payload)
-                    return dataclasses.replace(
-                        frame, payload=b"".join(continuation_payloads)
                     )
                 return frame
 

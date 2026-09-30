@@ -67,11 +67,12 @@ def _response_bytes(
     opcode: int,
     payload: bytes = b"",
     stream_id: int = 1,
+    flags: int = 0,
 ) -> bytes:
     header = pack_header(
         Frame(
             type=common_pb2.FRAME_TYPE_RESPONSE,
-            flags=0,
+            flags=flags,
             opcode=opcode,
             length=len(payload),
             stream_id=stream_id,
@@ -135,9 +136,11 @@ def _mock_sock(*chunks: bytes) -> MagicMock:
 _PATCH_CC = "taz.c3.connection.socket.create_connection"
 
 
-def _connected_client(*extra_chunks: bytes) -> TazClient:
+def _connected_client(
+    *extra_chunks: bytes, operations: list[int] | None = None
+) -> TazClient:
     """Return a TazClient connected via a mock socket."""
-    mock_sock = _mock_sock(_capability_bytes(), *extra_chunks)
+    mock_sock = _mock_sock(_capability_bytes(operations=operations), *extra_chunks)
     client = TazClient("127.0.0.1", 5555, keepalive=Keepalive.OFF)
     with patch(_PATCH_CC, return_value=mock_sock):
         client.connect()
@@ -225,6 +228,24 @@ class TestVersion:
         assert info.build == "abc123"
         assert info.platform == "linux/amd64"
 
+    def test_version_merges_chunked_response(self) -> None:
+        """String fields split across CONTINUATION frames are concatenated."""
+        first = _response_bytes(
+            common_pb2.OPCODE_VERSION,
+            daemon_control_pb2.VersionResponse(version="1.2").SerializeToString(),
+            flags=common_pb2.FRAME_FLAG_CONTINUATION,
+        )
+        last = _response_bytes(
+            common_pb2.OPCODE_VERSION,
+            daemon_control_pb2.VersionResponse(
+                version=".3", build="abc123"
+            ).SerializeToString(),
+        )
+        client = _connected_client(first, last)
+        info = client.version()
+        assert info.version == "1.2.3"
+        assert info.build == "abc123"
+
     def test_version_error_raises(self) -> None:
         err = _error_bytes(
             common_pb2.OPCODE_VERSION,
@@ -266,6 +287,64 @@ class TestCapabilities:
         client = TazClient("127.0.0.1", 5555)
         with pytest.raises(RuntimeError):
             client.capabilities()
+
+
+# ---------------------------------------------------------------------------
+# config_get() / config_update()
+# ---------------------------------------------------------------------------
+
+_CONFIG_OPS: list[int] = [
+    common_pb2.OPCODE_CONFIGURATION_GET,
+    common_pb2.OPCODE_CONFIGURATION_UPDATE,
+]
+
+
+class TestConfig:
+    def test_config_get_returns_dict(self) -> None:
+        resp = daemon_control_pb2.ConfigurationGetResponse(
+            config=[
+                common_pb2.KeyValue(key="log.level", value="INFO"),
+                common_pb2.KeyValue(key="compression", value="NONE"),
+            ]
+        )
+        client = _connected_client(
+            _response_bytes(
+                common_pb2.OPCODE_CONFIGURATION_GET, resp.SerializeToString()
+            ),
+            operations=_CONFIG_OPS,
+        )
+        assert client.config_get() == {"log.level": "INFO", "compression": "NONE"}
+
+    def test_config_get_error_raises(self) -> None:
+        err = _error_bytes(
+            common_pb2.OPCODE_CONFIGURATION_GET,
+            common_pb2.ERROR_CODE_INVALID_REQUEST,
+            "decode ConfigurationGetRequest failed",
+        )
+        client = _connected_client(err, operations=_CONFIG_OPS)
+        with pytest.raises(TazError) as exc_info:
+            client.config_get()
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+        assert not client._conn.closed
+
+    def test_config_update_returns_applied_and_rejected(self) -> None:
+        resp = daemon_control_pb2.ConfigurationUpdateResponse(
+            applied=["log.level"],
+            rejected=[
+                daemon_control_pb2.RejectedKey(key="invalid.key", reason="unknown key")
+            ],
+        )
+        client = _connected_client(
+            _response_bytes(
+                common_pb2.OPCODE_CONFIGURATION_UPDATE, resp.SerializeToString()
+            ),
+            operations=_CONFIG_OPS,
+        )
+        result = client.config_update({"log.level": "DEBUG", "invalid.key": "x"})
+        assert list(result.applied) == ["log.level"]
+        assert [(r.key, r.reason) for r in result.rejected] == [
+            ("invalid.key", "unknown key")
+        ]
 
 
 # ---------------------------------------------------------------------------
