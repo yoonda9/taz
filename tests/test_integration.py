@@ -7,8 +7,9 @@ import time
 from pathlib import Path
 
 import pytest
+from google.protobuf import empty_pb2
 from taz.c3 import TazClient, TazConnectionLost, TazError
-from taz.v1 import common_pb2
+from taz.v1 import common_pb2, daemon_control_pb2
 
 from tests.conftest import Daemon
 
@@ -121,11 +122,29 @@ class TestConfigUpdate:
         assert common_pb2.OPCODE_CONFIGURATION_UPDATE in ops
 
 
-class TestUnsupportedOpcode:
-    def test_pipeline_opcode_raises_taz_error_not_supported(
+class TestErrorFrames:
+    """The daemon's ERROR frames raise TazError; the connection stays usable."""
+
+    def test_pipeline_request_raises_not_supported(self, taz_client: TazClient) -> None:
+        # The client refuses an unadvertised opcode before sending it, so
+        # advertise PIPELINE locally to put the raw REQUEST on the wire.
+        taz_client._conn.capabilities.operations.append(common_pb2.OPCODE_PIPELINE)
+        with pytest.raises(TazError) as exc_info:
+            taz_client._call(common_pb2.OPCODE_PIPELINE, b"", empty_pb2.Empty, None)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
+        assert exc_info.value.message == "unknown opcode"
+        assert taz_client.version().version == _project_version()
+
+    def test_malformed_config_get_raises_invalid_request(
         self, taz_client: TazClient
     ) -> None:
-        """Sending an opcode not advertised by the daemon raises TazError."""
+        # keys (field 1) claims five bytes but only two follow.
         with pytest.raises(TazError) as exc_info:
-            taz_client._conn.send_request(common_pb2.OPCODE_PIPELINE, b"")
-        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
+            taz_client._call(
+                common_pb2.OPCODE_CONFIGURATION_GET,
+                b"\x0a\x05ab",
+                daemon_control_pb2.ConfigurationGetResponse,
+                None,
+            )
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+        assert taz_client.config_get(keys=["log.level"]) == {"log.level": "INFO"}
