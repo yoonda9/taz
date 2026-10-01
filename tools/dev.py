@@ -385,6 +385,15 @@ def cmd_proto(check: bool) -> None:
         ]
     )
 
+    # Generators write CRLF on Windows; .gitattributes only applies on
+    # checkout, so normalize here or git sees the files as modified.
+    for root in GENERATED_PATHS:
+        for path in root.rglob("*"):
+            if path.suffix in {".py", ".pyi", ".c", ".h"}:
+                data = path.read_bytes()
+                if b"\r\n" in data:
+                    path.write_bytes(data.replace(b"\r\n", b"\n"))
+
     if check:
         paths = [str(p.relative_to(ROOT)) for p in GENERATED_PATHS]
         dirty = run(
