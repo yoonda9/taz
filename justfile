@@ -12,6 +12,7 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
 preset := if os() == "windows" { "windows-debug" } else { "linux-debug" }
 dev := "uv run python tools/dev.py"
+win := "uv run python tools/win.py"
 
 # List recipes
 [private]
@@ -171,3 +172,27 @@ lint-py:
 lint-proto:
     buf lint rpc
     {{ dev }} proto-breaking
+
+# --- Windows VM -------------------------------------------------------------
+# A disposable linked clone of the TAZ Windows template on Proxmox (settings
+# in .env; see tools/win.py). `just win test` reproduces CI's Windows job.
+
+# Clone (if needed) and start the Windows VM, then wait for SSH
+win-up:
+    {{ win }} up
+
+# Push HEAD to the Windows VM and run `just ARGS` there with CI's environment
+win *args:
+    {{ win }} run {{ args }}
+
+# Open a shell on the Windows VM
+win-ssh:
+    {{ win }} ssh
+
+# Destroy the Windows VM and clone a fresh one
+win-reset:
+    {{ win }} reset
+
+# Destroy the Windows VM
+win-down:
+    {{ win }} down

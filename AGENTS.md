@@ -18,6 +18,7 @@ the wire spec and protobuf schemas (`rpc/`) are the contract; the C daemon
 | `c3/`          | Python client package (`import taz`)                |
 | `tests/`       | Integration tests (daemon + client)                 |
 | `tools/dev.py` | Cross-platform helpers behind `just` recipes        |
+| `tools/win.py` | Disposable Windows VM on Proxmox (`just win*`)      |
 | `justfile`     | Every developer/CI task                             |
 
 ## Build & test
@@ -30,8 +31,13 @@ just test           # C unit tests (GoogleTest) + Python tests (pytest)
 just lint           # all formatters, clang-tidy, cppcheck, ruff, mypy, buf
 just fmt            # apply all formatters
 just proto          # regenerate protobuf code after editing rpc/
+just win test       # push HEAD to a Windows VM clone, run `just test` there
 just --list         # everything else
 ```
+
+`just win*` needs the Proxmox token in `.env` (see `tools/win.py`). `just
+win-up` clones the TAZ Windows template (a warm `C:\taz`) into VM 9200;
+`just win-reset` and `just win-down` destroy only a clone tagged `win-clone`.
 
 ## Key conventions
 
