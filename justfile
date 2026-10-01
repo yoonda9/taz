@@ -181,9 +181,9 @@ lint-proto:
 win-up:
     {{ win }} up
 
-# Push HEAD to the Windows VM and run `just ARGS` there with CI's environment
+# Windows VM: up|ssh|reset|down, or RECIPE [ARGS] to push HEAD and run it there
 win *args:
-    {{ win }} run {{ args }}
+    {{ win }} {{ args }}
 
 # Open a shell on the Windows VM
 win-ssh:

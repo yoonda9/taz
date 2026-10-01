@@ -6,23 +6,23 @@ C:\\taz checkout (see the template's Proxmox description). Code reaches it by
 `git send-pack` over SSH, never through a forge, so the VM needs no
 credentials.
 
-Subcommands:
+Usage: win.py COMMAND | RECIPE [ARGS...]
     up               clone the template (if needed), start, wait for SSH
-    run ARGS...      push HEAD to the VM's C:\\taz, then run `just ARGS` there
     ssh              interactive shell on the VM
     reset            destroy the VM and clone it again
     down             stop and destroy the VM
+    RECIPE [ARGS]    push HEAD to the VM's C:\\taz, then run `just RECIPE ARGS`
+                     there (`run RECIPE` if a recipe is named like a command)
 
 Settings come from the environment, falling back to the repo's .env:
     PVE_URL, PVE_TOKEN_ID, PVE_TOKEN   Proxmox API host and token (required)
     TAZ_WIN_TEMPLATE   template VMID (9101)       TAZ_WIN_VMID     clone VMID (9200)
     TAZ_WIN_NODE       Proxmox node (pve)        TAZ_WIN_POOL     pool (taz)
-    TAZ_WIN_MEMORY     clone RAM in MB (6144)     TAZ_WIN_KEY      SSH private key
+    TAZ_WIN_MEMORY     clone RAM in MB (8192)     TAZ_WIN_KEY      SSH private key
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import shlex
@@ -98,7 +98,7 @@ def load_config() -> Config:
         pool=get("TAZ_WIN_POOL", "taz"),
         template=int(get("TAZ_WIN_TEMPLATE", "9101")),
         vmid=int(get("TAZ_WIN_VMID", "9200")),
-        memory=int(get("TAZ_WIN_MEMORY", "6144")),
+        memory=int(get("TAZ_WIN_MEMORY", "8192")),
         key=Path(get("TAZ_WIN_KEY", str(Path.home() / ".ssh" / "taz_win_ed25519"))),
     )
 
@@ -343,22 +343,17 @@ def cmd_down(cfg: Config) -> None:
 
 # ---------------------------------------------------------------------------
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="win.py", description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("up")
-    p = sub.add_parser("run")
-    p.add_argument("args", nargs=argparse.REMAINDER)
-    sub.add_parser("ssh")
-    sub.add_parser("reset")
-    sub.add_parser("down")
-    args = parser.parse_args(argv)
+    # Not argparse: anything that is not a local command is a recipe for the
+    # VM, so `just win down` and `just win test` both read naturally.
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in {"-h", "--help"}:
+        print(__doc__)
+        return
 
     cfg = load_config()
-    match args.command:
+    match args[0]:
         case "up":
             cmd_up(cfg)
-        case "run":
-            sys.exit(cmd_run(cfg, args.args))
         case "ssh":
             sys.exit(cmd_ssh(cfg))
         case "reset":
@@ -366,6 +361,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             cmd_up(cfg)
         case "down":
             cmd_down(cfg)
+        case "run":
+            sys.exit(cmd_run(cfg, args[1:]))
+        case _:
+            sys.exit(cmd_run(cfg, args))
 
 
 if __name__ == "__main__":
