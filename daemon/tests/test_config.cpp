@@ -347,4 +347,61 @@ TEST_F(ConfigTest, ValidExecMaxOutputBytesAtUint32Max)
     EXPECT_EQ(resp.rejected_count, 0);
 }
 
+// ---- typed accessor: taz_config_exec_max_output_bytes ------------------
+
+TEST_F(ConfigTest, ExecMaxOutputBytesAccessorDefault)
+{
+    EXPECT_EQ(taz_config_exec_max_output_bytes(), 1048576U);
+}
+
+TEST_F(ConfigTest, ExecMaxOutputBytesAccessorReflectsUpdate)
+{
+    taz_v1_ConfigurationUpdateRequest req =
+        taz_v1_ConfigurationUpdateRequest_init_zero;
+    req.config_count = 1;
+    std::strncpy(req.config[0].key, "exec.max_output_bytes",
+                 sizeof(req.config[0].key) - 1);
+    std::strncpy(req.config[0].value, "1000", sizeof(req.config[0].value) - 1);
+
+    taz_v1_ConfigurationUpdateResponse resp;
+    taz_config_update(&req, &resp);
+    ASSERT_EQ(resp.applied_count, 1);
+
+    EXPECT_EQ(taz_config_exec_max_output_bytes(), 1000U);
+}
+
+TEST_F(ConfigTest, ExecMaxOutputBytesAccessorAfterResetIsDefault)
+{
+    taz_v1_ConfigurationUpdateRequest req =
+        taz_v1_ConfigurationUpdateRequest_init_zero;
+    req.config_count = 1;
+    std::strncpy(req.config[0].key, "exec.max_output_bytes",
+                 sizeof(req.config[0].key) - 1);
+    std::strncpy(req.config[0].value, "1000", sizeof(req.config[0].value) - 1);
+
+    taz_v1_ConfigurationUpdateResponse resp;
+    taz_config_update(&req, &resp);
+    ASSERT_EQ(resp.applied_count, 1);
+
+    taz_config_reset();
+
+    EXPECT_EQ(taz_config_exec_max_output_bytes(), 1048576U);
+}
+
+TEST_F(ConfigTest, ExecMaxOutputBytesAccessorUnchangedAfterRejectedUpdate)
+{
+    taz_v1_ConfigurationUpdateRequest req =
+        taz_v1_ConfigurationUpdateRequest_init_zero;
+    req.config_count = 1;
+    std::strncpy(req.config[0].key, "exec.max_output_bytes",
+                 sizeof(req.config[0].key) - 1);
+    std::strncpy(req.config[0].value, "abc", sizeof(req.config[0].value) - 1);
+
+    taz_v1_ConfigurationUpdateResponse resp;
+    taz_config_update(&req, &resp);
+    ASSERT_EQ(resp.rejected_count, 1);
+
+    EXPECT_EQ(taz_config_exec_max_output_bytes(), 1048576U);
+}
+
 } // namespace

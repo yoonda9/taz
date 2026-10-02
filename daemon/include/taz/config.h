@@ -27,6 +27,12 @@ extern "C"
     void taz_config_update(const taz_v1_ConfigurationUpdateRequest *req,
                            taz_v1_ConfigurationUpdateResponse *out);
 
+    /* Typed accessor for the "exec.max_output_bytes" config key. Parses the
+     * stored, already-validated string; the key is always present and
+     * always a valid positive decimal uint32 (enforced by
+     * taz_config_update), so this never fails. */
+    size_t taz_config_exec_max_output_bytes(void);
+
 #ifdef __cplusplus
 }
 #endif

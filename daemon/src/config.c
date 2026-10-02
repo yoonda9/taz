@@ -237,3 +237,13 @@ void taz_config_update(const taz_v1_ConfigurationUpdateRequest *req,
         append_applied(out, e->key);
     }
 }
+
+size_t taz_config_exec_max_output_bytes(void)
+{
+    const config_entry_t *e = find_entry("exec.max_output_bytes");
+    if (e == NULL)
+    {
+        return 0;
+    }
+    return (size_t)strtoull(e->value, NULL, DECIMAL_BASE);
+}
