@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "handlers/command.h"
 #include "handlers/config.h"
 #include "handlers/version.h"
 #include "taz/error.h"
@@ -146,24 +147,6 @@ static void handle_ping(const taz_frame_header_t *header,
                        header->stream_id, NULL, 0U, write_fn, ctx);
 }
 
-/* Placeholder for the real COMMAND_EXEC handler: registers the opcode as
- * async (so the dispatch table and taz_dispatch_frame's loop-availability
- * check are both exercised) without yet decoding a request or spawning
- * anything. Closes the stream itself, exactly as a real async handler must
- * once it is done, so it never leaks a slot if reached with a usable loop. */
-static void handle_command_exec_placeholder(taz_dispatch_t *d,
-                                            const taz_frame_header_t *header,
-                                            const uint8_t *payload,
-                                            taz_dispatch_write_fn_t write_fn,
-                                            void *ctx)
-{
-    (void)payload;
-    send_error(header->stream_id, header->opcode,
-               taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
-               "COMMAND_EXEC not yet available", write_fn, ctx);
-    taz_dispatch_stream_done(d, header->stream_id);
-}
-
 /* --------------------------------------------------------------------------
  * Opcode dispatch table
  * -------------------------------------------------------------------------- */
@@ -201,8 +184,8 @@ static const opcode_entry_t OPCODE_TABLE[] = {
      (uint16_t)taz_v1_Opcode_OPCODE_CONFIGURATION_GET, false},
     {handle_configuration_update, NULL,
      (uint16_t)taz_v1_Opcode_OPCODE_CONFIGURATION_UPDATE, false},
-    {NULL, handle_command_exec_placeholder,
-     (uint16_t)taz_v1_Opcode_OPCODE_COMMAND_EXEC, true},
+    {NULL, handle_command_exec, (uint16_t)taz_v1_Opcode_OPCODE_COMMAND_EXEC,
+     true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))

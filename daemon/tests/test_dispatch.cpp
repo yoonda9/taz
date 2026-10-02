@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@
 #include "taz/dispatch.h"
 #include "taz/exec.h"
 #include "taz/frame.h"
+#include "taz/v1/command.pb.h"
 #include "taz/v1/common.pb.h"
 #include "taz/v1/daemon_control.pb.h"
 
@@ -60,6 +62,76 @@ bool DecodeErrorInfo(const std::vector<uint8_t> &frame, taz_v1_ErrorInfo *out)
         frame.data() + TAZ_FRAME_HEADER_SIZE,
         frame.size() - static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
     return pb_decode(&stream, taz_v1_ErrorInfo_fields, out);
+}
+
+std::string SelfExePath()
+{
+    char buf[4096];
+    size_t size = sizeof(buf);
+    if (uv_exepath(buf, &size) != 0)
+    {
+        return std::string();
+    }
+    return std::string(buf, size);
+}
+
+std::vector<uint8_t>
+CommandExecRequestBytes(const std::string &command,
+                        const std::vector<std::string> &args = {},
+                        const char *as_user = "")
+{
+    // Heap-allocated: the real struct is ~40 KiB (see test_command.cpp).
+    auto req = std::make_unique<taz_v1_CommandExecRequest>();
+    (void)std::strncpy(req->command, command.c_str(),
+                       sizeof(req->command) - 1U);
+    req->args_count = static_cast<pb_size_t>(args.size());
+    for (size_t i = 0U; i < args.size(); i++)
+    {
+        (void)std::strncpy(req->args[i], args[i].c_str(),
+                           sizeof(req->args[i]) - 1U);
+    }
+    (void)std::strncpy(req->as_user, as_user, sizeof(req->as_user) - 1U);
+
+    std::vector<uint8_t> buf(taz_v1_CommandExecRequest_size);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(
+        pb_encode(&ostream, taz_v1_CommandExecRequest_fields, req.get()));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
+bool CollectBytesCb(pb_istream_t *stream, const pb_field_iter_t * /*f*/,
+                    void **arg)
+{
+    auto *out = static_cast<std::string *>(*arg);
+    uint8_t buf[256];
+    while (stream->bytes_left > 0U)
+    {
+        const size_t n =
+            stream->bytes_left < sizeof(buf) ? stream->bytes_left : sizeof(buf);
+        if (!pb_read(stream, buf, n))
+        {
+            return false;
+        }
+        out->append(reinterpret_cast<const char *>(buf), n);
+    }
+    return true;
+}
+
+bool DecodeExecResponse(const std::vector<uint8_t> &frame,
+                        taz_v1_CommandExecResponse *out,
+                        std::string *stdout_out)
+{
+    if (frame.size() < static_cast<size_t>(TAZ_FRAME_HEADER_SIZE))
+    {
+        return false;
+    }
+    out->stdout_data.funcs.decode = CollectBytesCb;
+    out->stdout_data.arg = stdout_out;
+    pb_istream_t stream = pb_istream_from_buffer(
+        frame.data() + TAZ_FRAME_HEADER_SIZE,
+        frame.size() - static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+    return pb_decode(&stream, taz_v1_CommandExecResponse_fields, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +324,7 @@ TEST(Dispatch, CommandExecWithoutLoopProducesInternalErrorAndStaysClosed)
     EXPECT_EQ(d.active_count, 0U);
 }
 
-TEST(Dispatch, CommandExecWithLoopExercisesPlaceholderThroughDispatchFrame)
+TEST(Dispatch, CommandExecRunsRealProcessThroughDispatchFrame)
 {
     uv_loop_t loop;
     ASSERT_EQ(uv_loop_init(&loop), 0);
@@ -262,9 +334,129 @@ TEST(Dispatch, CommandExecWithLoopExercisesPlaceholderThroughDispatchFrame)
     d.loop = &loop;
     WriteCtx wctx;
 
+    const std::string exe = SelfExePath();
+    ASSERT_FALSE(exe.empty());
+    const auto payload =
+        CommandExecRequestBytes(exe, {"--gtest_filter=NoSuchSuite.*"});
+
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   13U, static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    // The handler returns once the process is spawned, well before it has
+    // exited: no frame written yet, and the stream stays open.
+    EXPECT_TRUE(wctx.frames.empty());
+    EXPECT_EQ(d.active_count, 1U);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    // on_done fired: exactly one RESPONSE, and the stream closed itself.
+    EXPECT_EQ(d.active_count, 0U);
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    const auto &frame = wctx.frames[0];
+    const auto resp = UnpackHeader(frame);
+    EXPECT_EQ(resp.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(resp.stream_id, 13U);
+
+    taz_v1_CommandExecResponse decoded = taz_v1_CommandExecResponse_init_zero;
+    std::string stdout_bytes;
+    ASSERT_TRUE(DecodeExecResponse(frame, &decoded, &stdout_bytes));
+    EXPECT_EQ(decoded.exit_code, 0);
+    EXPECT_FALSE(decoded.timed_out);
+    EXPECT_FALSE(stdout_bytes.empty());
+}
+
+TEST(Dispatch, CommandExecWithAsUserIsNotSupported)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    const auto payload = CommandExecRequestBytes(SelfExePath(), {}, "someone");
+
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   21U, static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    // Rejected synchronously, before any process is spawned.
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    const auto &frame = wctx.frames[0];
+    const auto resp = UnpackHeader(frame);
+    EXPECT_EQ(resp.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+    EXPECT_EQ(resp.stream_id, 21U);
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    ASSERT_TRUE(DecodeErrorInfo(frame, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_SUPPORTED);
+    EXPECT_EQ(d.active_count, 0U);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(Dispatch, CommandExecNonexistentCommandMapsToNotFound)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    const auto payload =
+        CommandExecRequestBytes("/no/such/taz-test-binary-xyz", {});
+
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   27U, static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    // uv_spawn fails synchronously for a missing executable.
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    const auto &frame = wctx.frames[0];
+    const auto resp = UnpackHeader(frame);
+    EXPECT_EQ(resp.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+    EXPECT_EQ(resp.stream_id, 27U);
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    ASSERT_TRUE(DecodeErrorInfo(frame, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+    EXPECT_EQ(d.active_count, 0U);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(Dispatch, CommandExecEmptyPayloadIsInvalidRequest)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    WriteCtx wctx;
+
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    d.loop = &loop;
+
     const taz_frame_header_t h = MakeHeader(
         static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
-        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC), 13U);
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC), 33U);
     taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
 
     ASSERT_EQ(wctx.frames.size(), 1U);
@@ -272,15 +464,10 @@ TEST(Dispatch, CommandExecWithLoopExercisesPlaceholderThroughDispatchFrame)
     const auto resp = UnpackHeader(frame);
     EXPECT_EQ(resp.type,
               static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
-    EXPECT_EQ(resp.stream_id, 13U);
 
     taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
     ASSERT_TRUE(DecodeErrorInfo(frame, &err));
-    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INTERNAL);
-
-    // Proves stream_add -> async_fn -> stream_done works through the real
-    // taz_dispatch_frame entrypoint with a usable loop, not just via manual
-    // active_streams manipulation: the slot must be free again afterward.
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
     EXPECT_EQ(d.active_count, 0U);
 
     ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
