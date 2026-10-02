@@ -24,6 +24,11 @@ extern "C"
     typedef void (*taz_dispatch_write_fn_t)(const uint8_t *data, size_t len,
                                             void *ctx);
 
+    /* Pins/unpins the owning connection alive on behalf of an in-flight
+     * async handler. ctx is conn_ctx below (the taz_conn_t * in
+     * production). */
+    typedef void (*taz_dispatch_conn_ref_fn_t)(void *ctx);
+
     /* Per-connection dispatch state. */
     typedef struct taz_dispatch_s
     {
@@ -38,6 +43,15 @@ extern "C"
          * connection.c right after taz_dispatch_init; left NULL by
          * taz_dispatch_init itself, which is what pure unit tests see. */
         uv_loop_t *loop;
+        /* conn_ref/conn_unref pin the owning connection alive for the
+         * duration of an in-flight async handler (e.g. COMMAND_EXEC's
+         * exec), so the connection can only be freed once every such
+         * handler has finished. Set alongside loop by connection.c; left
+         * NULL by taz_dispatch_init, in which case taz_dispatch_conn_ref/
+         * _unref are no-ops, which is what pure unit tests see. */
+        taz_dispatch_conn_ref_fn_t conn_ref;
+        taz_dispatch_conn_ref_fn_t conn_unref;
+        void *conn_ctx;
     } taz_dispatch_t;
 
     /* Initialise a dispatch context to the empty state. */
@@ -72,6 +86,12 @@ extern "C"
      * Streams stay active until their own on_done fires
      * taz_dispatch_stream_done, same as any other cancellation. */
     void taz_dispatch_cancel_all(taz_dispatch_t *d);
+
+    /* Pin/unpin the owning connection alive for an in-flight async handler.
+     * No-ops when d->conn_ref/conn_unref is NULL (a pure unit-test
+     * dispatch with no connection.c behind it). */
+    void taz_dispatch_conn_ref(taz_dispatch_t *d);
+    void taz_dispatch_conn_unref(taz_dispatch_t *d);
 
     /* True if opcode's handler manages its own stream lifetime (does not get
      * closed automatically by taz_dispatch_frame); false for synchronous and

@@ -26,6 +26,11 @@ static void on_close_cb(uv_handle_t *handle);
  * Reference counting
  * ------------------------------------------------------------------------- */
 
+static void conn_ref(taz_conn_t *conn)
+{
+    conn->refcount++;
+}
+
 static void conn_unref(taz_conn_t *conn)
 {
     conn->refcount--;
@@ -33,6 +38,20 @@ static void conn_unref(taz_conn_t *conn)
     {
         free(conn);
     }
+}
+
+/* taz_dispatch_conn_ref_fn_t adapters: taz_dispatch_t only knows conn_ctx
+ * as a void *, so handlers (e.g. command.c) never cast it to taz_conn_t *
+ * themselves - that keeps them working against a non-conn ctx in unit
+ * tests, where conn_ref/conn_unref stay NULL and these are never called. */
+static void dispatch_conn_ref_cb(void *ctx)
+{
+    conn_ref((taz_conn_t *)ctx);
+}
+
+static void dispatch_conn_unref_cb(void *ctx)
+{
+    conn_unref((taz_conn_t *)ctx);
 }
 
 static void on_write_done(uv_write_t *req, int status)
@@ -50,8 +69,9 @@ static void on_close_cb(uv_handle_t *handle)
     conn_unref(conn);
 }
 
-/* Initiate teardown: stop reads and close the TCP handle.  Must be called
- * from the libuv loop thread and is idempotent. */
+/* Initiate teardown: stop reads, kill every in-flight exec's process tree,
+ * and close the TCP handle.  Must be called from the libuv loop thread and
+ * is idempotent. */
 static void conn_close(taz_conn_t *conn)
 {
     if (conn->closing)
@@ -60,6 +80,10 @@ static void conn_close(taz_conn_t *conn)
     }
     conn->closing = 1;
     uv_read_stop((uv_stream_t *)&conn->handle);
+    /* Each cancelled exec still finishes normally later (on_exec_done), at
+     * which point conn_write_fn's closing guard below makes the response a
+     * no-op and the exec's own conn_unref lets this connection be freed. */
+    taz_dispatch_cancel_all(&conn->dispatch);
     uv_close((uv_handle_t *)&conn->handle, on_close_cb);
 }
 
@@ -91,7 +115,7 @@ static void conn_write_fn(const uint8_t *data, size_t len, void *ctx)
     (void)memcpy(frame_data, data, len);
 
     buf = uv_buf_init((char *)frame_data, (unsigned int)len);
-    conn->refcount++;
+    conn_ref(conn);
     rc = uv_write(&wr->req, (uv_stream_t *)&conn->handle, &buf, 1U,
                   on_write_done);
     if (rc != 0)
@@ -259,6 +283,9 @@ void taz_conn_on_new_connection(uv_stream_t *server, int status)
     taz_dispatch_init(&conn->dispatch);
     loop = uv_handle_get_loop((uv_handle_t *)server);
     conn->dispatch.loop = loop;
+    conn->dispatch.conn_ref = dispatch_conn_ref_cb;
+    conn->dispatch.conn_unref = dispatch_conn_unref_cb;
+    conn->dispatch.conn_ctx = conn;
 
     rc = uv_tcp_init(loop, &conn->handle);
     if (rc != 0)

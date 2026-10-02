@@ -32,6 +32,10 @@ static void on_exec_done(const taz_exec_result_t *result, void *arg)
     taz_command_send_exec_response(ectx->write_fn, ectx->write_ctx,
                                    ectx->stream_id, ectx->opcode, result);
     taz_dispatch_stream_done(ectx->d, ectx->stream_id);
+    /* Matches the taz_dispatch_conn_ref taken in handle_command_exec right
+     * after a successful taz_exec_start; this is the last point this
+     * handler ever touches the connection. */
+    taz_dispatch_conn_unref(ectx->d);
     free(ectx);
 }
 
@@ -155,6 +159,10 @@ void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
         return;
     }
 
+    /* The exec now owns a reference on the connection until on_exec_done
+     * unrefs it, so a client disconnect can never free the connection out
+     * from under this in-flight process. */
+    taz_dispatch_conn_ref(d);
     taz_dispatch_set_stream_exec(d, header->stream_id, exec_handle);
 }
 

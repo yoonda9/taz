@@ -84,6 +84,22 @@ void taz_dispatch_cancel_all(taz_dispatch_t *d)
     }
 }
 
+void taz_dispatch_conn_ref(taz_dispatch_t *d)
+{
+    if (d->conn_ref != NULL)
+    {
+        d->conn_ref(d->conn_ctx);
+    }
+}
+
+void taz_dispatch_conn_unref(taz_dispatch_t *d)
+{
+    if (d->conn_unref != NULL)
+    {
+        d->conn_unref(d->conn_ctx);
+    }
+}
+
 /* --------------------------------------------------------------------------
  * Frame-writing helpers
  * -------------------------------------------------------------------------- */

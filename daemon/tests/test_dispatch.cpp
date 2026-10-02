@@ -549,6 +549,161 @@ TEST(Dispatch, CancelAllCancelsEveryRegisteredExec)
 }
 
 // ---------------------------------------------------------------------------
+// taz_dispatch_conn_ref/_unref: connection-lifetime hooks for an in-flight
+// exec (step-03:conn-lifetime). connection.c wires these to the real
+// taz_conn_t; here they are exercised directly against a plain counter.
+// ---------------------------------------------------------------------------
+
+void CountRef(void *ctx)
+{
+    *static_cast<int *>(ctx) += 1;
+}
+
+void CountUnref(void *ctx)
+{
+    *static_cast<int *>(ctx) -= 1;
+}
+
+TEST(Dispatch, ConnRefUnrefNoOpWhenUnset)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(
+        &d); // conn_ref/conn_unref NULL: a pure unit-test dispatch.
+
+    // Must not crash or dereference the NULL conn_ctx.
+    taz_dispatch_conn_ref(&d);
+    taz_dispatch_conn_unref(&d);
+}
+
+TEST(Dispatch, ConnRefUnrefCallThroughWithCtx)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    int counter = 0;
+    d.conn_ref = CountRef;
+    d.conn_unref = CountUnref;
+    d.conn_ctx = &counter;
+
+    taz_dispatch_conn_ref(&d);
+    taz_dispatch_conn_ref(&d);
+    EXPECT_EQ(counter, 2);
+    taz_dispatch_conn_unref(&d);
+    EXPECT_EQ(counter, 1);
+}
+
+TEST(Dispatch, CommandExecRefsConnWhileInFlightAndUnrefsOnDone)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    int counter = 0;
+    d.conn_ref = CountRef;
+    d.conn_unref = CountUnref;
+    d.conn_ctx = &counter;
+    WriteCtx wctx;
+
+    const std::string exe = SelfExePath();
+    ASSERT_FALSE(exe.empty());
+    const auto payload =
+        CommandExecRequestBytes(exe, {"--gtest_filter=NoSuchSuite.*"});
+
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   51U, static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    // handle_command_exec refs the connection right after the spawn
+    // succeeds, before the process has had any chance to exit.
+    EXPECT_EQ(counter, 1);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    // on_exec_done unrefs exactly once, after the response is sent and the
+    // stream is closed.
+    EXPECT_EQ(counter, 0);
+    EXPECT_EQ(d.active_count, 0U);
+    ASSERT_EQ(wctx.frames.size(), 1U);
+}
+
+TEST(Dispatch, CommandExecSpawnFailureDoesNotRefConn)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    int counter = 0;
+    d.conn_ref = CountRef;
+    d.conn_unref = CountUnref;
+    d.conn_ctx = &counter;
+    WriteCtx wctx;
+
+    const auto payload =
+        CommandExecRequestBytes("/no/such/taz-test-binary-xyz", {});
+
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   52U, static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    // uv_spawn fails synchronously: no exec ever started, so no ref taken.
+    EXPECT_EQ(counter, 0);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(Dispatch, CancelAllUnrefsConnViaOnDoneAfterCancellation)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    int counter = 0;
+    d.conn_ref = CountRef;
+    d.conn_unref = CountUnref;
+    d.conn_ctx = &counter;
+    WriteCtx wctx;
+
+    // A real COMMAND_EXEC request for the long-lived sleeper helper, routed
+    // through taz_dispatch_frame exactly as handle_command_exec sees it in
+    // production.
+    const auto payload = CommandExecRequestBytes(TAZ_TEST_SLEEPER_PATH, {});
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   53U, static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    EXPECT_EQ(counter, 1);
+    EXPECT_EQ(d.active_count, 1U);
+
+    // Mirrors conn_close(): connection.c cancels every in-flight exec
+    // before tearing the TCP handle down.
+    taz_dispatch_cancel_all(&d);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    // on_done still fired exactly once for the cancelled exec, closing the
+    // stream and releasing the connection reference the real handler took.
+    EXPECT_EQ(d.active_count, 0U);
+    EXPECT_EQ(counter, 0);
+}
+
+// ---------------------------------------------------------------------------
 // OVERSIZED verdict → no-op (no write, no stream opened)
 // ---------------------------------------------------------------------------
 

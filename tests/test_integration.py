@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import re
+import sys
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 from google.protobuf import empty_pb2
 from taz.c3 import TazClient, TazConnectionLost, TazError
-from taz.v1 import common_pb2, daemon_control_pb2
+from taz.v1 import command_pb2, common_pb2, daemon_control_pb2
 
 from tests.conftest import Daemon
 
@@ -71,6 +73,57 @@ class TestConnectionLost:
             with pytest.raises(TazConnectionLost) as exc_info:
                 client.version()
             assert isinstance(exc_info.value.__cause__, TazConnectionLost)
+
+
+class TestConnectionLifetime:
+    """Closing a client mid-exec kills its process tree without blocking
+    other connections or leaving the daemon's connection state corrupt."""
+
+    def test_closing_socket_during_exec_kills_tree_and_connection_stays_usable(
+        self, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        pid_file = tmp_path / "pid.txt"
+        # No shell, per convention: the child reports its own pid via a file
+        # (the client never reads the COMMAND_EXEC response in this test).
+        snippet = (
+            "import os, pathlib, time; "
+            f"pathlib.Path(r'{pid_file}').write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        )
+        req = command_pb2.CommandExecRequest(
+            command=sys.executable, args=["-c", snippet]
+        )
+
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        # Bypass CommandNamespace (Step 04, not landed yet): send the raw
+        # REQUEST and never read its response, simulating an abrupt client
+        # disconnect while COMMAND_EXEC is in flight.
+        victim._conn.send_request(
+            common_pb2.OPCODE_COMMAND_EXEC, req.SerializeToString()
+        )
+
+        deadline = time.monotonic() + 10
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert pid_file.exists(), "child never started"
+        pid = int(pid_file.read_text())
+        assert psutil.pid_exists(pid)
+
+        # Abrupt teardown: close the socket without waiting for a RESPONSE.
+        victim.close()
+
+        # The dangling exec must not block a second, unrelated connection.
+        with TazClient("127.0.0.1", daemon.port) as other:
+            start = time.monotonic()
+            other.version()
+            assert time.monotonic() - start < 2.0
+
+        # conn_close cancels every in-flight exec's whole process tree.
+        deadline = time.monotonic() + 10
+        while psutil.pid_exists(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not psutil.pid_exists(pid)
 
 
 class TestConfigGet:
