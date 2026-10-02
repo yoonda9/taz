@@ -1,8 +1,13 @@
 #ifndef TAZ_EXEC_H
 #define TAZ_EXEC_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include <uv.h>
+
+#include "taz/v1/common.pb.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -49,6 +54,54 @@ extern "C"
     /* Free the buffers owned by *cap. Safe to call on a capture that was
      * initialized but never appended to. */
     void taz_exec_capture_free(taz_exec_capture_t *cap);
+
+    /* Opaque, heap-allocated handle for one spawned process. Owned entirely
+     * by exec.c; callers only ever see a pointer to it. */
+    typedef struct taz_exec_s taz_exec_t;
+
+    /* Describes a process to spawn. The engine copies everything it needs
+     * out of *spec before taz_exec_start returns, so the pointers inside it
+     * (including file/args/env/cwd strings) only need to stay valid for the
+     * duration of that call. */
+    typedef struct
+    {
+        const char *file;        /* command to run */
+        const char *const *args; /* arguments, WITHOUT argv[0] */
+        size_t args_count;
+        const taz_v1_KeyValue *env; /* extra variables, merged over the
+                                     * daemon's own environment */
+        size_t env_count;
+        const char *cwd;     /* NULL/"" = daemon's cwd */
+        uint32_t timeout_ms; /* 0 = none */
+        size_t max_output_bytes;
+    } taz_exec_spec_t;
+
+    /* Outcome of a finished exec. out/err point into buffers owned by the
+     * taz_exec_t and are valid only for the duration of the taz_exec_done_fn
+     * call they are passed to. */
+    typedef struct
+    {
+        int64_t exit_status;
+        int term_signal;
+        const uint8_t *out;
+        size_t out_len;
+        const uint8_t *err;
+        size_t err_len;
+        bool timed_out;
+        bool truncated;
+        bool cancelled;
+    } taz_exec_result_t;
+
+    typedef void (*taz_exec_done_fn)(const taz_exec_result_t *result,
+                                     void *arg);
+
+    /* Start *spec on loop. Returns 0 on success, in which case *out receives
+     * the new handle and on_done will fire exactly once, later, from the
+     * loop. Returns a UV_E* code on spawn failure, in which case on_done
+     * never fires, *out is untouched, and nothing is leaked (any partially
+     * initialized handles are closed internally). */
+    int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
+                       taz_exec_done_fn on_done, void *arg, taz_exec_t **out);
 
 #ifdef __cplusplus
 }
