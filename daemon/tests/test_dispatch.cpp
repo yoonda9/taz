@@ -8,9 +8,11 @@
 #include <gtest/gtest.h>
 #include <pb_decode.h>
 #include <pb_encode.h>
+#include <uv.h>
 
 #include "taz/config.h"
 #include "taz/dispatch.h"
+#include "taz/exec.h"
 #include "taz/frame.h"
 #include "taz/v1/common.pb.h"
 #include "taz/v1/daemon_control.pb.h"
@@ -209,6 +211,119 @@ TEST(Dispatch, DuplicateStreamIdProducesInvalidRequest)
     // Rejection must not mutate the active set.
     EXPECT_EQ(d.active_count, 1U);
     EXPECT_EQ(d.active_streams[0], sid);
+}
+
+// ---------------------------------------------------------------------------
+// Async dispatch: loop requirement, stream lifetime, cancel_all
+// ---------------------------------------------------------------------------
+
+TEST(Dispatch, CommandExecOpcodeIsMarkedAsync)
+{
+    EXPECT_TRUE(taz_dispatch_opcode_is_async(
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC)));
+    EXPECT_FALSE(taz_dispatch_opcode_is_async(
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION)));
+    EXPECT_FALSE(taz_dispatch_opcode_is_async(0xFFFFU));
+}
+
+TEST(Dispatch, CommandExecWithoutLoopProducesInternalErrorAndStaysClosed)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d); // d.loop == NULL: a pure unit-test dispatch.
+    WriteCtx wctx;
+
+    const taz_frame_header_t h = MakeHeader(
+        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC), 11U);
+    taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    const auto &frame = wctx.frames[0];
+    const auto resp = UnpackHeader(frame);
+    EXPECT_EQ(resp.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+    EXPECT_EQ(resp.stream_id, 11U);
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    ASSERT_TRUE(DecodeErrorInfo(frame, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INTERNAL);
+
+    // Rejected before the stream was ever opened.
+    EXPECT_EQ(d.active_count, 0U);
+}
+
+TEST(Dispatch, StreamDoneFreesStreamIdForReuse)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    WriteCtx wctx;
+
+    // Simulate an async handler's stream having just completed.
+    const uint32_t sid = 42U;
+    d.active_streams[0] = sid;
+    d.active_count = 1U;
+    taz_dispatch_stream_done(&d, sid);
+    EXPECT_EQ(d.active_count, 0U);
+
+    // The id is immediately usable again by an ordinary request.
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_VERSION), sid);
+    taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    EXPECT_EQ(UnpackHeader(wctx.frames[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(d.active_count, 0U);
+}
+
+TEST(Dispatch, SetStreamExecIsNoOpWhenStreamNotActive)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+
+    // No stream is active, so this must not create one or dereference the
+    // bogus pointer; cancel_all must then have nothing to walk.
+    taz_dispatch_set_stream_exec(&d, 99U, reinterpret_cast<taz_exec_t *>(1));
+    EXPECT_EQ(d.active_count, 0U);
+    taz_dispatch_cancel_all(&d);
+}
+
+void RecordCancelled(const taz_exec_result_t *result, void *arg)
+{
+    auto *cancelled = static_cast<bool *>(arg);
+    *cancelled = result->cancelled;
+}
+
+TEST(Dispatch, CancelAllCancelsEveryRegisteredExec)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+
+    bool cancelled = false;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(&loop, &spec, RecordCancelled, &cancelled, &x), 0);
+
+    // Simulate what an async handler does once taz_exec_start succeeds:
+    // open the stream, then register the exec against it.
+    d.active_streams[0] = 7U;
+    d.active_count = 1U;
+    taz_dispatch_set_stream_exec(&d, 7U, x);
+
+    taz_dispatch_cancel_all(&d);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    EXPECT_TRUE(cancelled);
 }
 
 // ---------------------------------------------------------------------------

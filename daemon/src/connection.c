@@ -239,6 +239,7 @@ static void send_capability(taz_conn_t *conn)
 void taz_conn_on_new_connection(uv_stream_t *server, int status)
 {
     taz_conn_t *conn;
+    uv_loop_t *loop;
     int rc;
 
     if (status < 0)
@@ -256,8 +257,10 @@ void taz_conn_on_new_connection(uv_stream_t *server, int status)
     conn->refcount = 1U;
     taz_reassembly_init(&conn->reassembly);
     taz_dispatch_init(&conn->dispatch);
+    loop = uv_handle_get_loop((uv_handle_t *)server);
+    conn->dispatch.loop = loop;
 
-    rc = uv_tcp_init(uv_handle_get_loop((uv_handle_t *)server), &conn->handle);
+    rc = uv_tcp_init(loop, &conn->handle);
     if (rc != 0)
     {
         free(conn);

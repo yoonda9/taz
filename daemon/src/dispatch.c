@@ -37,6 +37,7 @@ static int stream_add(taz_dispatch_t *d, uint32_t id)
         return 0;
     }
     d->active_streams[d->active_count] = id;
+    d->stream_execs[d->active_count] = NULL;
     d->active_count++;
     return 1;
 }
@@ -50,7 +51,34 @@ void taz_dispatch_stream_done(taz_dispatch_t *d, uint32_t stream_id)
         {
             d->active_count--;
             d->active_streams[i] = d->active_streams[d->active_count];
+            d->stream_execs[i] = d->stream_execs[d->active_count];
             return;
+        }
+    }
+}
+
+void taz_dispatch_set_stream_exec(taz_dispatch_t *d, uint32_t stream_id,
+                                  taz_exec_t *exec)
+{
+    size_t i;
+    for (i = 0U; i < d->active_count; ++i)
+    {
+        if (d->active_streams[i] == stream_id)
+        {
+            d->stream_execs[i] = exec;
+            return;
+        }
+    }
+}
+
+void taz_dispatch_cancel_all(taz_dispatch_t *d)
+{
+    size_t i;
+    for (i = 0U; i < d->active_count; ++i)
+    {
+        if (d->stream_execs[i] != NULL)
+        {
+            taz_exec_cancel(d->stream_execs[i]);
         }
     }
 }
@@ -118,26 +146,63 @@ static void handle_ping(const taz_frame_header_t *header,
                        header->stream_id, NULL, 0U, write_fn, ctx);
 }
 
+/* Placeholder for the real COMMAND_EXEC handler: registers the opcode as
+ * async (so the dispatch table and taz_dispatch_frame's loop-availability
+ * check are both exercised) without yet decoding a request or spawning
+ * anything. Closes the stream itself, exactly as a real async handler must
+ * once it is done, so it never leaks a slot if reached with a usable loop. */
+static void handle_command_exec_placeholder(taz_dispatch_t *d,
+                                            const taz_frame_header_t *header,
+                                            const uint8_t *payload,
+                                            taz_dispatch_write_fn_t write_fn,
+                                            void *ctx)
+{
+    (void)payload;
+    send_error(header->stream_id, header->opcode,
+               taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+               "COMMAND_EXEC not yet available", write_fn, ctx);
+    taz_dispatch_stream_done(d, header->stream_id);
+}
+
 /* --------------------------------------------------------------------------
  * Opcode dispatch table
  * -------------------------------------------------------------------------- */
 
-typedef void (*handler_fn_t)(const taz_frame_header_t *header,
-                             const uint8_t *payload,
-                             taz_dispatch_write_fn_t write_fn, void *ctx);
+/* Synchronous handlers return with their stream already finished;
+ * taz_dispatch_frame closes it for them. */
+typedef void (*sync_handler_fn_t)(const taz_frame_header_t *header,
+                                  const uint8_t *payload,
+                                  taz_dispatch_write_fn_t write_fn, void *ctx);
+
+/* Async handlers receive d so they can read d->loop, register a taz_exec_t *
+ * via taz_dispatch_set_stream_exec, and close their own stream later via
+ * taz_dispatch_stream_done once their response is written. */
+typedef void (*async_handler_fn_t)(taz_dispatch_t *d,
+                                   const taz_frame_header_t *header,
+                                   const uint8_t *payload,
+                                   taz_dispatch_write_fn_t write_fn, void *ctx);
 
 typedef struct
 {
+    sync_handler_fn_t sync_fn;   /* non-NULL iff !is_async */
+    async_handler_fn_t async_fn; /* non-NULL iff is_async */
     uint16_t opcode;
-    handler_fn_t fn;
+    /* When true, taz_dispatch_frame leaves the stream open after async_fn
+     * returns: async_fn owns calling taz_dispatch_stream_done later, once
+     * its response has actually been written. It also requires d->loop to
+     * be set; taz_dispatch_frame reports ERROR INTERNAL without calling
+     * async_fn at all when it is NULL (e.g. a pure unit-test dispatch). */
+    bool is_async;
 } opcode_entry_t;
 
 static const opcode_entry_t OPCODE_TABLE[] = {
-    {(uint16_t)taz_v1_Opcode_OPCODE_VERSION, handle_version},
-    {(uint16_t)taz_v1_Opcode_OPCODE_CONFIGURATION_GET,
-     handle_configuration_get},
-    {(uint16_t)taz_v1_Opcode_OPCODE_CONFIGURATION_UPDATE,
-     handle_configuration_update},
+    {handle_version, NULL, (uint16_t)taz_v1_Opcode_OPCODE_VERSION, false},
+    {handle_configuration_get, NULL,
+     (uint16_t)taz_v1_Opcode_OPCODE_CONFIGURATION_GET, false},
+    {handle_configuration_update, NULL,
+     (uint16_t)taz_v1_Opcode_OPCODE_CONFIGURATION_UPDATE, false},
+    {NULL, handle_command_exec_placeholder,
+     (uint16_t)taz_v1_Opcode_OPCODE_COMMAND_EXEC, true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))
@@ -217,9 +282,17 @@ void taz_dispatch_frame(taz_dispatch_t *d, const taz_frame_header_t *header,
         return;
     }
 
-    /* Open the stream, dispatch to the handler, then close it.  All current
-     * handlers are synchronous; async handlers in future steps will call
-     * taz_dispatch_stream_done themselves and not reach this point. */
+    /* Async opcodes need a loop to spawn their work on; a dispatch without
+     * one (e.g. a pure unit test) can never complete them, so reject before
+     * opening a stream rather than hanging it forever. */
+    if (entry->is_async && d->loop == NULL)
+    {
+        send_error(header->stream_id, header->opcode,
+                   taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+                   "async handler requires a loop", write_fn, ctx);
+        return;
+    }
+
     if (!stream_add(d, header->stream_id))
     {
         send_error(header->stream_id, header->opcode,
@@ -227,6 +300,27 @@ void taz_dispatch_frame(taz_dispatch_t *d, const taz_frame_header_t *header,
                    write_fn, ctx);
         return;
     }
-    entry->fn(header, payload, write_fn, ctx);
-    taz_dispatch_stream_done(d, header->stream_id);
+
+    /* Sync handlers return with their work already done, so the stream
+     * closes here. Async handlers keep it open and close it themselves,
+     * later, once their response has actually been written. */
+    if (entry->is_async)
+    {
+        entry->async_fn(d, header, payload, write_fn, ctx);
+    }
+    else
+    {
+        entry->sync_fn(header, payload, write_fn, ctx);
+        taz_dispatch_stream_done(d, header->stream_id);
+    }
+}
+
+bool taz_dispatch_opcode_is_async(uint16_t opcode)
+{
+    const opcode_entry_t *entry = lookup_opcode(opcode);
+    if (entry == NULL)
+    {
+        return false;
+    }
+    return entry->is_async;
 }

@@ -1,9 +1,13 @@
 #ifndef TAZ_DISPATCH_H
 #define TAZ_DISPATCH_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
+#include <uv.h>
+
+#include "taz/exec.h"
 #include "taz/frame.h"
 
 #ifdef __cplusplus
@@ -24,7 +28,16 @@ extern "C"
     typedef struct taz_dispatch_s
     {
         uint32_t active_streams[TAZ_DISPATCH_MAX_STREAMS];
+        /* stream_execs[i] is the in-flight exec (if any) owning
+         * active_streams[i], kept at the same index; NULL for streams with
+         * no exec (every sync stream, and async streams before the handler
+         * has one to register). */
+        taz_exec_t *stream_execs[TAZ_DISPATCH_MAX_STREAMS];
         size_t active_count;
+        /* Loop async handlers (e.g. COMMAND_EXEC) spawn on. Set by
+         * connection.c right after taz_dispatch_init; left NULL by
+         * taz_dispatch_init itself, which is what pure unit tests see. */
+        uv_loop_t *loop;
     } taz_dispatch_t;
 
     /* Initialise a dispatch context to the empty state. */
@@ -45,8 +58,25 @@ extern "C"
 
     /* Remove stream_id from the active set after an async handler completes.
      * Synchronous handlers (e.g. VERSION) are removed by taz_dispatch_frame
-     * automatically; this is for future async handlers. */
+     * automatically; async handlers (e.g. COMMAND_EXEC) call this themselves
+     * once their response has been written. */
     void taz_dispatch_stream_done(taz_dispatch_t *d, uint32_t stream_id);
+
+    /* Associate exec with stream_id so taz_dispatch_cancel_all can reach it.
+     * A no-op if stream_id is not currently active (e.g. it already
+     * finished). */
+    void taz_dispatch_set_stream_exec(taz_dispatch_t *d, uint32_t stream_id,
+                                      taz_exec_t *exec);
+
+    /* Kill every exec currently registered via taz_dispatch_set_stream_exec.
+     * Streams stay active until their own on_done fires
+     * taz_dispatch_stream_done, same as any other cancellation. */
+    void taz_dispatch_cancel_all(taz_dispatch_t *d);
+
+    /* True if opcode's handler manages its own stream lifetime (does not get
+     * closed automatically by taz_dispatch_frame); false for synchronous and
+     * unknown opcodes. */
+    bool taz_dispatch_opcode_is_async(uint16_t opcode);
 
 #ifdef __cplusplus
 }
