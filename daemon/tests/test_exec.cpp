@@ -1,6 +1,8 @@
 // Unit tests for exec.c/h: the output capture buffer and the taz_exec_start
 // spawn engine.
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -11,6 +13,47 @@
 
 namespace
 {
+
+// Lets the env-merge tests below use this same binary as the spawned child:
+// if TAZ_TEST_ECHO_ENV_VAR is set in the child's environment, print the
+// value of the env var it names and exit immediately, before main()/gtest
+// ever runs — static init order makes this safe regardless of what argv or
+// gtest's own startup would otherwise do with a re-spawned test binary.
+struct EchoEnvOnStartup
+{
+    EchoEnvOnStartup()
+    {
+        const char *var_name = std::getenv("TAZ_TEST_ECHO_ENV_VAR");
+        if (var_name == nullptr)
+        {
+            return;
+        }
+        const char *value = std::getenv(var_name);
+        std::fputs(value != nullptr ? value : "", stdout);
+        std::fflush(stdout);
+        std::exit(0);
+    }
+};
+
+const EchoEnvOnStartup echo_env_on_startup{};
+
+void set_parent_env(const char *name, const char *value)
+{
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+void unset_parent_env(const char *name)
+{
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
 
 class ExecCaptureTest : public ::testing::Test
 {
@@ -251,6 +294,117 @@ TEST_F(ExecSpawnTest, NonexistentCwdReturnsError)
     taz_exec_t *x = nullptr;
     EXPECT_NE(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
     EXPECT_FALSE(outcome.called);
+}
+
+// --- env merge --------------------------------------------------------
+//
+// spec.env entries always include a TAZ_TEST_ECHO_ENV_VAR entry naming the
+// variable the child should echo back on stdout (see EchoEnvOnStartup
+// above), so these tests observe the merged child environment without
+// depending on any external echo/printenv binary.
+
+TEST_F(ExecSpawnTest, ExtraVarIsAddedToChildEnv)
+{
+    taz_v1_KeyValue env[] = {
+        {"TAZ_TEST_ECHO_ENV_VAR", "TAZ_TEST_ADDED_VAR"},
+        {"TAZ_TEST_ADDED_VAR", "added_value"},
+    };
+    taz_exec_spec_t spec{};
+    spec.file = exe_.c_str();
+    spec.env = env;
+    spec.env_count = 2;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.out, "added_value");
+}
+
+TEST_F(ExecSpawnTest, ExtraVarOverridesSameNameEntry)
+{
+    set_parent_env("TAZ_TEST_OVERRIDE_VAR", "original_value");
+
+    taz_v1_KeyValue env[] = {
+        {"TAZ_TEST_ECHO_ENV_VAR", "TAZ_TEST_OVERRIDE_VAR"},
+        {"TAZ_TEST_OVERRIDE_VAR", "overridden_value"},
+    };
+    taz_exec_spec_t spec{};
+    spec.file = exe_.c_str();
+    spec.env = env;
+    spec.env_count = 2;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+
+    unset_parent_env("TAZ_TEST_OVERRIDE_VAR");
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.out, "overridden_value");
+}
+
+#ifndef _WIN32
+// POSIX env names are case-sensitive (unlike Windows, where this same
+// request would be an override — see .ralph/specs/step-5-command-exec/
+// plan.md:91-92), so a differently-cased extra entry must be added
+// alongside the original rather than replacing it.
+TEST_F(ExecSpawnTest, DifferentlyCasedNameIsNotTreatedAsOverrideOnPosix)
+{
+    set_parent_env("TAZ_TEST_CASE_VAR", "original_value");
+
+    taz_v1_KeyValue env[] = {
+        {"TAZ_TEST_ECHO_ENV_VAR", "TAZ_TEST_CASE_VAR"},
+        {"taz_test_case_var", "should_not_override"},
+    };
+    taz_exec_spec_t spec{};
+    spec.file = exe_.c_str();
+    spec.env = env;
+    spec.env_count = 2;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+
+    unset_parent_env("TAZ_TEST_CASE_VAR");
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.out, "original_value");
+}
+#endif
+
+TEST_F(ExecSpawnTest, UnrelatedDaemonEnvVarsSurviveUnchanged)
+{
+    const char *path_value = std::getenv("PATH");
+    ASSERT_NE(path_value, nullptr);
+
+    taz_v1_KeyValue env[] = {
+        {"TAZ_TEST_ECHO_ENV_VAR", "PATH"},
+    };
+    taz_exec_spec_t spec{};
+    spec.file = exe_.c_str();
+    spec.env = env;
+    spec.env_count = 1;
+    spec.max_output_bytes = 1U << 20;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.out, path_value);
 }
 
 } // namespace

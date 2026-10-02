@@ -5,11 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Env var name matching for override/add merge: case-insensitive on
+ * Windows (its environment is case-insensitive), case-sensitive on POSIX. */
 #ifdef _WIN32
-#define TAZ_EXEC_STRCASECMP _stricmp
+#define TAZ_EXEC_ENV_NAME_CMP _stricmp
 #else
-#include <strings.h>
-#define TAZ_EXEC_STRCASECMP strcasecmp
+#define TAZ_EXEC_ENV_NAME_CMP strcmp
 #endif
 
 /* Initial allocation for a stream buffer on its first append. */
@@ -323,7 +324,7 @@ static int build_env(const taz_v1_KeyValue *extra, size_t extra_count,
         int overridden = 0;
         for (size_t j = 0U; j < extra_count; j++)
         {
-            if (TAZ_EXEC_STRCASECMP(base[i].name, extra[j].key) == 0)
+            if (TAZ_EXEC_ENV_NAME_CMP(base[i].name, extra[j].key) == 0)
             {
                 overridden = 1;
                 break;
