@@ -243,6 +243,7 @@ add_library(
     src/error.c
     src/config.c
     src/response.c
+    src/exec.c
     src/server.c
     src/dispatch.c
     src/connection.c
