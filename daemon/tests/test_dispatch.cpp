@@ -252,6 +252,41 @@ TEST(Dispatch, CommandExecWithoutLoopProducesInternalErrorAndStaysClosed)
     EXPECT_EQ(d.active_count, 0U);
 }
 
+TEST(Dispatch, CommandExecWithLoopExercisesPlaceholderThroughDispatchFrame)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    const taz_frame_header_t h = MakeHeader(
+        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC), 13U);
+    taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    const auto &frame = wctx.frames[0];
+    const auto resp = UnpackHeader(frame);
+    EXPECT_EQ(resp.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+    EXPECT_EQ(resp.stream_id, 13U);
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    ASSERT_TRUE(DecodeErrorInfo(frame, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INTERNAL);
+
+    // Proves stream_add -> async_fn -> stream_done works through the real
+    // taz_dispatch_frame entrypoint with a usable loop, not just via manual
+    // active_streams manipulation: the slot must be free again afterward.
+    EXPECT_EQ(d.active_count, 0U);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
 TEST(Dispatch, StreamDoneFreesStreamIdForReuse)
 {
     taz_dispatch_t d;
