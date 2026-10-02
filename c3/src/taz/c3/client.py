@@ -6,6 +6,7 @@ from types import TracebackType
 
 from google.protobuf.message import Message
 
+from taz.c3.command import CommandNamespace
 from taz.c3.connection import Connection
 from taz.c3.errors import TazError
 from taz.c3.protocol.dispatch import Dispatcher
@@ -29,6 +30,7 @@ class TazClient:
         with TazClient("127.0.0.1", 5555) as client:
             client.ping()
             info = client.version()
+            result = client.command.exec("ls", args=["-la", "/tmp"])
     """
 
     def __init__(
@@ -45,6 +47,7 @@ class TazClient:
         self._keepalive = keepalive if keepalive is not None else Keepalive()
         self._conn = Connection(timeout=timeout)
         self._dispatcher = Dispatcher(self._conn, backlog)
+        self.command = CommandNamespace(self)
 
     # ------------------------------------------------------------------
     # Connection lifecycle
