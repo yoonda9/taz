@@ -21,11 +21,15 @@ add_executable(
     test_config.cpp
     test_error.cpp
     test_response.cpp
-    test_exec.cpp)
+    test_exec.cpp
+    test_command.cpp)
 # taz::proto comes in transitively via taz_core; taz_cxx_warnings carries C++
 # warning flags without the C-only -Wstrict-prototypes/-Wmissing-prototypes.
 target_link_libraries(taz_tests PRIVATE taz_core taz_cxx_warnings
                                         GTest::gtest_main)
+# Private handler headers (e.g. handlers/command.h) live under src/, which
+# taz_core does not expose publicly.
+target_include_directories(taz_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(
     taz_tests PRIVATE TAZ_TEST_SLEEPER_PATH="$<TARGET_FILE:taz_test_sleeper>")
 
