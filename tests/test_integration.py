@@ -12,7 +12,7 @@ from pathlib import Path
 import psutil
 import pytest
 from google.protobuf import empty_pb2
-from taz.c3 import CommandResult, TazClient, TazConnectionLost, TazError
+from taz.c3 import CommandResult, Keepalive, TazClient, TazConnectionLost, TazError
 from taz.v1 import command_pb2, common_pb2, daemon_control_pb2
 
 from tests.conftest import Daemon
@@ -282,6 +282,34 @@ class TestCommandExec:
         if error_box:
             raise error_box[0]
         assert result_box[0].exit_code == 0
+
+
+@pytest.mark.slow
+class TestCommandExecSlowKeepalive:
+    """A long, idle-on-the-wire exec must survive the client's own keepalive
+    prober — both with the default prober running and with it disabled.
+
+    Uses dedicated clients rather than ``taz_client`` (idle=60), which is
+    longer than the 40 s exec and so would never exercise a PING."""
+
+    def test_default_keepalive_survives_idle_exec(self, daemon: Daemon) -> None:
+        with TazClient("127.0.0.1", daemon.port) as client:
+            start = time.monotonic()
+            result = client.command.exec(
+                PY, args=_py("import time; time.sleep(40)"), timeout_ms=0
+            )
+            elapsed = time.monotonic() - start
+        assert result.exit_code == 0
+        assert result.timed_out is False
+        assert elapsed >= 40
+
+    def test_keepalive_off_survives_idle_exec(self, daemon: Daemon) -> None:
+        with TazClient("127.0.0.1", daemon.port, keepalive=Keepalive.OFF) as client:
+            result = client.command.exec(
+                PY, args=_py("import time; time.sleep(40)"), timeout_ms=0
+            )
+        assert result.exit_code == 0
+        assert result.timed_out is False
 
 
 class TestConfigGet:
