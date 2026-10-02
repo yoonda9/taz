@@ -196,3 +196,8 @@ win-reset:
 # Destroy the Windows VM
 win-down:
     {{ win }} down
+
+# Rebuild the Windows templates from ISO (`all`, ~1.5 h) or only the TAZ layer (`layer`)
+[unix]
+win-rebuild what="all":
+    uv run python tools/winbuild.py {{ what }}

@@ -1,0 +1,44 @@
+# @@BASE_NAME@@: generic Windows build box template
+
+Disposable Windows Server build/dev VMs for any project: linked-clone this template, start the clone, SSH in. To reset, destroy the clone and clone again. **Lab only: the credentials below are fixed and shared by every clone.**
+
+For warm per-project caches, build a project layer: linked-clone this template, set the project up, shut down, convert the clone to a template (e.g. **@@LAYER@@ `@@LAYER_NAME@@`**). Linked clones and layers depend on this template: never delete or modify it while they exist.
+
+## Source
+- Built @@BUILD_DATE@@ by `just win-rebuild` in the TAZ repo (`tools/winbuild.py`, `tools/winimage/`) from `@@ISO@@`: unattended install, then the toolchain over SSH.
+- No sysprep, no cloud-init: every clone has the same hostname (`@@HOSTNAME@@`), machine SID and SSH host keys. Each clone gets a new MAC and a DHCP address.
+
+## OS
+- @@OS@@, timezone UTC.
+- **Eval licence expires @@EVAL_EXPIRY@@** (every clone shares this date; `slmgr /rearm` once per clone adds 180 days). Run `just win-rebuild` before then.
+- Windows Update notifies only (no automatic reboots). Long paths on. No password complexity or expiry. Defender excludes the VS dirs, `~\.conan2`, and the mise/uv dirs.
+
+## Toolchain (matches GitHub's `windows-2025` runner and the TAZ CI pins)
+- @@VS@@ in `@@VS_PATH@@`: C++ workload, MSVC @@MSVC@@ + ASan, Windows SDK @@SDK@@. No dev-prompt env by default: load it with vswhere + `vcvarsall.bat`.
+- Git @@GIT@@ (system config: `core.longpaths=true`, **`core.autocrlf=true`**; pin LF with `.gitattributes` in your repo).
+- mise @@MISE@@ in `C:\tools\mise\bin` (machine PATH); `%LOCALAPPDATA%\mise\shims` on the user PATH; no tools installed.
+- cppcheck @@CPPCHECK@@ in `C:\Program Files\Cppcheck` (machine PATH).
+- QEMU guest agent, VirtIO drivers, OpenSSH server.
+
+## Hardware
+q35, SeaBIOS, 4 vCPU (host), 8 GB RAM (balloon min 4 GB), SATA 120 GB (SATA on purpose; VirtIO SCSI broke the install), VirtIO NIC on `vmbr0` (DHCP).
+
+## Credentials
+- User **`@@USER@@`** (local admin). Password for `@@USER@@` and the built-in `Administrator`: **`<not filled in: copy WIN_PASSWORD from the TAZ repo .env>`**. sshd accepts password login.
+- SSH sessions are elevated; the default shell is Windows PowerShell 5.1.
+- Authorized key (in `C:\ProgramData\ssh\administrators_authorized_keys`; private key on the Fedora dev VM at `~/.ssh/taz_win_ed25519`):
+  `@@PUBKEY@@`
+  fingerprint `@@PUBKEY_FP@@`
+- SSH host keys (identical on every clone and layer):
+@@HOSTKEY_FPS@@
+
+## Use
+API `https://@@PVE_HOST@@:8006/api2/json`, node `@@NODE@@`, pool `@@POOL@@`; header `Authorization: PVEAPIToken=<id>=<secret>`.
+1. Clone (linked, seconds): `POST /nodes/@@NODE@@/qemu/@@BASE@@/clone` with `newid=<id> name=<name> full=0 pool=@@POOL@@`, then poll `GET /nodes/@@NODE@@/tasks/<upid>/status` until `status=stopped`.
+2. Start: `POST /nodes/@@NODE@@/qemu/<id>/status/start`.
+3. IP: poll `GET /nodes/@@NODE@@/qemu/<id>/agent/network-get-interfaces` until it answers; take the IPv4 that is not `127.*`/`169.254.*`.
+4. SSH: `ssh -o HostKeyAlias=win-build -o UserKnownHostsFile=<file> -i ~/.ssh/taz_win_ed25519 -o IdentitiesOnly=yes @@USER@@@<ip>` (or the password). Every clone has the same host key, so pin it once under an alias instead of per IP; `<file>` holds this line:
+   `@@HOSTKEY_LINE@@`
+5. Code (the VM has no forge credentials; push from your machine): `git init -b main C:/work/<proj>; git -C C:/work/<proj> config receive.denyCurrentBranch updateInstead` on the VM, then `git send-pack --receive-pack='git receive-pack' --force @@USER@@@<ip>:C:/work/<proj> main` (with `GIT_SSH_COMMAND` carrying the options above).
+6. Scripts: `scp` a `.ps1` to the home dir and run `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $HOME\x.ps1` (`~\x.ps1` is not expanded; long `-EncodedCommand` payloads are rejected by sshd).
+7. Reset: `POST /nodes/@@NODE@@/qemu/<id>/status/stop`, then `DELETE /nodes/@@NODE@@/qemu/<id>?purge=1&destroy-unreferenced-disks=1`, then clone again.

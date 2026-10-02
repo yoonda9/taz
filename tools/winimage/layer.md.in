@@ -1,0 +1,26 @@
+# @@LAYER_NAME@@: TAZ Windows build box template
+
+Disposable Windows build VMs for the TAZ repo, with a warm checkout. **From a TAZ checkout, `just win up|ssh|reset|down` and `just win <recipe>` (`tools/win.py`) do everything below**: they clone into VM 9200, rename it `win-9200`, push HEAD, and run the recipe with CI's environment. **Lab only: the credentials below are fixed and shared by every clone.**
+
+## Layers
+- **Base: @@BASE@@ `@@BASE_NAME@@`** (generic Windows build box; OS, toolchain, credentials and API details are in its description). This template is a linked clone of it, so @@BASE@@ must stay while this template or its clones exist.
+- **This layer** (built @@BUILD_DATE@@ by `just win-rebuild`) adds `C:\taz`: git checkout of the private TAZ repo at `@@COMMIT@@`, branch `main` checked out, `receive.denyCurrentBranch=updateInstead`. It has warm mise tools, uv env, Conan packages (`windows-debug` and `windows-asan`) and a built `windows-debug` tree, and `just lint` has been run once. Defender also excludes `C:\taz`.
+- Same OS as the base, **eval expires @@EVAL_EXPIRY@@**. Hostname `@@HOSTNAME@@`.
+
+## Credentials
+- User **`@@USER@@`** (local admin). Password for `@@USER@@` and the built-in `Administrator`: **`<not filled in: copy WIN_PASSWORD from the TAZ repo .env>`**. sshd accepts password login.
+- Key: `@@PUBKEY@@` (`@@PUBKEY_FP@@`); private key on the Fedora dev VM at `~/.ssh/taz_win_ed25519`.
+- Host key (identical on every clone; pin it under an alias): `@@HOSTKEY_LINE@@`
+
+## Manual use
+API `https://@@PVE_HOST@@:8006/api2/json`, node `@@NODE@@`, pool `@@POOL@@`; header `Authorization: PVEAPIToken=<id>=<secret>`.
+1. Clone: `POST /nodes/@@NODE@@/qemu/@@LAYER@@/clone` with `newid=<id> name=<name> full=0 pool=@@POOL@@`, then poll `GET /nodes/@@NODE@@/tasks/<upid>/status`.
+2. Start: `POST /nodes/@@NODE@@/qemu/<id>/status/start`.
+3. IP: poll `GET /nodes/@@NODE@@/qemu/<id>/agent/network-get-interfaces`; take the IPv4 that is not `127.*`/`169.254.*`.
+4. SSH: `ssh -o HostKeyAlias=win-build -o UserKnownHostsFile=<file> -i ~/.ssh/taz_win_ed25519 -o IdentitiesOnly=yes @@USER@@@<ip>`.
+5. Push (`send-pack` skips the local pre-push hook): `GIT_SSH_COMMAND='ssh <options above>' git send-pack --receive-pack='git receive-pack' --force @@USER@@@<ip>:C:/taz HEAD:refs/heads/main`. If it is rejected with "Working directory has unstaged changes", run `git -C C:/taz reset --hard -q` on the VM first.
+6. Build/test like CI, in `C:\taz`: `$env:CI='1'; $env:UV_LOCKED='1'; just doctor; just build; $env:TAZ_DAEMON='daemon/build/windows-debug/tazd.exe'; just test`.
+7. Reset: `POST /nodes/@@NODE@@/qemu/<id>/status/stop`, then `DELETE /nodes/@@NODE@@/qemu/<id>?purge=1&destroy-unreferenced-disks=1`, then clone again.
+
+## Cold start (measured while building this layer on a bare base clone)
+@@TIMINGS@@. This layer skips all of that.

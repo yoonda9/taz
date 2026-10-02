@@ -19,6 +19,7 @@ Settings come from the environment, falling back to the repo's .env:
     TAZ_WIN_TEMPLATE   template VMID (9101)       TAZ_WIN_VMID     clone VMID (9200)
     TAZ_WIN_NODE       Proxmox node (pve)        TAZ_WIN_POOL     pool (taz)
     TAZ_WIN_MEMORY     clone RAM in MB (8192)     TAZ_WIN_KEY      SSH private key
+    WIN_USER           Windows user (user)
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 REMOTE_REPO = "C:/taz"
-SSH_USER = "taz"
 # Every clone shares the template's SSH host key, so it is pinned once under
 # this alias instead of once per DHCP address.
 HOST_KEY_ALIAS = "win-build"
@@ -66,6 +66,8 @@ class Config:
     vmid: int
     memory: int
     key: Path
+    user: str
+    known_hosts: Path = KNOWN_HOSTS
 
     @property
     def vm_path(self) -> str:
@@ -76,21 +78,23 @@ class Config:
         return f"win-{self.vmid}"
 
 
-def load_config() -> Config:
+def setting(name: str, default: str | None = None) -> str:
+    """A setting from the environment, else the repo's .env, else the default."""
     dotenv: dict[str, str] = {}
     env_file = ROOT / ".env"
     if env_file.is_file():
         for line in env_file.read_text().splitlines():
-            name, sep, value = line.strip().partition("=")
-            if sep and not name.startswith("#"):
-                dotenv[name.strip()] = value.strip().strip("'\"")
+            key, sep, raw = line.strip().partition("=")
+            if sep and not key.startswith("#"):
+                dotenv[key.strip()] = raw.strip().strip("'\"")
+    value = os.environ.get(name) or dotenv.get(name) or default
+    if value is None:
+        sys.exit(f"error: {name} is not set (environment or .env)")
+    return value
 
-    def get(name: str, default: str | None = None) -> str:
-        value = os.environ.get(name) or dotenv.get(name) or default
-        if value is None:
-            sys.exit(f"error: {name} is not set (environment or .env)")
-        return value
 
+def load_config() -> Config:
+    get = setting
     return Config(
         api=f"https://{get('PVE_URL')}:8006/api2/json",
         auth=f"PVEAPIToken={get('PVE_TOKEN_ID')}={get('PVE_TOKEN')}",
@@ -100,6 +104,7 @@ def load_config() -> Config:
         vmid=int(get("TAZ_WIN_VMID", "9200")),
         memory=int(get("TAZ_WIN_MEMORY", "8192")),
         key=Path(get("TAZ_WIN_KEY", str(Path.home() / ".ssh" / "taz_win_ed25519"))),
+        user=get("WIN_USER", "user"),
     )
 
 
@@ -107,20 +112,30 @@ def load_config() -> Config:
 # Proxmox API
 # ---------------------------------------------------------------------------
 # The lab Proxmox host serves a self-signed certificate.
-_TLS = ssl.create_default_context()
-_TLS.check_hostname = False
-_TLS.verify_mode = ssl.CERT_NONE
+TLS = ssl.create_default_context()
+TLS.check_hostname = False
+TLS.verify_mode = ssl.CERT_NONE
 
 
 def api(
-    cfg: Config, method: str, path: str, data: dict[str, str | int] | None = None
+    cfg: Config,
+    method: str,
+    path: str,
+    data: dict[str, str | int] | None = None,
+    *,
+    body: bytes | None = None,
+    content_type: str | None = None,
 ) -> Any:
-    body = urllib.parse.urlencode(data).encode() if data else None
+    headers = {"Authorization": cfg.auth}
+    if data:
+        body = urllib.parse.urlencode(data).encode()
+    elif content_type:
+        headers["Content-Type"] = content_type
     request = urllib.request.Request(  # noqa: S310 - https URL built from PVE_URL
-        cfg.api + path, data=body, method=method, headers={"Authorization": cfg.auth}
+        cfg.api + path, data=body, method=method, headers=headers
     )
     try:
-        with urllib.request.urlopen(request, context=_TLS, timeout=30) as response:  # noqa: S310
+        with urllib.request.urlopen(request, context=TLS, timeout=300) as response:  # noqa: S310
             return json.load(response)["data"]
     except urllib.error.HTTPError as err:
         raise ApiError(f"{method} {path}: {err.code} {err.reason}") from None
@@ -141,8 +156,10 @@ def _finished(task: dict[str, Any]) -> str | None:
     return str(task.get("exitstatus")) if task.get("status") == "stopped" else None
 
 
-def wait_for[T](probe: Callable[[], T | None], what: str) -> T:
-    deadline = time.monotonic() + WAIT_SECONDS
+def wait_for[T](
+    probe: Callable[[], T | None], what: str, timeout: int = WAIT_SECONDS
+) -> T:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             value = probe()
@@ -151,7 +168,7 @@ def wait_for[T](probe: Callable[[], T | None], what: str) -> T:
         if value is not None:
             return value
         time.sleep(3)
-    sys.exit(f"error: timed out after {WAIT_SECONDS}s waiting for {what}")
+    sys.exit(f"error: timed out after {timeout}s waiting for {what}")
 
 
 def vm_status(cfg: Config) -> str | None:
@@ -182,14 +199,15 @@ def ssh_options(cfg: Config) -> list[str]:
         "-o", "IdentitiesOnly=yes",
         "-o", "ConnectTimeout=10",
         "-o", f"HostKeyAlias={HOST_KEY_ALIAS}",
-        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "-o", f"UserKnownHostsFile={cfg.known_hosts}",
         "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "HashKnownHosts=no",
     ]  # fmt: skip
 
 
 def ssh(cfg: Config, ip: str, command: str, *, capture: bool = False) -> str | None:
     result = subprocess.run(
-        ["ssh", *ssh_options(cfg), "-o", "BatchMode=yes", f"{SSH_USER}@{ip}", command],
+        ["ssh", *ssh_options(cfg), "-o", "BatchMode=yes", f"{cfg.user}@{ip}", command],
         capture_output=capture,
         text=True,
         check=False,
@@ -260,12 +278,12 @@ def cmd_up(cfg: Config) -> str:
 
         wait_for(renamed, f"{cfg.hostname} to come back")
         ip = wait_for(lambda: guest_ip(cfg), "the guest agent to report an IP")
-    log(t0, f"VM {cfg.vmid} ({cfg.hostname}) ready: ssh {SSH_USER}@{ip}")
+    log(t0, f"VM {cfg.vmid} ({cfg.hostname}) ready: ssh {cfg.user}@{ip}")
     return ip
 
 
-def cmd_run(cfg: Config, args: Sequence[str]) -> int:
-    ip = cmd_up(cfg)
+def push_head(cfg: Config, ip: str) -> int:
+    """Push HEAD to the VM's checked-out `main`, which updates C:\\taz in place."""
     if subprocess.run(
         ["git", "diff", "--quiet", "HEAD"], cwd=ROOT, check=False
     ).returncode:
@@ -278,21 +296,25 @@ def cmd_run(cfg: Config, args: Sequence[str]) -> int:
     # refuses to update a dirty tree. Untracked build trees stay warm.
     ssh(cfg, ip, f"git -C {REMOTE_REPO} reset --hard -q")
     env = dict(os.environ, GIT_SSH_COMMAND=shlex.join(["ssh", *ssh_options(cfg)]))
-    push = subprocess.run(
+    return subprocess.run(
         [
             "git",
             "send-pack",
             "--receive-pack=git receive-pack",
             "--force",
-            f"{SSH_USER}@{ip}:{REMOTE_REPO}",
+            f"{cfg.user}@{ip}:{REMOTE_REPO}",
             "HEAD:refs/heads/main",
         ],
         cwd=ROOT,
         env=env,
         check=False,
-    )
-    if push.returncode:
-        return push.returncode
+    ).returncode
+
+
+def cmd_run(cfg: Config, args: Sequence[str]) -> int:
+    ip = cmd_up(cfg)
+    if code := push_head(cfg, ip):
+        return code
     exports = "; ".join(f"$env:{k}={ps_quote(v)}" for k, v in REMOTE_ENV.items())
     recipe = " ".join(ps_quote(a) for a in args)
     command = (
@@ -301,7 +323,7 @@ def cmd_run(cfg: Config, args: Sequence[str]) -> int:
         f"just {recipe}; exit $LASTEXITCODE"
     )
     return subprocess.run(
-        ["ssh", *ssh_options(cfg), "-o", "BatchMode=yes", f"{SSH_USER}@{ip}", command],
+        ["ssh", *ssh_options(cfg), "-o", "BatchMode=yes", f"{cfg.user}@{ip}", command],
         check=False,
     ).returncode
 
@@ -309,7 +331,7 @@ def cmd_run(cfg: Config, args: Sequence[str]) -> int:
 def cmd_ssh(cfg: Config) -> int:
     ip = cmd_up(cfg)
     return subprocess.run(
-        ["ssh", *ssh_options(cfg), "-t", f"{SSH_USER}@{ip}"], check=False
+        ["ssh", *ssh_options(cfg), "-t", f"{cfg.user}@{ip}"], check=False
     ).returncode
 
 

@@ -10,16 +10,17 @@ the wire spec and protobuf schemas (`rpc/`) are the contract; the C daemon
 
 ## Layout
 
-| Path           | What                                                |
-| -------------- | --------------------------------------------------- |
-| `docs/`        | Requirements, wire protocol, API spec               |
-| `rpc/`         | Protobuf schemas (source of truth for the protocol) |
-| `daemon/`      | C daemon (libuv + nanopb), CMake + Conan build      |
-| `c3/`          | Python client package (`import taz`)                |
-| `tests/`       | Integration tests (daemon + client)                 |
-| `tools/dev.py` | Cross-platform helpers behind `just` recipes        |
-| `tools/win.py` | Disposable Windows VM on Proxmox (`just win*`)      |
-| `justfile`     | Every developer/CI task                             |
+| Path                | What                                                |
+| ------------------- | --------------------------------------------------- |
+| `docs/`             | Requirements, wire protocol, API spec               |
+| `rpc/`              | Protobuf schemas (source of truth for the protocol) |
+| `daemon/`           | C daemon (libuv + nanopb), CMake + Conan build      |
+| `c3/`               | Python client package (`import taz`)                |
+| `tests/`            | Integration tests (daemon + client)                 |
+| `tools/dev.py`      | Cross-platform helpers behind `just` recipes        |
+| `tools/win.py`      | Disposable Windows VM on Proxmox (`just win*`)      |
+| `tools/winbuild.py` | Rebuilds the Windows templates (`tools/winimage/`)  |
+| `justfile`          | Every developer/CI task                             |
 
 ## Build & test
 
@@ -38,6 +39,9 @@ just --list         # everything else
 `just win*` needs the Proxmox token in `.env` (see `tools/win.py`). `just
 win-up` clones the TAZ Windows template (a warm `C:\taz`) into VM 9200;
 `just win-reset` and `just win-down` destroy only a clone tagged `win-clone`.
+`just win-rebuild` reinstalls both templates from ISO, e.g. before the
+Windows eval licence expires; `just win-rebuild layer` refreshes only the
+TAZ layer.
 
 ## Key conventions
 
