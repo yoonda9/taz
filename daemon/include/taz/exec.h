@@ -77,7 +77,7 @@ extern "C"
     } taz_exec_spec_t;
 
     /* Outcome of a finished exec. out/err point into buffers owned by the
-     * taz_exec_t and are valid only for the duration of the taz_exec_done_fn
+     * taz_exec_t and are valid only for the duration of the taz_exec_done_fn_t
      * call they are passed to. */
     typedef struct
     {
@@ -92,8 +92,8 @@ extern "C"
         bool cancelled;
     } taz_exec_result_t;
 
-    typedef void (*taz_exec_done_fn)(const taz_exec_result_t *result,
-                                     void *arg);
+    typedef void (*taz_exec_done_fn_t)(const taz_exec_result_t *result,
+                                       void *arg);
 
     /* Start *spec on loop. Returns 0 on success, in which case *out receives
      * the new handle and on_done will fire exactly once, later, from the
@@ -101,7 +101,7 @@ extern "C"
      * never fires, *out is untouched, and nothing is leaked (any partially
      * initialized handles are closed internally). */
     int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
-                       taz_exec_done_fn on_done, void *arg, taz_exec_t **out);
+                       taz_exec_done_fn_t on_done, void *arg, taz_exec_t **out);
 
     /* Kill x's whole process tree right away and mark the eventual result
      * cancelled. on_done still fires exactly once, later, once the process

@@ -9,6 +9,10 @@
 # - clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
 #   flags every memcpy/memset and asks for the C11 Annex K *_s functions,
 #   which glibc and musl do not provide; bounds are checked at each call.
+# - clang-analyzer-optin.core.EnumCastOutOfRange assumes every enum is a
+#   closed set of values, but libuv's flag enums (e.g. uv_stdio_flags) are
+#   bitmasks meant to be OR-ed together, so combined values are never a
+#   single declared enumerator. False positive for any such bitmask use.
 ---
 Checks: >
   bugprone-*,
@@ -19,6 +23,7 @@ Checks: >
   portability-*,
   readability-*,
   -bugprone-easily-swappable-parameters,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -misc-include-cleaner,
   -readability-identifier-length,

@@ -22,7 +22,7 @@ namespace
 // gtest's own startup would otherwise do with a re-spawned test binary.
 struct EchoEnvOnStartup
 {
-    EchoEnvOnStartup()
+    EchoEnvOnStartup() noexcept
     {
         const char *var_name = std::getenv("TAZ_TEST_ECHO_ENV_VAR");
         if (var_name == nullptr)
@@ -30,8 +30,8 @@ struct EchoEnvOnStartup
             return;
         }
         const char *value = std::getenv(var_name);
-        std::fputs(value != nullptr ? value : "", stdout);
-        std::fflush(stdout);
+        (void)std::fputs(value != nullptr ? value : "", stdout);
+        (void)std::fflush(stdout);
         std::exit(0);
     }
 };
@@ -64,6 +64,12 @@ class ExecCaptureTest : public ::testing::Test
         taz_exec_capture_free(&cap_);
     }
 
+    taz_exec_capture_t *Cap()
+    {
+        return &cap_;
+    }
+
+  private:
     taz_exec_capture_t cap_{};
 };
 
@@ -85,82 +91,82 @@ std::string err_str(const taz_exec_capture_t &cap)
 
 TEST_F(ExecCaptureTest, UnderCapKeepsAllBytes)
 {
-    taz_exec_capture_init(&cap_, 10);
+    taz_exec_capture_init(Cap(), 10);
 
-    append_str(&cap_, TAZ_EXEC_STREAM_OUT, "abc");
+    append_str(Cap(), TAZ_EXEC_STREAM_OUT, "abc");
 
-    EXPECT_EQ(out_str(cap_), "abc");
-    EXPECT_EQ(cap_.err_len, 0U);
-    EXPECT_FALSE(cap_.truncated);
+    EXPECT_EQ(out_str(*Cap()), "abc");
+    EXPECT_EQ(Cap()->err_len, 0U);
+    EXPECT_FALSE(Cap()->truncated);
 }
 
 TEST_F(ExecCaptureTest, ExactlyAtCapIsNotTruncated)
 {
-    taz_exec_capture_init(&cap_, 10);
+    taz_exec_capture_init(Cap(), 10);
 
-    append_str(&cap_, TAZ_EXEC_STREAM_OUT, "0123456789");
+    append_str(Cap(), TAZ_EXEC_STREAM_OUT, "0123456789");
 
-    EXPECT_EQ(cap_.out_len, 10U);
-    EXPECT_FALSE(cap_.truncated);
+    EXPECT_EQ(Cap()->out_len, 10U);
+    EXPECT_FALSE(Cap()->truncated);
 }
 
 TEST_F(ExecCaptureTest, OverCapTruncatesAndStopsGrowth)
 {
-    taz_exec_capture_init(&cap_, 10);
+    taz_exec_capture_init(Cap(), 10);
 
-    append_str(&cap_, TAZ_EXEC_STREAM_OUT, "0123456789ABCDE");
+    append_str(Cap(), TAZ_EXEC_STREAM_OUT, "0123456789ABCDE");
 
-    EXPECT_EQ(cap_.out_len, 10U);
-    EXPECT_EQ(out_str(cap_), "0123456789");
-    EXPECT_TRUE(cap_.truncated);
+    EXPECT_EQ(Cap()->out_len, 10U);
+    EXPECT_EQ(out_str(*Cap()), "0123456789");
+    EXPECT_TRUE(Cap()->truncated);
 }
 
 TEST_F(ExecCaptureTest, CapIsCombinedAcrossOutAndErr)
 {
-    taz_exec_capture_init(&cap_, 10);
+    taz_exec_capture_init(Cap(), 10);
 
-    append_str(&cap_, TAZ_EXEC_STREAM_OUT, "123456");
-    append_str(&cap_, TAZ_EXEC_STREAM_ERR, "abcdef");
+    append_str(Cap(), TAZ_EXEC_STREAM_OUT, "123456");
+    append_str(Cap(), TAZ_EXEC_STREAM_ERR, "abcdef");
 
-    EXPECT_EQ(cap_.out_len, 6U);
-    EXPECT_EQ(cap_.err_len, 4U);
-    EXPECT_EQ(out_str(cap_), "123456");
-    EXPECT_EQ(err_str(cap_), "abcd");
-    EXPECT_TRUE(cap_.truncated);
+    EXPECT_EQ(Cap()->out_len, 6U);
+    EXPECT_EQ(Cap()->err_len, 4U);
+    EXPECT_EQ(out_str(*Cap()), "123456");
+    EXPECT_EQ(err_str(*Cap()), "abcd");
+    EXPECT_TRUE(Cap()->truncated);
 }
 
 TEST_F(ExecCaptureTest, AppendAfterTruncationLeavesLengthsUnchanged)
 {
-    taz_exec_capture_init(&cap_, 10);
+    taz_exec_capture_init(Cap(), 10);
 
-    append_str(&cap_, TAZ_EXEC_STREAM_OUT, "0123456789ABCDE");
-    ASSERT_TRUE(cap_.truncated);
-    size_t out_len_before = cap_.out_len;
-    size_t err_len_before = cap_.err_len;
+    append_str(Cap(), TAZ_EXEC_STREAM_OUT, "0123456789ABCDE");
+    ASSERT_TRUE(Cap()->truncated);
+    const size_t out_len_before = Cap()->out_len;
+    const size_t err_len_before = Cap()->err_len;
 
-    append_str(&cap_, TAZ_EXEC_STREAM_OUT, "more");
-    append_str(&cap_, TAZ_EXEC_STREAM_ERR, "more");
+    append_str(Cap(), TAZ_EXEC_STREAM_OUT, "more");
+    append_str(Cap(), TAZ_EXEC_STREAM_ERR, "more");
 
-    EXPECT_EQ(cap_.out_len, out_len_before);
-    EXPECT_EQ(cap_.err_len, err_len_before);
+    EXPECT_EQ(Cap()->out_len, out_len_before);
+    EXPECT_EQ(Cap()->err_len, err_len_before);
 }
 
 TEST_F(ExecCaptureTest, ZeroLengthAppendIsNoop)
 {
-    taz_exec_capture_init(&cap_, 10);
+    taz_exec_capture_init(Cap(), 10);
 
-    taz_exec_capture_append(&cap_, TAZ_EXEC_STREAM_OUT, "", 0);
+    taz_exec_capture_append(Cap(), TAZ_EXEC_STREAM_OUT, "", 0);
 
-    EXPECT_EQ(cap_.out_len, 0U);
-    EXPECT_EQ(cap_.err_len, 0U);
-    EXPECT_FALSE(cap_.truncated);
+    EXPECT_EQ(Cap()->out_len, 0U);
+    EXPECT_EQ(Cap()->err_len, 0U);
+    EXPECT_FALSE(Cap()->truncated);
 }
 
 TEST_F(ExecCaptureTest, FreeOfUntouchedCaptureIsSafe)
 {
-    taz_exec_capture_init(&cap_, 10);
+    taz_exec_capture_init(Cap(), 10);
 
-    taz_exec_capture_free(&cap_);
+    taz_exec_capture_free(Cap());
 }
 
 // --- taz_exec_start -------------------------------------------------------
@@ -201,7 +207,7 @@ std::string self_exe_path()
 {
     char buf[4096];
     size_t size = sizeof(buf);
-    int rc = uv_exepath(buf, &size);
+    const int rc = uv_exepath(buf, &size);
     if (rc != 0)
     {
         return std::string();
@@ -225,24 +231,35 @@ class ExecSpawnTest : public ::testing::Test
         EXPECT_EQ(uv_loop_close(&loop_), 0);
     }
 
+    uv_loop_t *Loop()
+    {
+        return &loop_;
+    }
+
+    const std::string &Exe() const
+    {
+        return exe_;
+    }
+
+  private:
     uv_loop_t loop_{};
     std::string exe_;
 };
 
 TEST_F(ExecSpawnTest, SuccessfulSpawnCallsOnDoneOnceWithOutput)
 {
-    const char *args[] = {"--gtest_filter=NoSuchSuite.*"};
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
     taz_exec_spec_t spec{};
-    spec.file = exe_.c_str();
+    spec.file = Exe().c_str();
     spec.args = args;
     spec.args_count = 1;
     spec.max_output_bytes = 1U << 20;
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
 
-    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
     EXPECT_TRUE(outcome.called);
     EXPECT_EQ(outcome.exit_status, 0);
@@ -253,18 +270,18 @@ TEST_F(ExecSpawnTest, SuccessfulSpawnCallsOnDoneOnceWithOutput)
 
 TEST_F(ExecSpawnTest, OutputCapTruncatesButChildIsStillReaped)
 {
-    const char *args[] = {"--gtest_filter=NoSuchSuite.*"};
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
     taz_exec_spec_t spec{};
-    spec.file = exe_.c_str();
+    spec.file = Exe().c_str();
     spec.args = args;
     spec.args_count = 1;
     spec.max_output_bytes = 5;
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
 
-    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
     EXPECT_TRUE(outcome.called);
     EXPECT_TRUE(outcome.truncated);
@@ -273,27 +290,27 @@ TEST_F(ExecSpawnTest, OutputCapTruncatesButChildIsStillReaped)
 
 TEST_F(ExecSpawnTest, NonexistentFileReturnsErrorWithoutCallback)
 {
-    std::string missing = exe_ + "-taz-test-does-not-exist";
+    const std::string missing = Exe() + "-taz-test-does-not-exist";
     taz_exec_spec_t spec{};
     spec.file = missing.c_str();
     spec.max_output_bytes = 1024;
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    EXPECT_NE(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    EXPECT_NE(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
     EXPECT_FALSE(outcome.called);
 }
 
 TEST_F(ExecSpawnTest, NonexistentCwdReturnsError)
 {
     taz_exec_spec_t spec{};
-    spec.file = exe_.c_str();
+    spec.file = Exe().c_str();
     spec.cwd = "/taz-test-cwd-does-not-exist";
     spec.max_output_bytes = 1024;
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    EXPECT_NE(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    EXPECT_NE(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
     EXPECT_FALSE(outcome.called);
 }
 
@@ -311,16 +328,16 @@ TEST_F(ExecSpawnTest, ExtraVarIsAddedToChildEnv)
         {"TAZ_TEST_ADDED_VAR", "added_value"},
     };
     taz_exec_spec_t spec{};
-    spec.file = exe_.c_str();
+    spec.file = Exe().c_str();
     spec.env = env;
     spec.env_count = 2;
     spec.max_output_bytes = 1024;
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
 
-    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
     EXPECT_TRUE(outcome.called);
     EXPECT_EQ(outcome.out, "added_value");
@@ -335,16 +352,16 @@ TEST_F(ExecSpawnTest, ExtraVarOverridesSameNameEntry)
         {"TAZ_TEST_OVERRIDE_VAR", "overridden_value"},
     };
     taz_exec_spec_t spec{};
-    spec.file = exe_.c_str();
+    spec.file = Exe().c_str();
     spec.env = env;
     spec.env_count = 2;
     spec.max_output_bytes = 1024;
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
 
-    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
     unset_parent_env("TAZ_TEST_OVERRIDE_VAR");
 
@@ -366,16 +383,16 @@ TEST_F(ExecSpawnTest, DifferentlyCasedNameIsNotTreatedAsOverrideOnPosix)
         {"taz_test_case_var", "should_not_override"},
     };
     taz_exec_spec_t spec{};
-    spec.file = exe_.c_str();
+    spec.file = Exe().c_str();
     spec.env = env;
     spec.env_count = 2;
     spec.max_output_bytes = 1024;
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
 
-    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
     unset_parent_env("TAZ_TEST_CASE_VAR");
 
@@ -393,16 +410,16 @@ TEST_F(ExecSpawnTest, UnrelatedDaemonEnvVarsSurviveUnchanged)
         {"TAZ_TEST_ECHO_ENV_VAR", "PATH"},
     };
     taz_exec_spec_t spec{};
-    spec.file = exe_.c_str();
+    spec.file = Exe().c_str();
     spec.env = env;
     spec.env_count = 1;
     spec.max_output_bytes = 1U << 20;
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
 
-    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
     EXPECT_TRUE(outcome.called);
     EXPECT_EQ(outcome.out, path_value);
@@ -423,10 +440,10 @@ TEST_F(ExecSpawnTest, TimeoutKillsChildAndSetsTimedOut)
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
 
     auto start = std::chrono::steady_clock::now();
-    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
     auto elapsed = std::chrono::steady_clock::now() - start;
 
     EXPECT_TRUE(outcome.called);
@@ -443,12 +460,12 @@ TEST_F(ExecSpawnTest, CancelKillsChildAndSetsCancelled)
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
 
     taz_exec_cancel(x);
 
     auto start = std::chrono::steady_clock::now();
-    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
     auto elapsed = std::chrono::steady_clock::now() - start;
 
     EXPECT_TRUE(outcome.called);
@@ -459,9 +476,9 @@ TEST_F(ExecSpawnTest, CancelKillsChildAndSetsCancelled)
 
 TEST_F(ExecSpawnTest, ZeroTimeoutMeansChildRunsToNormalCompletion)
 {
-    const char *args[] = {"--gtest_filter=NoSuchSuite.*"};
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
     taz_exec_spec_t spec{};
-    spec.file = exe_.c_str();
+    spec.file = Exe().c_str();
     spec.args = args;
     spec.args_count = 1;
     spec.max_output_bytes = 1U << 20;
@@ -469,9 +486,9 @@ TEST_F(ExecSpawnTest, ZeroTimeoutMeansChildRunsToNormalCompletion)
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
 
-    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
     EXPECT_TRUE(outcome.called);
     EXPECT_EQ(outcome.exit_status, 0);

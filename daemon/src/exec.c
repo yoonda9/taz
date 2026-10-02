@@ -144,6 +144,15 @@ void taz_exec_capture_free(taz_exec_capture_t *cap)
  * for, but always closed so loop teardown never depends on that). */
 #define TAZ_EXEC_HANDLE_COUNT 4
 
+/* Handles closed when setup fails before uv_spawn is attempted: the two
+ * pipes and the timer. The process handle is not part of this count - in
+ * this path uv_spawn has not been called, so it is not yet valid to close. */
+#define TAZ_EXEC_PRESPAWN_HANDLE_COUNT 3
+
+/* stdio slots passed to uv_spawn: stdin (ignored), stdout, and stderr -
+ * matching the two pipes captured above. */
+#define TAZ_EXEC_STDIO_COUNT 3
+
 struct taz_exec_s
 {
     uv_process_t process;
@@ -157,7 +166,7 @@ struct taz_exec_s
     HANDLE job;
 #endif
     taz_exec_capture_t capture;
-    taz_exec_done_fn on_done;
+    taz_exec_done_fn_t on_done;
     void *arg;
     int pending; /* counts down from TAZ_EXEC_PENDING_COUNT to 0 */
     int closing; /* counts down from TAZ_EXEC_HANDLE_COUNT to 0 */
@@ -365,7 +374,7 @@ static void free_env(char **env)
     {
         free(env[i]);
     }
-    free(env);
+    free((void *)env);
 }
 
 /* Build the NAME=VALUE environment for the child: the daemon's own
@@ -467,7 +476,7 @@ static int create_job_object(HANDLE *out_job)
 #endif
 
 int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
-                   taz_exec_done_fn on_done, void *arg, taz_exec_t **out)
+                   taz_exec_done_fn_t on_done, void *arg, taz_exec_t **out)
 {
     taz_exec_t *x = (taz_exec_t *)calloc(1U, sizeof(*x));
     if (x == NULL)
@@ -523,19 +532,19 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     if (rc != 0)
     {
         free_env(envp);
-        free(argv);
-        x->closing = 3;
+        free((void *)argv);
+        x->closing = TAZ_EXEC_PRESPAWN_HANDLE_COUNT;
         uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);
         uv_close((uv_handle_t *)&x->err_pipe, on_handle_closed);
         uv_close((uv_handle_t *)&x->timer, on_handle_closed);
         return rc;
     }
 
-    uv_stdio_container_t stdio[3];
+    uv_stdio_container_t stdio[TAZ_EXEC_STDIO_COUNT];
     stdio[0].flags = UV_IGNORE;
-    stdio[1].flags = (uv_stdio_flags)(UV_CREATE_PIPE | UV_WRITABLE_PIPE);
+    stdio[1].flags = UV_CREATE_PIPE | UV_WRITABLE_PIPE;
     stdio[1].data.stream = (uv_stream_t *)&x->out_pipe;
-    stdio[2].flags = (uv_stdio_flags)(UV_CREATE_PIPE | UV_WRITABLE_PIPE);
+    stdio[2].flags = UV_CREATE_PIPE | UV_WRITABLE_PIPE;
     stdio[2].data.stream = (uv_stream_t *)&x->err_pipe;
 
     uv_process_options_t options;
@@ -546,7 +555,7 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     options.env = envp;
     options.cwd =
         (spec->cwd != NULL && spec->cwd[0] != '\0') ? spec->cwd : NULL;
-    options.stdio_count = 3;
+    options.stdio_count = TAZ_EXEC_STDIO_COUNT;
     options.stdio = stdio;
 #ifdef _WIN32
     options.flags = UV_PROCESS_WINDOWS_HIDE;
@@ -558,7 +567,7 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     rc = uv_spawn(loop, &x->process, &options);
 
     free_env(envp);
-    free(argv);
+    free((void *)argv);
 
     if (rc != 0)
     {
