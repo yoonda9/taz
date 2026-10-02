@@ -1,5 +1,6 @@
 #include "taz/exec.h"
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -17,6 +18,17 @@
 #define TAZ_EXEC_ENV_NAME_CMP _stricmp
 #else
 #define TAZ_EXEC_ENV_NAME_CMP strcmp
+#endif
+
+/* Largest size on_alloc can report through uv_buf_t.len without narrowing:
+ * that field is size_t on the POSIX backend but ULONG (32-bit, always,
+ * even on 64-bit Windows) on the Windows backend. libuv's own suggested
+ * size is small (64 KiB), so this only ever clamps a hypothetically huge
+ * suggestion rather than firing in practice. */
+#ifdef _WIN32
+#define TAZ_EXEC_ALLOC_MAX ((size_t)ULONG_MAX)
+#else
+#define TAZ_EXEC_ALLOC_MAX SIZE_MAX
 #endif
 
 /* Initial allocation for a stream buffer on its first append. */
@@ -293,8 +305,10 @@ static void on_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
 {
     (void)handle;
 
-    buf->base = (char *)malloc(suggested_size);
-    buf->len = (buf->base != NULL) ? suggested_size : 0U;
+    size_t capped = (suggested_size <= TAZ_EXEC_ALLOC_MAX) ? suggested_size
+                                                           : TAZ_EXEC_ALLOC_MAX;
+    buf->base = (char *)malloc(capped);
+    buf->len = (buf->base != NULL) ? (unsigned long)capped : 0UL;
 }
 
 static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf,
