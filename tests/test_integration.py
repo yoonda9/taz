@@ -5,13 +5,14 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
 import psutil
 import pytest
 from google.protobuf import empty_pb2
-from taz.c3 import TazClient, TazConnectionLost, TazError
+from taz.c3 import CommandResult, TazClient, TazConnectionLost, TazError
 from taz.v1 import command_pb2, common_pb2, daemon_control_pb2
 
 from tests.conftest import Daemon
@@ -39,6 +40,19 @@ def _py(snippet: str) -> list[str]:
 def _normalize(data: bytes) -> bytes:
     """Collapse Windows text-mode ``\\r\\n`` so output assertions are portable."""
     return data.replace(b"\r\n", b"\n")
+
+
+def _process_gone(pid: int) -> bool:
+    """True once ``pid`` is unreachable or a not-yet-reaped zombie.
+
+    A killed process tree's orphaned members get reparented and reaped by
+    init asynchronously, so there's a brief window where the pid still
+    resolves to a zombie; that still counts as "gone" for our purposes.
+    """
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
 
 
 class TestPing:
@@ -206,6 +220,68 @@ class TestCommandExec:
         result = taz_client.command.exec(PY, args=["-c", "print('demo')"])
         assert result.exit_code == 0
         assert _normalize(result.stdout) == b"demo\n"
+
+    def test_timeout_kills_process_and_sets_timed_out(
+        self, taz_client: TazClient
+    ) -> None:
+        start = time.monotonic()
+        result = taz_client.command.exec(
+            PY, args=_py("import time; time.sleep(60)"), timeout_ms=200
+        )
+        assert result.timed_out is True
+        assert time.monotonic() - start < 10
+
+    def test_timeout_kills_whole_process_tree(self, taz_client: TazClient) -> None:
+        # The child spawns a grandchild sleeper, reports its pid (flushed so
+        # the daemon's capture sees it even if the parent is killed right
+        # after), then sleeps itself; timeout_ms is generous enough for a
+        # fresh interpreter to start and print on a slow (Windows) host.
+        snippet = (
+            "import subprocess, sys, time; "
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(60)']); "
+            "print(child.pid); sys.stdout.flush(); "
+            "time.sleep(60)"
+        )
+        result = taz_client.command.exec(PY, args=_py(snippet), timeout_ms=2000)
+        assert result.timed_out is True
+        grandchild_pid = int(_normalize(result.stdout).strip())
+
+        deadline = time.monotonic() + 5
+        while not _process_gone(grandchild_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert _process_gone(grandchild_pid)
+
+    def test_long_exec_does_not_block_a_second_connection(
+        self, taz_client: TazClient, daemon: Daemon
+    ) -> None:
+        result_box: list[CommandResult] = []
+        error_box: list[BaseException] = []
+
+        def run_slow_exec() -> None:
+            try:
+                result_box.append(
+                    taz_client.command.exec(PY, args=_py("import time; time.sleep(2)"))
+                )
+            except BaseException as exc:  # re-raised on the main thread below
+                error_box.append(exc)
+
+        thread = threading.Thread(target=run_slow_exec)
+        thread.start()
+        try:
+            # Give the exec a head start so B's call genuinely overlaps it.
+            time.sleep(0.5)
+            with TazClient("127.0.0.1", daemon.port) as other:
+                start = time.monotonic()
+                other.version()
+                assert time.monotonic() - start < 1.0
+        finally:
+            thread.join(timeout=10)
+        assert not thread.is_alive()
+
+        if error_box:
+            raise error_box[0]
+        assert result_box[0].exit_code == 0
 
 
 class TestConfigGet:
