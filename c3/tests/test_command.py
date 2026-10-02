@@ -9,6 +9,7 @@ import pytest
 from taz.c3.client import TazClient
 from taz.c3.command import CommandResult
 from taz.c3.errors import TazError
+from taz.c3.protocol import frame
 from taz.c3.protocol.frame import HEADER_SIZE, Frame, pack_header
 from taz.c3.settings import Keepalive
 from taz.v1 import command_pb2, common_pb2
@@ -88,10 +89,10 @@ _SOCKET_SPEC = sorted({*dir(socket.socket), "sendmsg"})
 def _mock_sock(*chunks: bytes) -> MagicMock:
     """Mock socket that serves ``chunks`` sequentially then EOF.
 
-    Records every ``sendmsg`` call's bytes on ``sock.sent``, copied eagerly:
-    ``send_frame``'s retry loop pops consumed buffers off the same list it
-    passed in, so reading ``call_args_list`` after the fact would see it
-    already drained to empty.
+    Records every ``sendmsg`` or ``sendall`` call's bytes on ``sock.sent``,
+    copied eagerly: ``send_frame``'s retry loop pops consumed buffers off
+    the same list it passed in, so reading ``call_args_list`` after the fact
+    would see it already drained to empty.
     """
     pending = [bytearray(c) for c in chunks]
     sent: list[bytes] = []
@@ -116,10 +117,14 @@ def _mock_sock(*chunks: bytes) -> MagicMock:
         sent.append(b"".join(bytes(view) for view in views))
         return sum(len(view) for view in views)
 
+    def sendall(data: bytes) -> None:
+        sent.append(data)
+
     sock = MagicMock(spec=_SOCKET_SPEC)
     sock.recv.side_effect = recv
     sock.gettimeout.return_value = None
     sock.sendmsg.side_effect = sendmsg
+    sock.sendall.side_effect = sendall
     sock.sent = sent
     return sock
 
@@ -213,6 +218,22 @@ class TestCommandExec:
         assert [(kv.key, kv.value) for kv in req.env] == [("FOO", "bar")]
         assert req.working_dir == "/srv/app"
         assert req.timeout_ms == 5000
+
+    def test_exec_sends_request_via_sendall_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On platforms without sendmsg (e.g. Windows), send_frame falls back to
+        sendall; the request must still round-trip correctly through that path."""
+        monkeypatch.setattr(frame, "_HAS_SENDMSG", False)
+        client, mock_sock = _connected_client_with_sock(_exec_response())
+        client.command.exec("cmd", args=["a", "b"], working_dir="/srv/app")
+        mock_sock.sendmsg.assert_not_called()
+        sent = b"".join(mock_sock.sent)
+        req = command_pb2.CommandExecRequest()
+        req.ParseFromString(sent[HEADER_SIZE:])
+        assert req.command == "cmd"
+        assert list(req.args) == ["a", "b"]
+        assert req.working_dir == "/srv/app"
 
     def test_exec_merges_chunked_response_across_three_frames(self) -> None:
         """stdout_data/stderr_data split across CONTINUATION frames concatenate."""
