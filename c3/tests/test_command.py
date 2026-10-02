@@ -88,10 +88,10 @@ _SOCKET_SPEC = sorted({*dir(socket.socket), "sendmsg"})
 def _mock_sock(*chunks: bytes) -> MagicMock:
     """Mock socket that serves ``chunks`` sequentially then EOF.
 
-    Records every ``sendmsg`` call's bytes on ``sock.sent``, copied eagerly:
-    ``send_frame``'s retry loop pops consumed buffers off the same list it
-    passed in, so reading ``call_args_list`` after the fact would see it
-    already drained to empty.
+    Records every ``sendmsg`` or ``sendall`` call's bytes on ``sock.sent``,
+    copied eagerly: ``send_frame``'s retry loop pops consumed buffers off
+    the same list it passed in, so reading ``call_args_list`` after the fact
+    would see it already drained to empty.
     """
     pending = [bytearray(c) for c in chunks]
     sent: list[bytes] = []
@@ -116,10 +116,14 @@ def _mock_sock(*chunks: bytes) -> MagicMock:
         sent.append(b"".join(bytes(view) for view in views))
         return sum(len(view) for view in views)
 
+    def sendall(data: bytes) -> None:
+        sent.append(data)
+
     sock = MagicMock(spec=_SOCKET_SPEC)
     sock.recv.side_effect = recv
     sock.gettimeout.return_value = None
     sock.sendmsg.side_effect = sendmsg
+    sock.sendall.side_effect = sendall
     sock.sent = sent
     return sock
 
