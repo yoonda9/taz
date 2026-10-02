@@ -103,6 +103,12 @@ extern "C"
     int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
                        taz_exec_done_fn on_done, void *arg, taz_exec_t **out);
 
+    /* Kill x's whole process tree right away and mark the eventual result
+     * cancelled. on_done still fires exactly once, later, once the process
+     * and its pipes have finished draining - same as a natural exit or a
+     * timeout. A no-op if on_done has already fired. */
+    void taz_exec_cancel(taz_exec_t *x);
+
 #ifdef __cplusplus
 }
 #endif

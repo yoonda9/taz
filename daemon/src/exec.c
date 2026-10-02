@@ -5,6 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <signal.h>
+#endif
+
 /* Env var name matching for override/add merge: case-insensitive on
  * Windows (its environment is case-insensitive), case-sensitive on POSIX. */
 #ifdef _WIN32
@@ -127,18 +133,29 @@ void taz_exec_capture_free(taz_exec_capture_t *cap)
 }
 
 /* Number of completion events that must all arrive before an exec is
- * finished: the process exit and EOF on each of the two captured pipes. */
+ * finished: the process exit and EOF on each of the two captured pipes. The
+ * timeout timer is not one of these - it only ever triggers a tree kill,
+ * never a completion by itself. */
 #define TAZ_EXEC_PENDING_COUNT 3
 
 /* Handles closed as a unit once an exec finishes, or once a spawn attempt
- * that got this far fails: the process handle and its two pipes. */
-#define TAZ_EXEC_HANDLE_COUNT 3
+ * that got this far fails: the process handle, its two pipes, and the
+ * timeout timer (always created, started only when a timeout was asked
+ * for, but always closed so loop teardown never depends on that). */
+#define TAZ_EXEC_HANDLE_COUNT 4
 
 struct taz_exec_s
 {
     uv_process_t process;
     uv_pipe_t out_pipe;
     uv_pipe_t err_pipe;
+    uv_timer_t timer;
+#ifdef _WIN32
+    /* Per-exec Job Object the child is assigned to right after uv_spawn, so
+     * that killing the job (KILL_ON_JOB_CLOSE) takes the whole tree with it.
+     * NULL if creation failed before a process was ever spawned. */
+    HANDLE job;
+#endif
     taz_exec_capture_t capture;
     taz_exec_done_fn on_done;
     void *arg;
@@ -146,6 +163,9 @@ struct taz_exec_s
     int closing; /* counts down from TAZ_EXEC_HANDLE_COUNT to 0 */
     int64_t exit_status;
     int term_signal;
+    bool timed_out;
+    bool cancelled;
+    bool done; /* true once on_done has fired; guards late cancel/timeout */
 };
 
 static void on_handle_closed(uv_handle_t *handle)
@@ -157,6 +177,12 @@ static void on_handle_closed(uv_handle_t *handle)
         return;
     }
 
+#ifdef _WIN32
+    if (x->job != NULL)
+    {
+        (void)CloseHandle(x->job);
+    }
+#endif
     taz_exec_capture_free(&x->capture);
     free(x);
 }
@@ -164,14 +190,37 @@ static void on_handle_closed(uv_handle_t *handle)
 /* Close every handle belonging to x. Safe to call for a spawn that never
  * started (uv_spawn always initializes the process handle before it can
  * fail) as well as for one that ran to completion; on_handle_closed frees x
- * once all three close callbacks have fired. */
+ * once all close callbacks have fired. */
 static void close_all(taz_exec_t *x)
 {
     x->closing = TAZ_EXEC_HANDLE_COUNT;
     uv_close((uv_handle_t *)&x->process, on_handle_closed);
     uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);
     uv_close((uv_handle_t *)&x->err_pipe, on_handle_closed);
+    uv_close((uv_handle_t *)&x->timer, on_handle_closed);
 }
+
+/* Kill x's whole process tree. A no-op once the child has already exited
+ * (POSIX: ESRCH from uv_kill, silently ignored) or if the process was never
+ * successfully spawned (Windows: x->job is NULL). */
+#ifdef _WIN32
+static void tree_kill(taz_exec_t *x)
+{
+    if (x->job != NULL)
+    {
+        (void)TerminateJobObject(x->job, 1);
+    }
+}
+#else
+static void tree_kill(taz_exec_t *x)
+{
+    if (x->process.pid > 0)
+    {
+        int rc = uv_kill(-x->process.pid, SIGKILL);
+        (void)rc;
+    }
+}
+#endif
 
 static void finish_if_ready(taz_exec_t *x)
 {
@@ -182,16 +231,19 @@ static void finish_if_ready(taz_exec_t *x)
         return;
     }
 
+    (void)uv_timer_stop(&x->timer);
+
     result.exit_status = x->exit_status;
     result.term_signal = x->term_signal;
     result.out = x->capture.out;
     result.out_len = x->capture.out_len;
     result.err = x->capture.err;
     result.err_len = x->capture.err_len;
-    result.timed_out = false;
+    result.timed_out = x->timed_out;
     result.truncated = (x->capture.truncated != 0);
-    result.cancelled = false;
+    result.cancelled = x->cancelled;
 
+    x->done = true;
     x->on_done(&result, x->arg);
     close_all(x);
 }
@@ -204,6 +256,28 @@ static void on_process_exit(uv_process_t *process, int64_t exit_status,
     x->exit_status = exit_status;
     x->term_signal = term_signal;
     finish_if_ready(x);
+}
+
+static void on_timeout(uv_timer_t *timer)
+{
+    taz_exec_t *x = (taz_exec_t *)timer->data;
+
+    if (x->done)
+    {
+        return;
+    }
+    x->timed_out = true;
+    tree_kill(x);
+}
+
+void taz_exec_cancel(taz_exec_t *x)
+{
+    if (x->done)
+    {
+        return;
+    }
+    x->cancelled = true;
+    tree_kill(x);
 }
 
 static void on_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
@@ -363,6 +437,35 @@ static int build_env(const taz_v1_KeyValue *extra, size_t extra_count,
     return 0;
 }
 
+#ifdef _WIN32
+/* Create a Job Object that kills every process assigned to it as soon as
+ * its last handle closes, so tree_kill only has to close one handle to take
+ * down the whole tree. The child is assigned to *out_job right after
+ * uv_spawn (taz_exec_start), since libuv offers no way to spawn suspended. */
+static int create_job_object(HANDLE *out_job)
+{
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    if (job == NULL)
+    {
+        return uv_translate_sys_error((int)GetLastError());
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+    (void)memset(&info, 0, sizeof(info));
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info,
+                                 sizeof(info)))
+    {
+        int rc = uv_translate_sys_error((int)GetLastError());
+        (void)CloseHandle(job);
+        return rc;
+    }
+
+    *out_job = job;
+    return 0;
+}
+#endif
+
 int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
                    taz_exec_done_fn on_done, void *arg, taz_exec_t **out)
 {
@@ -394,6 +497,16 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     }
     x->err_pipe.data = x;
 
+    rc = uv_timer_init(loop, &x->timer);
+    if (rc != 0)
+    {
+        x->closing = 2;
+        uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);
+        uv_close((uv_handle_t *)&x->err_pipe, on_handle_closed);
+        return rc;
+    }
+    x->timer.data = x;
+
     char **argv = NULL;
     char **envp = NULL;
     rc = build_argv(spec, &argv);
@@ -401,12 +514,20 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     {
         rc = build_env(spec->env, spec->env_count, &envp);
     }
+#ifdef _WIN32
+    if (rc == 0)
+    {
+        rc = create_job_object(&x->job);
+    }
+#endif
     if (rc != 0)
     {
+        free_env(envp);
         free(argv);
-        x->closing = 2;
+        x->closing = 3;
         uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);
         uv_close((uv_handle_t *)&x->err_pipe, on_handle_closed);
+        uv_close((uv_handle_t *)&x->timer, on_handle_closed);
         return rc;
     }
 
@@ -427,6 +548,11 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
         (spec->cwd != NULL && spec->cwd[0] != '\0') ? spec->cwd : NULL;
     options.stdio_count = 3;
     options.stdio = stdio;
+#ifdef _WIN32
+    options.flags = UV_PROCESS_WINDOWS_HIDE;
+#else
+    options.flags = UV_PROCESS_DETACHED;
+#endif
 
     x->process.data = x;
     rc = uv_spawn(loop, &x->process, &options);
@@ -440,8 +566,24 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
         return rc;
     }
 
+#ifdef _WIN32
+    if (!AssignProcessToJobObject(x->job, x->process.process_handle))
+    {
+        /* The child escaped containment (e.g. nested jobs unsupported);
+         * TerminateJobObject can no longer help, so take down at least the
+         * direct child. The exec still completes normally through the exit
+         * callback once it does. */
+        (void)TerminateProcess(x->process.process_handle, 1U);
+    }
+#endif
+
     (void)uv_read_start((uv_stream_t *)&x->out_pipe, on_alloc, on_read_out);
     (void)uv_read_start((uv_stream_t *)&x->err_pipe, on_alloc, on_read_err);
+
+    if (spec->timeout_ms != 0U)
+    {
+        (void)uv_timer_start(&x->timer, on_timeout, spec->timeout_ms, 0U);
+    }
 
     *out = x;
     return 0;

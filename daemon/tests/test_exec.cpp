@@ -1,6 +1,7 @@
 // Unit tests for exec.c/h: the output capture buffer and the taz_exec_start
 // spawn engine.
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -405,6 +406,76 @@ TEST_F(ExecSpawnTest, UnrelatedDaemonEnvVarsSurviveUnchanged)
 
     EXPECT_TRUE(outcome.called);
     EXPECT_EQ(outcome.out, path_value);
+}
+
+// --- timeout / tree kill / cancel -----------------------------------------
+//
+// taz_test_sleeper (built from sleeper.c) sleeps for 60 s with no shell
+// involved, so these tests have a child that would still be running long
+// after the assertions below if the kill path were broken.
+
+TEST_F(ExecSpawnTest, TimeoutKillsChildAndSetsTimedOut)
+{
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+    spec.timeout_ms = 200;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.timed_out);
+    EXPECT_FALSE(outcome.cancelled);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+TEST_F(ExecSpawnTest, CancelKillsChildAndSetsCancelled)
+{
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+
+    taz_exec_cancel(x);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.cancelled);
+    EXPECT_FALSE(outcome.timed_out);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+TEST_F(ExecSpawnTest, ZeroTimeoutMeansChildRunsToNormalCompletion)
+{
+    const char *args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = exe_.c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1U << 20;
+    spec.timeout_ms = 0;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(&loop_, &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.exit_status, 0);
+    EXPECT_FALSE(outcome.timed_out);
 }
 
 } // namespace

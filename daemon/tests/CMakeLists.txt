@@ -4,6 +4,11 @@
 find_package(GTest REQUIRED CONFIG)
 include(GoogleTest)
 
+# Cross-platform sleeper child for the exec timeout/cancel tests below: a
+# tiny, shell-free executable that just sleeps. Test-only, not installed.
+add_executable(taz_test_sleeper sleeper.c)
+target_link_libraries(taz_test_sleeper PRIVATE taz_warnings libuv::uv_a)
+
 add_executable(
     taz_tests
     test_proto.cpp
@@ -21,5 +26,7 @@ add_executable(
 # warning flags without the C-only -Wstrict-prototypes/-Wmissing-prototypes.
 target_link_libraries(taz_tests PRIVATE taz_core taz_cxx_warnings
                                         GTest::gtest_main)
+target_compile_definitions(
+    taz_tests PRIVATE TAZ_TEST_SLEEPER_PATH="$<TARGET_FILE:taz_test_sleeper>")
 
 gtest_discover_tests(taz_tests)
