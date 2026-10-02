@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
@@ -25,6 +26,19 @@ def _project_version() -> str:
     )
     assert m is not None, f"no project VERSION in {_DAEMON_CMAKELISTS}"
     return m.group(1)
+
+
+PY = sys.executable
+
+
+def _py(snippet: str) -> list[str]:
+    """``args`` for a no-shell ``python -c <snippet>`` child."""
+    return ["-c", snippet]
+
+
+def _normalize(data: bytes) -> bytes:
+    """Collapse Windows text-mode ``\\r\\n`` so output assertions are portable."""
+    return data.replace(b"\r\n", b"\n")
 
 
 class TestPing:
@@ -124,6 +138,74 @@ class TestConnectionLifetime:
         while psutil.pid_exists(pid) and time.monotonic() < deadline:
             time.sleep(0.1)
         assert not psutil.pid_exists(pid)
+
+
+class TestCommandExec:
+    """``COMMAND_EXEC`` round trips through the typed ``client.command`` API."""
+
+    def test_print_captures_stdout_and_exit_code(self, taz_client: TazClient) -> None:
+        result = taz_client.command.exec(PY, args=_py("print('hello')"))
+        assert result.exit_code == 0
+        assert _normalize(result.stdout) == b"hello\n"
+        assert result.timed_out is False
+        assert result.truncated is False
+
+    def test_exit_code_is_propagated(self, taz_client: TazClient) -> None:
+        result = taz_client.command.exec(PY, args=_py("import sys; sys.exit(3)"))
+        assert result.exit_code == 3
+
+    def test_stderr_is_captured_separately_from_stdout(
+        self, taz_client: TazClient
+    ) -> None:
+        result = taz_client.command.exec(
+            PY, args=_py("import sys; sys.stderr.write('oops')")
+        )
+        assert _normalize(result.stderr) == b"oops"
+        assert result.stdout == b""
+
+    def test_env_is_merged_into_daemon_environment(self, taz_client: TazClient) -> None:
+        snippet = "import os; print(os.environ.get('FOO')); print('PATH' in os.environ)"
+        result = taz_client.command.exec(PY, args=_py(snippet), env={"FOO": "bar"})
+        lines = _normalize(result.stdout).splitlines()
+        assert lines == [b"bar", b"True"]
+
+    def test_working_dir_changes_child_cwd(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        result = taz_client.command.exec(
+            PY, args=_py("import os; print(os.getcwd())"), working_dir=str(tmp_path)
+        )
+        printed = _normalize(result.stdout).strip().decode()
+        assert os.path.samefile(printed, tmp_path)
+
+    def test_large_output_spans_multiple_chunks(self, taz_client: TazClient) -> None:
+        result = taz_client.command.exec(PY, args=_py("print('x' * 300000)"))
+        assert _normalize(result.stdout) == b"x" * 300000 + b"\n"
+        assert result.truncated is False
+
+    def test_output_cap_truncates_and_sets_flag(self, taz_client: TazClient) -> None:
+        taz_client.config_update({"exec.max_output_bytes": "1000"})
+        result = taz_client.command.exec(PY, args=_py("print('x' * 300000)"))
+        assert result.truncated is True
+        assert len(result.stdout) + len(result.stderr) <= 1000
+
+    def test_nonexistent_command_raises_not_found_and_connection_stays_usable(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        missing = str(tmp_path / "no-such-binary")
+        with pytest.raises(TazError) as exc_info:
+            taz_client.command.exec(missing)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+        taz_client.ping()
+
+    def test_capabilities_advertise_command_exec(self, taz_client: TazClient) -> None:
+        cap = taz_client.capabilities()
+        assert common_pb2.OPCODE_COMMAND_EXEC in set(cap.operations)
+
+    def test_demo_round_trip(self, taz_client: TazClient) -> None:
+        result = taz_client.command.exec(PY, args=["-c", "print('demo')"])
+        assert result.exit_code == 0
+        assert _normalize(result.stdout) == b"demo\n"
 
 
 class TestConfigGet:
