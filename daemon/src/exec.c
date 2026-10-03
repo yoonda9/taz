@@ -384,16 +384,14 @@ static void free_env(char **env)
     {
         return;
     }
-    /* Count before freeing anything: MSVC /analyze reports a terminator scan
-     * that frees as it goes as a read of uninitialized memory (C6001). */
-    size_t count = 0U;
-    while (env[count] != NULL)
+    for (size_t i = 0U; env[i] != NULL; i++)
     {
-        count++;
-    }
-    for (size_t i = 0U; i < count; i++)
-    {
-        free(env[i]);
+        /* Free through a copy: MSVC /analyze treats every env[i] as one
+         * location, so free(env[i]) would make the next env[i] read look
+         * uninitialized (C6001). Counting first instead trips GCC 13's
+         * -fanalyzer (a false malloc leak). */
+        char *entry = env[i];
+        free(entry);
     }
     free((void *)env);
 }
