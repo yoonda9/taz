@@ -384,7 +384,14 @@ static void free_env(char **env)
     {
         return;
     }
-    for (size_t i = 0U; env[i] != NULL; i++)
+    /* Count before freeing anything: MSVC /analyze reports a terminator scan
+     * that frees as it goes as a read of uninitialized memory (C6001). */
+    size_t count = 0U;
+    while (env[count] != NULL)
+    {
+        count++;
+    }
+    for (size_t i = 0U; i < count; i++)
     {
         free(env[i]);
     }
