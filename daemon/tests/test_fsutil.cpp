@@ -311,6 +311,43 @@ TEST_F(PasswdNameFromUid, NonNumericUidFieldIsSkipped)
     EXPECT_STREQ(buf, "good");
 }
 
+TEST_F(PasswdNameFromUid, OverlongLineIsSkippedNotMisparsed)
+{
+    // A line longer than the internal buffer must never have its tail
+    // reparsed as a fresh "name:x:uid:..." entry.
+    WriteFile(std::string(505, 'A') + "evil:x:1000:1000::/h:/bin/sh\n");
+    char buf[64];
+    EXPECT_EQ(
+        taz_passwd_name_from_uid(Path().c_str(), 1000UL, buf, sizeof(buf)), 0);
+}
+
+TEST_F(PasswdNameFromUid, EmptyNameFieldIsSkipped)
+{
+    WriteFile(":x:9:9:NoName:/home/noname:/bin/bash\n"
+              "dave:x:9:9:Dave:/home/dave:/bin/bash\n");
+    char buf[64];
+    EXPECT_EQ(taz_passwd_name_from_uid(Path().c_str(), 9UL, buf, sizeof(buf)),
+              1);
+    EXPECT_STREQ(buf, "dave");
+}
+
+TEST_F(PasswdNameFromUid, NegativeUidFieldIsSkipped)
+{
+    WriteFile("neg:x:-1:-1:Neg:/home/neg:/bin/bash\n");
+    char buf[64];
+    EXPECT_EQ(taz_passwd_name_from_uid(Path().c_str(), (unsigned long)-1, buf,
+                                       sizeof(buf)),
+              0);
+}
+
+TEST_F(PasswdNameFromUid, LeadingWhitespaceUidFieldIsSkipped)
+{
+    WriteFile("spacey:x: 7:7:Spacey:/home/spacey:/bin/bash\n");
+    char buf[64];
+    EXPECT_EQ(taz_passwd_name_from_uid(Path().c_str(), 7UL, buf, sizeof(buf)),
+              0);
+}
+
 TEST_F(PasswdNameFromUid, LongNameIsTruncated)
 {
     const std::string name = "averyverylongusernamethatdoesnotfit";

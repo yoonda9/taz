@@ -14,8 +14,10 @@
 
 #ifdef _WIN32
 #define FSUTIL_SEP '\\'
-/* Length of the Win32 long-path prefix "\\?\". */
-#define WIN_LONGPATH_PREFIX_LEN 4U
+/* The Win32 long-path prefix. */
+static const char WIN_LONGPATH_PREFIX[] = "\\\\?\\";
+/* Length of the Win32 long-path prefix, excluding the NUL. */
+#define WIN_LONGPATH_PREFIX_LEN (sizeof(WIN_LONGPATH_PREFIX) - 1U)
 /* Length of "C:" plus one trailing separator. */
 #define WIN_DRIVE_SEP_LEN 3U
 #else
@@ -160,8 +162,8 @@ size_t taz_fsutil_root_prefix_len(const char *path)
     size_t len = strlen(path);
 
 #ifdef _WIN32
-    if ((len >= WIN_LONGPATH_PREFIX_LEN) && (path[0] == '\\') &&
-        (path[1] == '\\') && (path[2] == '?') && (path[3] == '\\'))
+    if ((len >= WIN_LONGPATH_PREFIX_LEN) &&
+        (memcmp(path, WIN_LONGPATH_PREFIX, WIN_LONGPATH_PREFIX_LEN) == 0))
     {
         size_t drive_len = win_drive_prefix_len(path + WIN_LONGPATH_PREFIX_LEN,
                                                 len - WIN_LONGPATH_PREFIX_LEN);
@@ -214,14 +216,40 @@ int taz_passwd_name_from_uid(const char *passwd_path, unsigned long uid,
 
     while (fgets(line, (int)sizeof(line), f) != NULL)
     {
-        char *name_end = strchr(line, ':');
+        size_t line_len = strlen(line);
+        int ends_in_newline = (line_len > 0U) && (line[line_len - 1U] == '\n');
+        char *name_end;
         char *uid_start;
         char *uid_end;
         char *end;
         unsigned long line_uid;
         size_t name_len;
 
-        if (name_end == NULL)
+        if (!ends_in_newline && (feof(f) == 0))
+        {
+            /* The buffer filled before the real line ended; drain the rest
+             * of it so its tail is never parsed as a fresh entry. */
+            int c;
+            int found_newline = 0;
+
+            while ((c = fgetc(f)) != EOF)
+            {
+                if (c == '\n')
+                {
+                    found_newline = 1;
+                    break;
+                }
+            }
+            if (!found_newline)
+            {
+                /* The overlong line ran to EOF; nothing left to read. */
+                break;
+            }
+            continue;
+        }
+
+        name_end = strchr(line, ':');
+        if ((name_end == NULL) || (name_end == line))
         {
             continue;
         }
@@ -235,6 +263,10 @@ int taz_passwd_name_from_uid(const char *passwd_path, unsigned long uid,
         if ((uid_end == NULL) || (uid_end == uid_start))
         {
             continue;
+        }
+        if ((uid_start[0] < '0') || (uid_start[0] > '9'))
+        {
+            continue; /* reject leading '-', '+', whitespace, etc. */
         }
 
         *uid_end = '\0';
