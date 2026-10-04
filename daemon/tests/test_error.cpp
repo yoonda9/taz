@@ -140,9 +140,21 @@ class ErrorFromFsReq : public ::testing::Test
   protected:
     void SetUp() override
     {
+        char tmpdir[1024];
+        size_t tmpdir_len = sizeof(tmpdir) - 1;
+        ASSERT_EQ(uv_os_tmpdir(tmpdir, &tmpdir_len), 0);
+        const std::string tpl_str =
+            std::string(tmpdir, tmpdir_len) + "/taz_error_test_XXXXXX";
+        std::vector<char> tpl(tpl_str.begin(), tpl_str.end());
+        tpl.push_back('\0');
+
         uv_fs_t req;
-        char tpl[] = "/tmp/taz_error_test_XXXXXX";
-        ASSERT_EQ(uv_fs_mkdtemp(NULL, &req, tpl, NULL), 0);
+        const int rc = uv_fs_mkdtemp(NULL, &req, tpl.data(), NULL);
+        if (rc != 0)
+        {
+            uv_fs_req_cleanup(&req);
+        }
+        ASSERT_EQ(rc, 0);
         dir_ = req.path;
         uv_fs_req_cleanup(&req);
     }
