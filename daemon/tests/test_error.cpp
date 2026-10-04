@@ -2,10 +2,12 @@
 
 #include <cerrno>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 #include <pb_decode.h>
+#include <uv.h>
 
 #include "taz/error.h"
 #include "taz/frame.h"
@@ -128,6 +130,149 @@ TEST(ErrorFromWin32, UnknownMapsToInternal)
 }
 
 #endif /* _WIN32 */
+
+// ---------------------------------------------------------------------------
+// taz_error_from_fs_req / taz_error_fs_detail
+// ---------------------------------------------------------------------------
+
+class ErrorFromFsReq : public ::testing::Test
+{
+  protected:
+    void SetUp() override
+    {
+        uv_fs_t req;
+        char tpl[] = "/tmp/taz_error_test_XXXXXX";
+        ASSERT_EQ(uv_fs_mkdtemp(NULL, &req, tpl, NULL), 0);
+        dir_ = req.path;
+        uv_fs_req_cleanup(&req);
+    }
+
+    void TearDown() override
+    {
+        // Best-effort cleanup; individual tests remove what they create.
+        uv_fs_t req;
+        (void)uv_fs_rmdir(NULL, &req, dir_.c_str(), NULL);
+        uv_fs_req_cleanup(&req);
+    }
+
+    const std::string &Dir() const
+    {
+        return dir_;
+    }
+
+  private:
+    std::string dir_;
+};
+
+TEST_F(ErrorFromFsReq, StatMissingPathMapsToNotFound)
+{
+    const std::string missing = Dir() + "/does-not-exist";
+    uv_fs_t req;
+    const int rc = uv_fs_lstat(NULL, &req, missing.c_str(), NULL);
+    ASSERT_LT(rc, 0);
+    ASSERT_LT(req.result, 0);
+
+    EXPECT_EQ(taz_error_from_fs_req(&req),
+              taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+    EXPECT_STRNE(taz_error_fs_detail(&req), "");
+    EXPECT_STREQ(taz_error_fs_detail(&req), uv_strerror((int)req.result));
+    uv_fs_req_cleanup(&req);
+}
+
+TEST_F(ErrorFromFsReq, MkdirExistingDirectoryMapsToAlreadyExists)
+{
+    uv_fs_t req;
+    const int rc = uv_fs_mkdir(NULL, &req, Dir().c_str(), 0755, NULL);
+    ASSERT_LT(rc, 0);
+    ASSERT_LT(req.result, 0);
+
+    EXPECT_EQ(taz_error_from_fs_req(&req),
+              taz_v1_ErrorCode_ERROR_CODE_ALREADY_EXISTS);
+    EXPECT_STRNE(taz_error_fs_detail(&req), "");
+    uv_fs_req_cleanup(&req);
+}
+
+TEST_F(ErrorFromFsReq, OpenExclExistingFileMapsToAlreadyExists)
+{
+    const std::string path = Dir() + "/existing-file";
+    uv_fs_t create_req;
+    const int fd = uv_fs_open(NULL, &create_req, path.c_str(),
+                              UV_FS_O_WRONLY | UV_FS_O_CREAT, 0644, NULL);
+    ASSERT_GE(fd, 0);
+    uv_fs_req_cleanup(&create_req);
+    uv_fs_t close_req;
+    ASSERT_EQ(uv_fs_close(NULL, &close_req, fd, NULL), 0);
+    uv_fs_req_cleanup(&close_req);
+
+    uv_fs_t req;
+    const int rc =
+        uv_fs_open(NULL, &req, path.c_str(),
+                   UV_FS_O_WRONLY | UV_FS_O_CREAT | UV_FS_O_EXCL, 0644, NULL);
+    ASSERT_LT(rc, 0);
+    ASSERT_LT(req.result, 0);
+
+    EXPECT_EQ(taz_error_from_fs_req(&req),
+              taz_v1_ErrorCode_ERROR_CODE_ALREADY_EXISTS);
+    EXPECT_STRNE(taz_error_fs_detail(&req), "");
+    uv_fs_req_cleanup(&req);
+
+    uv_fs_t unlink_req;
+    (void)uv_fs_unlink(NULL, &unlink_req, path.c_str(), NULL);
+    uv_fs_req_cleanup(&unlink_req);
+}
+
+TEST_F(ErrorFromFsReq, RmdirNonEmptyDirectoryMapsToInternal)
+{
+    const std::string sub = Dir() + "/nonempty";
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(NULL, &mkdir_req, sub.c_str(), 0755, NULL), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    const std::string child = sub + "/child";
+    uv_fs_t open_req;
+    const int fd = uv_fs_open(NULL, &open_req, child.c_str(),
+                              UV_FS_O_WRONLY | UV_FS_O_CREAT, 0644, NULL);
+    ASSERT_GE(fd, 0);
+    uv_fs_req_cleanup(&open_req);
+    uv_fs_t close_req;
+    ASSERT_EQ(uv_fs_close(NULL, &close_req, fd, NULL), 0);
+    uv_fs_req_cleanup(&close_req);
+
+    uv_fs_t req;
+    const int rc = uv_fs_rmdir(NULL, &req, sub.c_str(), NULL);
+    ASSERT_LT(rc, 0);
+    ASSERT_LT(req.result, 0);
+
+    EXPECT_EQ(taz_error_from_fs_req(&req),
+              taz_v1_ErrorCode_ERROR_CODE_INTERNAL);
+    EXPECT_STRNE(taz_error_fs_detail(&req), "");
+    uv_fs_req_cleanup(&req);
+
+    uv_fs_t unlink_req;
+    (void)uv_fs_unlink(NULL, &unlink_req, child.c_str(), NULL);
+    uv_fs_req_cleanup(&unlink_req);
+    uv_fs_t rmdir_req;
+    (void)uv_fs_rmdir(NULL, &rmdir_req, sub.c_str(), NULL);
+    uv_fs_req_cleanup(&rmdir_req);
+}
+
+TEST_F(ErrorFromFsReq, UnlinkDirectoryMapsToExpectedCode)
+{
+    uv_fs_t req;
+    const int rc = uv_fs_unlink(NULL, &req, Dir().c_str(), NULL);
+    ASSERT_LT(rc, 0);
+    ASSERT_LT(req.result, 0);
+
+#ifdef _WIN32
+    EXPECT_EQ(taz_error_from_fs_req(&req),
+              taz_v1_ErrorCode_ERROR_CODE_PERMISSION_DENIED);
+#else
+    EXPECT_EQ(taz_error_from_fs_req(&req),
+              taz_v1_ErrorCode_ERROR_CODE_INTERNAL);
+#endif
+    EXPECT_STRNE(taz_error_fs_detail(&req), "");
+    EXPECT_STREQ(taz_error_fs_detail(&req), uv_strerror((int)req.result));
+    uv_fs_req_cleanup(&req);
+}
 
 // ---------------------------------------------------------------------------
 // taz_error_send

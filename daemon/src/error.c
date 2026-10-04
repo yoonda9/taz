@@ -73,6 +73,22 @@ taz_v1_ErrorCode taz_error_from_win32(unsigned long err)
 }
 #endif
 
+taz_v1_ErrorCode taz_error_from_fs_req(const uv_fs_t *req)
+{
+    int sys_err = uv_fs_get_system_error(req);
+
+#ifdef _WIN32
+    return taz_error_from_win32((unsigned long)sys_err);
+#else
+    return taz_error_from_errno(sys_err);
+#endif
+}
+
+const char *taz_error_fs_detail(const uv_fs_t *req)
+{
+    return uv_strerror((int)req->result);
+}
+
 void taz_error_send(taz_dispatch_write_fn_t write_fn, void *ctx,
                     uint32_t stream_id, uint16_t opcode, taz_v1_ErrorCode code,
                     const char *message, const char *detail)

@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <uv.h>
+
 #include "taz/dispatch.h"
 #include "taz/v1/common.pb.h"
 
@@ -25,6 +27,14 @@ extern "C"
     /* Map a Win32 GetLastError() value to an ErrorCode. */
     taz_v1_ErrorCode taz_error_from_win32(unsigned long err);
 #endif
+
+    /* Map a failed synchronous uv_fs_* request (req->result < 0) to an
+     * ErrorCode via the platform error from uv_fs_get_system_error. */
+    taz_v1_ErrorCode taz_error_from_fs_req(const uv_fs_t *req);
+
+    /* The platform error string for a failed synchronous uv_fs_* request,
+     * for use as the ErrorInfo detail field. */
+    const char *taz_error_fs_detail(const uv_fs_t *req);
 
     /* Build and send an ERROR frame via write_fn.
      * message and detail may be NULL. */
