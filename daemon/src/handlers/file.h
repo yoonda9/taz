@@ -23,6 +23,29 @@ extern "C"
                           const uint8_t *payload,
                           taz_dispatch_write_fn_t write_fn, void *ctx);
 
+    /* Async FILE_CREATE handler: decode the request (the content field is a
+     * decode callback copied into a heap buffer while still on the loop
+     * thread, since payload is only valid for the duration of this call),
+     * reject an empty path with INVALID_REQUEST, then on the thread pool
+     * exclusively create the file (permissions == 0 defaults to 0644) and
+     * write all of content, closing it either way. Replies with a
+     * FileCreateResponse(success=true) or an error (e.g. ALREADY_EXISTS when
+     * the path exists, NOT_FOUND when a parent directory is missing). A
+     * write failure closes the file and leaves whatever was written so far
+     * on disk. Closes the stream itself. */
+    void handle_file_create(taz_dispatch_t *d, const taz_frame_header_t *header,
+                            const uint8_t *payload,
+                            taz_dispatch_write_fn_t write_fn, void *ctx);
+
+    /* Async FILE_DELETE handler: decode the request, reject an empty path
+     * with INVALID_REQUEST, then uv_fs_unlink the path on the thread pool
+     * (removes a symlink itself, never its target; never removes a
+     * directory). Replies with a FileDeleteResponse(success=true) or an
+     * error. Closes the stream itself. */
+    void handle_file_delete(taz_dispatch_t *d, const taz_frame_header_t *header,
+                            const uint8_t *payload,
+                            taz_dispatch_write_fn_t write_fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

@@ -213,6 +213,10 @@ static const opcode_entry_t OPCODE_TABLE[] = {
     {NULL, handle_command_exec, (uint16_t)taz_v1_Opcode_OPCODE_COMMAND_EXEC,
      true},
     {NULL, handle_file_stat, (uint16_t)taz_v1_Opcode_OPCODE_FILE_STAT, true},
+    {NULL, handle_file_create, (uint16_t)taz_v1_Opcode_OPCODE_FILE_CREATE,
+     true},
+    {NULL, handle_file_delete, (uint16_t)taz_v1_Opcode_OPCODE_FILE_DELETE,
+     true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))

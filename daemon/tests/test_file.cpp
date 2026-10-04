@@ -1,6 +1,6 @@
-// Unit tests for handlers/file.c: FILE_STAT driven end to end through
-// taz_dispatch_frame with a real uv_loop_t, so the handler's work-submit /
-// after-work path (taz/work.h) actually runs.
+// Unit tests for handlers/file.c: FILE_STAT, FILE_CREATE and FILE_DELETE
+// driven end to end through taz_dispatch_frame with a real uv_loop_t, so the
+// handlers' work-submit / after-work path (taz/work.h) actually runs.
 
 #include <cstdint>
 #include <cstring>
@@ -94,12 +94,71 @@ std::vector<uint8_t> encode_stat_request(const std::string &path)
     return buf;
 }
 
+// FileCreateRequest.content is FT_CALLBACK; encoding it needs an encode
+// callback (mirrors handlers/command.c's encode_bytes for *_data fields).
+struct BytesCtx
+{
+    const uint8_t *data;
+    size_t len;
+};
+
+bool EncodeBytesField(pb_ostream_t *stream, const pb_field_iter_t *field,
+                      void *const *arg)
+{
+    const auto *bctx = static_cast<const BytesCtx *>(*arg);
+    if (!pb_encode_tag_for_field(stream, field))
+    {
+        return false;
+    }
+    return pb_encode_string(stream, bctx->data, bctx->len);
+}
+
+std::vector<uint8_t> encode_create_request(const std::string &path,
+                                           const std::string &content,
+                                           uint32_t permissions)
+{
+    taz_v1_FileCreateRequest req = taz_v1_FileCreateRequest_init_zero;
+    if (!path.empty())
+    {
+        (void)strncpy(req.path, path.c_str(), sizeof(req.path) - 1U);
+    }
+    req.permissions = permissions;
+
+    BytesCtx bctx{reinterpret_cast<const uint8_t *>(content.data()),
+                  content.size()};
+    if (!content.empty())
+    {
+        req.content.funcs.encode = EncodeBytesField;
+        req.content.arg = &bctx;
+    }
+
+    std::vector<uint8_t> buf(sizeof(req.path) + content.size() + 64U);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(pb_encode(&ostream, taz_v1_FileCreateRequest_fields, &req));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
+std::vector<uint8_t> encode_delete_request(const std::string &path)
+{
+    taz_v1_FileDeleteRequest req = taz_v1_FileDeleteRequest_init_zero;
+    if (!path.empty())
+    {
+        (void)strncpy(req.path, path.c_str(), sizeof(req.path) - 1U);
+    }
+    std::vector<uint8_t> buf(taz_v1_FileDeleteRequest_size);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(pb_encode(&ostream, taz_v1_FileDeleteRequest_fields, &req));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
 // ---------------------------------------------------------------------------
 // Fixture: real loop, fake dispatch, a scratch directory removed in
 // TearDown.
 // ---------------------------------------------------------------------------
 
-class FileStatTest : public ::testing::Test
+class FileHandlerTest : public ::testing::Test
 {
   protected:
     void SetUp() override
@@ -202,18 +261,19 @@ class FileStatTest : public ::testing::Test
         uv_fs_req_cleanup(&chmod_req);
     }
 
-    // Drives one FILE_STAT REQUEST through taz_dispatch_frame. If
+    // Drives one REQUEST of the given opcode through taz_dispatch_frame. If
     // check_in_flight is set, it runs right after dispatch returns but
     // before the loop runs, to observe state while the work is still
     // (ostensibly) in flight.
-    void
-    DispatchStatRequest(const std::vector<uint8_t> &payload, uint32_t stream_id,
-                        const std::function<void()> &check_in_flight = nullptr)
+    void DispatchRequest(taz_v1_Opcode opcode,
+                         const std::vector<uint8_t> &payload,
+                         uint32_t stream_id,
+                         const std::function<void()> &check_in_flight = nullptr)
     {
         taz_frame_header_t header{};
         header.type = static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST);
         header.flags = static_cast<uint8_t>(taz_v1_FrameFlag_FRAME_FLAG_NONE);
-        header.opcode = static_cast<uint16_t>(taz_v1_Opcode_OPCODE_FILE_STAT);
+        header.opcode = static_cast<uint16_t>(opcode);
         header.length = static_cast<uint32_t>(payload.size());
         header.stream_id = stream_id;
 
@@ -225,6 +285,69 @@ class FileStatTest : public ::testing::Test
             check_in_flight();
         }
         ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    }
+
+    // Convenience wrapper for the FILE_STAT tests (written before FILE_CREATE/
+    // FILE_DELETE existed; kept so those tests read the same as before).
+    void
+    DispatchStatRequest(const std::vector<uint8_t> &payload, uint32_t stream_id,
+                        const std::function<void()> &check_in_flight = nullptr)
+    {
+        DispatchRequest(taz_v1_Opcode_OPCODE_FILE_STAT, payload, stream_id,
+                        check_in_flight);
+    }
+
+    static bool PathExists(const std::string &path)
+    {
+        uv_fs_t req;
+        const int rc = uv_fs_lstat(nullptr, &req, path.c_str(), nullptr);
+        uv_fs_req_cleanup(&req);
+        return rc == 0;
+    }
+
+#ifndef _WIN32
+    static uint64_t FileMode(const std::string &path)
+    {
+        uv_fs_t req;
+        const int rc = uv_fs_lstat(nullptr, &req, path.c_str(), nullptr);
+        const uint64_t mode = (rc == 0) ? (req.statbuf.st_mode & 07777U) : 0U;
+        uv_fs_req_cleanup(&req);
+        return mode;
+    }
+#endif
+
+    static std::string ReadFileBytes(const std::string &path)
+    {
+        uv_fs_t open_req;
+        const uv_file fd = uv_fs_open(nullptr, &open_req, path.c_str(),
+                                      UV_FS_O_RDONLY, 0, nullptr);
+        uv_fs_req_cleanup(&open_req);
+        if (fd < 0)
+        {
+            return std::string();
+        }
+
+        std::string data;
+        char chunk[4096];
+        for (;;)
+        {
+            const uv_buf_t buf = uv_buf_init(chunk, sizeof(chunk));
+            uv_fs_t read_req;
+            const int n =
+                uv_fs_read(nullptr, &read_req, fd, &buf, 1,
+                           static_cast<int64_t>(data.size()), nullptr);
+            uv_fs_req_cleanup(&read_req);
+            if (n <= 0)
+            {
+                break;
+            }
+            data.append(chunk, static_cast<size_t>(n));
+        }
+
+        uv_fs_t close_req;
+        (void)uv_fs_close(nullptr, &close_req, fd, nullptr);
+        uv_fs_req_cleanup(&close_req);
+        return data;
     }
 
     const std::vector<std::vector<uint8_t>> &Frames() const
@@ -262,7 +385,7 @@ class FileStatTest : public ::testing::Test
 
 } // namespace
 
-TEST_F(FileStatTest, RegularFileReportsSizeAndKind)
+TEST_F(FileHandlerTest, RegularFileReportsSizeAndKind)
 {
     const std::string path = JoinDir("hello.txt");
     WriteFile(path, "hello"); // 5 bytes
@@ -308,7 +431,7 @@ TEST_F(FileStatTest, RegularFileReportsSizeAndKind)
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
-TEST_F(FileStatTest, DirectoryReportsKindDir)
+TEST_F(FileHandlerTest, DirectoryReportsKindDir)
 {
     const std::string path = JoinDir("subdir");
     uv_fs_t mkdir_req;
@@ -328,7 +451,7 @@ TEST_F(FileStatTest, DirectoryReportsKindDir)
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
-TEST_F(FileStatTest, SymlinkReportsKindSymlinkAndTarget)
+TEST_F(FileHandlerTest, SymlinkReportsKindSymlinkAndTarget)
 {
     const std::string target = JoinDir("target.txt");
     WriteFile(target, "x");
@@ -360,7 +483,7 @@ TEST_F(FileStatTest, SymlinkReportsKindSymlinkAndTarget)
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
-TEST_F(FileStatTest, MissingPathReturnsNotFoundWithDetail)
+TEST_F(FileHandlerTest, MissingPathReturnsNotFoundWithDetail)
 {
     const std::string path = JoinDir("does-not-exist");
 
@@ -382,7 +505,7 @@ TEST_F(FileStatTest, MissingPathReturnsNotFoundWithDetail)
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
-TEST_F(FileStatTest, EmptyPathIsInvalidRequestWithoutTouchingThePool)
+TEST_F(FileHandlerTest, EmptyPathIsInvalidRequestWithoutTouchingThePool)
 {
     DispatchStatRequest(encode_stat_request(""), 5U);
 
@@ -402,7 +525,7 @@ TEST_F(FileStatTest, EmptyPathIsInvalidRequestWithoutTouchingThePool)
     EXPECT_EQ(ActiveStreamCount(), 0U);
 }
 
-TEST_F(FileStatTest, EmptyPathFieldInNonEmptyPayloadIsInvalidRequest)
+TEST_F(FileHandlerTest, EmptyPathFieldInNonEmptyPayloadIsInvalidRequest)
 {
     // Tag 1 (path), wire type 2 (LEN), explicit zero length: unlike
     // encode_stat_request(""), this payload is non-empty, so dispatch takes
@@ -427,7 +550,7 @@ TEST_F(FileStatTest, EmptyPathFieldInNonEmptyPayloadIsInvalidRequest)
     EXPECT_EQ(ActiveStreamCount(), 0U);
 }
 
-TEST_F(FileStatTest, UndecodablePayloadIsInvalidRequest)
+TEST_F(FileHandlerTest, UndecodablePayloadIsInvalidRequest)
 {
     // Tag 1 (path), wire type 2 (LEN), announcing a 200-byte string but
     // supplying none: pb_decode must fail on truncated input.
@@ -449,7 +572,7 @@ TEST_F(FileStatTest, UndecodablePayloadIsInvalidRequest)
     EXPECT_EQ(ActiveStreamCount(), 0U);
 }
 
-TEST_F(FileStatTest, StreamIsActiveAndConnectionRefdWhileInFlight)
+TEST_F(FileHandlerTest, StreamIsActiveAndConnectionRefdWhileInFlight)
 {
     const std::string path = JoinDir("hello.txt");
     WriteFile(path, "hello");
@@ -468,7 +591,7 @@ TEST_F(FileStatTest, StreamIsActiveAndConnectionRefdWhileInFlight)
     EXPECT_EQ(UnrefCount(), 1);
 }
 
-TEST_F(FileStatTest, ConnectionClosingWhileInFlightSendsNothing)
+TEST_F(FileHandlerTest, ConnectionClosingWhileInFlightSendsNothing)
 {
     const std::string path = JoinDir("hello.txt");
     WriteFile(path, "hello");
@@ -485,4 +608,300 @@ TEST_F(FileStatTest, ConnectionClosingWhileInFlightSendsNothing)
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), 1);
     EXPECT_EQ(UnrefCount(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// FILE_CREATE
+// ---------------------------------------------------------------------------
+
+TEST_F(FileHandlerTest, CreateEmptyContentSucceedsWithZeroSize)
+{
+    const std::string path = JoinDir("created.txt");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
+                    encode_create_request(path, "", 0U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(h.opcode,
+              static_cast<uint16_t>(taz_v1_Opcode_OPCODE_FILE_CREATE));
+
+    taz_v1_FileCreateResponse resp = taz_v1_FileCreateResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_FileCreateResponse_fields, &resp));
+    EXPECT_TRUE(resp.success);
+
+    EXPECT_TRUE(PathExists(path));
+    EXPECT_EQ(ReadFileBytes(path).size(), 0U);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CreateWithContentWritesAllBytes)
+{
+    const std::string path = JoinDir("created.txt");
+    const std::string content(3000U, 'x');
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
+                    encode_create_request(path, content, 0U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(ReadFileBytes(path), content);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CreateExistingReturnsAlreadyExists)
+{
+    const std::string path = JoinDir("created.txt");
+    WriteFile(path, "existing");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
+                    encode_create_request(path, "new", 0U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_ALREADY_EXISTS);
+    EXPECT_EQ(ReadFileBytes(path), "existing");
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CreateUnderMissingDirectoryReturnsNotFound)
+{
+    const std::string path = JoinDir("no-such-dir/created.txt");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
+                    encode_create_request(path, "", 0U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+#ifndef _WIN32
+TEST_F(FileHandlerTest, CreateWithExplicitModeHonoursPermissions)
+{
+    const std::string path = JoinDir("created.txt");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
+                    encode_create_request(path, "", 0600U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(FileMode(path), 0600U);
+}
+
+TEST_F(FileHandlerTest, CreateWithZeroPermissionsDefaultsToDefaultMode)
+{
+    const std::string path = JoinDir("created.txt");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
+                    encode_create_request(path, "", 0U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(FileMode(path), 0644U);
+}
+#endif
+
+TEST_F(FileHandlerTest, CreateEmptyPathIsInvalidRequestWithoutTouchingThePool)
+{
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
+                    encode_create_request("", "", 0U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "path is required");
+
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+TEST_F(FileHandlerTest, CreateUndecodablePayloadIsInvalidRequest)
+{
+    // Tag 1 (path), wire type 2 (LEN), announcing a 200-byte string but
+    // supplying none: pb_decode must fail on truncated input.
+    const std::vector<uint8_t> payload{0x0AU, 0xC8U, 0x01U};
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE, payload, 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+// ---------------------------------------------------------------------------
+// FILE_DELETE
+// ---------------------------------------------------------------------------
+
+TEST_F(FileHandlerTest, DeleteRemovesFile)
+{
+    const std::string path = JoinDir("hello.txt");
+    WriteFile(path, "hello");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_DELETE,
+                    encode_delete_request(path), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+
+    taz_v1_FileDeleteResponse resp = taz_v1_FileDeleteResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_FileDeleteResponse_fields, &resp));
+    EXPECT_TRUE(resp.success);
+    EXPECT_FALSE(PathExists(path));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DeleteMissingReturnsNotFound)
+{
+    const std::string path = JoinDir("does-not-exist");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_DELETE,
+                    encode_delete_request(path), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+    EXPECT_STRNE(err.detail, "");
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DeleteDirectoryReturnsErrorAndDirectorySurvives)
+{
+    const std::string path = JoinDir("subdir");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, path.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_DELETE,
+                    encode_delete_request(path), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_NE(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+    EXPECT_TRUE(PathExists(path));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DeleteSymlinkRemovesLinkNotTarget)
+{
+    const std::string target = JoinDir("target.txt");
+    WriteFile(target, "x");
+    const std::string link = JoinDir("link");
+
+    uv_fs_t symlink_req;
+    const int rc = uv_fs_symlink(nullptr, &symlink_req, "target.txt",
+                                 link.c_str(), 0, nullptr);
+    uv_fs_req_cleanup(&symlink_req);
+#ifdef _WIN32
+    if (rc == UV_EPERM || rc == UV_EACCES)
+    {
+        GTEST_SKIP() << "no symlink privilege on this Windows host";
+    }
+#endif
+    ASSERT_EQ(rc, 0);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_DELETE,
+                    encode_delete_request(link), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_FALSE(PathExists(link));
+    EXPECT_TRUE(PathExists(target));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DeleteEmptyPathIsInvalidRequestWithoutTouchingThePool)
+{
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_DELETE, encode_delete_request(""),
+                    1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "path is required");
+
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+TEST_F(FileHandlerTest, DeleteUndecodablePayloadIsInvalidRequest)
+{
+    const std::vector<uint8_t> payload{0x0AU, 0xC8U, 0x01U};
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_DELETE, payload, 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
 }
