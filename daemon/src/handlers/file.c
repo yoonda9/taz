@@ -25,6 +25,9 @@
  * (proto3 cannot distinguish "unset" from 0; DEC-008). */
 #define TAZ_FILE_DEFAULT_MODE 0644U
 
+/* DIR_MAKE's default mode when the request's permissions field is 0. */
+#define TAZ_DIR_DEFAULT_MODE 0755U
+
 #ifndef _WIN32
 #define TAZ_PASSWD_PATH "/etc/passwd"
 #endif
@@ -697,6 +700,238 @@ void handle_file_chmod(taz_dispatch_t *d, const taz_frame_header_t *header,
     fctx->req = req;
 
     if (taz_work_submit(d, header->stream_id, file_chmod_work, file_chmod_done,
+                        fctx) != 0)
+    {
+        free(fctx);
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+                       "work submit failed", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+}
+
+/* Carries everything dir_make_work/dir_make_done need. */
+typedef struct
+{
+    taz_dispatch_write_fn_t write_fn;
+    void *write_ctx;
+    uint32_t stream_id;
+    uint16_t opcode;
+    taz_v1_DirMakeRequest req;
+
+    int ok;
+    taz_v1_ErrorCode error_code;
+    const char *detail;
+    taz_v1_DirMakeResponse resp;
+} dir_make_ctx_t;
+
+/* mkdir -p over a heap copy of fctx->req.path: create every missing prefix
+ * (ignoring EEXIST on a prefix - it may already exist, or mkdir may fail
+ * for a reason the next level's mkdir will surface instead), then the final
+ * component. taz_fsutil_root_prefix_len/taz_fsutil_is_sep keep this
+ * portable (POSIX "/", Windows drive/UNC/long-path prefixes); trailing
+ * separators are trimmed first so they never produce an empty component. */
+static void dir_make_parents(dir_make_ctx_t *fctx, uint32_t mode)
+{
+    const size_t path_len = strlen(fctx->req.path);
+    char *copy = (char *)malloc(path_len + 1U);
+    size_t root_len;
+    size_t len;
+    size_t i;
+    uv_fs_t req;
+
+    if (copy == NULL)
+    {
+        fctx->ok = 0;
+        fctx->error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+        fctx->detail = "out of memory";
+        return;
+    }
+    (void)memcpy(copy, fctx->req.path, path_len + 1U);
+
+    /* Trim trailing separators by scanning forward from root_len and
+     * remembering the position just past the last non-separator byte
+     * seen - equivalent to trimming from the end, but indexes only ever
+     * increase (0 <= i < path_len), which keeps every array access
+     * trivially in bounds for a static analyzer. */
+    root_len = taz_fsutil_root_prefix_len(copy);
+    len = root_len;
+    for (i = root_len; i < path_len; i++)
+    {
+        if (!taz_fsutil_is_sep(copy[i]))
+        {
+            len = i + 1U;
+        }
+    }
+    copy[len] = '\0';
+
+    for (i = root_len; i < len; i++)
+    {
+        if (!taz_fsutil_is_sep(copy[i]))
+        {
+            continue;
+        }
+
+        {
+            const char saved = copy[i];
+            copy[i] = '\0';
+            if ((uv_fs_mkdir(NULL, &req, copy, (int)mode, NULL) < 0) &&
+                (req.result != UV_EEXIST))
+            {
+                fctx->ok = 0;
+                fctx->error_code = taz_error_from_fs_req(&req);
+                fctx->detail = taz_error_fs_detail(&req);
+                uv_fs_req_cleanup(&req);
+                free(copy);
+                return;
+            }
+            uv_fs_req_cleanup(&req);
+            copy[i] = saved;
+        }
+    }
+
+    if (uv_fs_mkdir(NULL, &req, copy, (int)mode, NULL) < 0)
+    {
+        if (req.result == UV_EEXIST)
+        {
+            uv_fs_t stat_req;
+            int is_dir = 0;
+            if (uv_fs_lstat(NULL, &stat_req, copy, NULL) == 0)
+            {
+                is_dir = (taz_fsutil_kind_from_mode(stat_req.statbuf.st_mode) ==
+                          taz_v1_Kind_KIND_DIR);
+            }
+            uv_fs_req_cleanup(&stat_req);
+            uv_fs_req_cleanup(&req);
+            free(copy);
+
+            if (is_dir)
+            {
+                fctx->resp.success = true;
+                fctx->ok = 1;
+                return;
+            }
+            fctx->ok = 0;
+            fctx->error_code = taz_v1_ErrorCode_ERROR_CODE_ALREADY_EXISTS;
+            fctx->detail = "path exists and is not a directory";
+            return;
+        }
+
+        fctx->ok = 0;
+        fctx->error_code = taz_error_from_fs_req(&req);
+        fctx->detail = taz_error_fs_detail(&req);
+        uv_fs_req_cleanup(&req);
+        free(copy);
+        return;
+    }
+
+    uv_fs_req_cleanup(&req);
+    free(copy);
+    fctx->resp.success = true;
+    fctx->ok = 1;
+}
+
+/* Pool thread: without parents, a single uv_fs_mkdir; with parents, the
+ * mkdir -p walk above. */
+static void dir_make_work(void *user)
+{
+    dir_make_ctx_t *fctx = (dir_make_ctx_t *)user;
+    const uint32_t mode = (fctx->req.permissions != 0U)
+                              ? (fctx->req.permissions & TAZ_FS_MODE_BITS)
+                              : TAZ_DIR_DEFAULT_MODE;
+
+    if (fctx->req.parents)
+    {
+        dir_make_parents(fctx, mode);
+        return;
+    }
+
+    {
+        uv_fs_t req;
+        if (uv_fs_mkdir(NULL, &req, fctx->req.path, (int)mode, NULL) < 0)
+        {
+            fctx->ok = 0;
+            fctx->error_code = taz_error_from_fs_req(&req);
+            fctx->detail = taz_error_fs_detail(&req);
+            uv_fs_req_cleanup(&req);
+            return;
+        }
+        uv_fs_req_cleanup(&req);
+    }
+
+    fctx->resp.success = true;
+    fctx->ok = 1;
+}
+
+static void dir_make_done(void *user, int closing)
+{
+    dir_make_ctx_t *fctx = (dir_make_ctx_t *)user;
+
+    if (!closing)
+    {
+        if (fctx->ok)
+        {
+            taz_response_send(fctx->write_fn, fctx->write_ctx, fctx->stream_id,
+                              fctx->opcode, taz_v1_DirMakeResponse_fields,
+                              &fctx->resp);
+        }
+        else
+        {
+            taz_error_send(fctx->write_fn, fctx->write_ctx, fctx->stream_id,
+                           fctx->opcode, fctx->error_code, "mkdir failed",
+                           fctx->detail);
+        }
+    }
+    free(fctx);
+}
+
+void handle_dir_make(taz_dispatch_t *d, const taz_frame_header_t *header,
+                     const uint8_t *payload, taz_dispatch_write_fn_t write_fn,
+                     void *ctx)
+{
+    taz_v1_DirMakeRequest req = taz_v1_DirMakeRequest_init_zero;
+    dir_make_ctx_t *fctx;
+
+    if (payload != NULL && header->length > 0U)
+    {
+        pb_istream_t istream =
+            pb_istream_from_buffer(payload, (size_t)header->length);
+        if (!pb_decode(&istream, taz_v1_DirMakeRequest_fields, &req))
+        {
+            taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                           taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                           "decode DirMakeRequest failed", NULL);
+            taz_dispatch_stream_done(d, header->stream_id);
+            return;
+        }
+    }
+
+    if (req.path[0] == '\0')
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                       "path is required", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+
+    fctx = (dir_make_ctx_t *)calloc(1U, sizeof(*fctx));
+    if (fctx == NULL)
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
+                       NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+    fctx->write_fn = write_fn;
+    fctx->write_ctx = ctx;
+    fctx->stream_id = header->stream_id;
+    fctx->opcode = header->opcode;
+    fctx->req = req;
+
+    if (taz_work_submit(d, header->stream_id, dir_make_work, dir_make_done,
                         fctx) != 0)
     {
         free(fctx);

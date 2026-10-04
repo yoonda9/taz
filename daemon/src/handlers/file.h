@@ -59,6 +59,20 @@ extern "C"
                            const uint8_t *payload,
                            taz_dispatch_write_fn_t write_fn, void *ctx);
 
+    /* Async DIR_MAKE handler: decode the request, reject an empty path with
+     * INVALID_REQUEST, then on the thread pool create the directory
+     * (permissions == 0 defaults to 0755). With parents == false this is a
+     * single uv_fs_mkdir (EEXIST -> ALREADY_EXISTS, a missing parent ->
+     * NOT_FOUND). With parents == true (mkdir -p) it walks the path via
+     * taz_fsutil_root_prefix_len / taz_fsutil_is_sep, creating each missing
+     * prefix (ignoring EEXIST on a prefix); when the final component
+     * already exists, success if it is a directory, else ALREADY_EXISTS.
+     * Replies with a DirMakeResponse(success=true) or an error. Closes the
+     * stream itself. */
+    void handle_dir_make(taz_dispatch_t *d, const taz_frame_header_t *header,
+                         const uint8_t *payload,
+                         taz_dispatch_write_fn_t write_fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif
