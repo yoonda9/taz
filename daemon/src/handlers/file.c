@@ -728,15 +728,17 @@ typedef struct
 
 /* mkdir -p over a heap copy of fctx->req.path: create every missing prefix,
  * then the final component. A prefix mkdir failure other than EEXIST fails
- * the whole call immediately. On EEXIST, lstat the prefix to confirm it is
- * really a directory: CreateDirectoryW/mkdir through a regular-file prefix
- * reports a platform-specific error on the *next* level down (ENOTDIR on
- * POSIX, ERROR_PATH_NOT_FOUND -> NOT_FOUND on Windows), so checking here
- * keeps the error code platform-independent (ALREADY_EXISTS) instead of
- * leaking that difference to the caller. taz_fsutil_root_prefix_len/
- * taz_fsutil_is_sep keep this portable (POSIX "/", Windows drive/UNC/
- * long-path prefixes); trailing separators are trimmed first so they never
- * produce an empty component. */
+ * the whole call immediately. On EEXIST, stat (not lstat) the prefix to
+ * confirm it is really a directory: CreateDirectoryW/mkdir through a
+ * regular-file prefix reports a platform-specific error on the *next* level
+ * down (ENOTDIR on POSIX, ERROR_PATH_NOT_FOUND -> NOT_FOUND on Windows), so
+ * checking here keeps the error code platform-independent (ALREADY_EXISTS)
+ * instead of leaking that difference to the caller. Following symlinks
+ * (stat, not lstat) matches mkdir -p: a prefix or final component that is a
+ * symlink to a directory counts as already existing, same as coreutils
+ * mkdir -p. taz_fsutil_root_prefix_len/taz_fsutil_is_sep keep this portable
+ * (POSIX "/", Windows drive/UNC/long-path prefixes); trailing separators are
+ * trimmed first so they never produce an empty component. */
 static void dir_make_parents(dir_make_ctx_t *fctx, uint32_t mode)
 {
     const size_t path_len = strlen(fctx->req.path);
@@ -796,7 +798,7 @@ static void dir_make_parents(dir_make_ctx_t *fctx, uint32_t mode)
                 {
                     uv_fs_t stat_req;
                     int is_dir = 0;
-                    if (uv_fs_lstat(NULL, &stat_req, copy, NULL) == 0)
+                    if (uv_fs_stat(NULL, &stat_req, copy, NULL) == 0)
                     {
                         is_dir = (taz_fsutil_kind_from_mode(
                                       stat_req.statbuf.st_mode) ==
@@ -830,7 +832,7 @@ static void dir_make_parents(dir_make_ctx_t *fctx, uint32_t mode)
         {
             uv_fs_t stat_req;
             int is_dir = 0;
-            if (uv_fs_lstat(NULL, &stat_req, copy, NULL) == 0)
+            if (uv_fs_stat(NULL, &stat_req, copy, NULL) == 0)
             {
                 is_dir = (taz_fsutil_kind_from_mode(stat_req.statbuf.st_mode) ==
                           taz_v1_Kind_KIND_DIR);

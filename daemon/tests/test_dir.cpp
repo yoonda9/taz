@@ -195,6 +195,89 @@ TEST_F(FileHandlerTest,
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
+TEST_F(FileHandlerTest, DirMakeWithParentsThroughSymlinkedDirSucceeds)
+{
+    const std::string real_path = JoinDir("real");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(
+        uv_fs_mkdir(nullptr, &mkdir_req, real_path.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+
+    const std::string link_path = JoinDir("link");
+    uv_fs_t symlink_req;
+    const int rc = uv_fs_symlink(nullptr, &symlink_req, "real",
+                                 link_path.c_str(), UV_FS_SYMLINK_DIR, nullptr);
+    uv_fs_req_cleanup(&symlink_req);
+#ifdef _WIN32
+    if (rc == UV_EPERM || rc == UV_EACCES)
+    {
+        GTEST_SKIP() << "no symlink privilege on this Windows host";
+    }
+#endif
+    ASSERT_EQ(rc, 0);
+
+    const std::string path = JoinDir("link/sub");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_MAKE,
+                    encode_dir_make_request(path, 0U, true), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+
+    taz_v1_DirMakeResponse resp = taz_v1_DirMakeResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_DirMakeResponse_fields, &resp));
+    EXPECT_TRUE(resp.success);
+
+    EXPECT_TRUE(PathIsDir(JoinDir("link/sub")));
+    EXPECT_TRUE(PathIsDir(JoinDir("real/sub")));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DirMakeWithParentsOnExistingSymlinkedDirSucceeds)
+{
+    const std::string real_path = JoinDir("real");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(
+        uv_fs_mkdir(nullptr, &mkdir_req, real_path.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+
+    const std::string link_path = JoinDir("link");
+    uv_fs_t symlink_req;
+    const int rc = uv_fs_symlink(nullptr, &symlink_req, "real",
+                                 link_path.c_str(), UV_FS_SYMLINK_DIR, nullptr);
+    uv_fs_req_cleanup(&symlink_req);
+#ifdef _WIN32
+    if (rc == UV_EPERM || rc == UV_EACCES)
+    {
+        GTEST_SKIP() << "no symlink privilege on this Windows host";
+    }
+#endif
+    ASSERT_EQ(rc, 0);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_MAKE,
+                    encode_dir_make_request(link_path, 0U, true), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+
+    taz_v1_DirMakeResponse resp = taz_v1_DirMakeResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_DirMakeResponse_fields, &resp));
+    EXPECT_TRUE(resp.success);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
 TEST_F(FileHandlerTest, DirMakeWithoutParentsAcceptsTrailingSeparator)
 {
     const std::string path = JoinDir("subdir") + "/";
