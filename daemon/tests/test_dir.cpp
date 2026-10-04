@@ -773,14 +773,13 @@ TEST_F(FileHandlerTest, DirListPathIsFileReturnsErrorNotNotFound)
 }
 
 #ifndef _WIN32
-// Probe for mem-1791147651-a703 / review.rejected on ab80693: a directory
-// readable but not searchable (0600: r without x) makes scandir succeed
-// (it only needs read on the directory itself) while lstat-ing each
-// surviving entry fails with EACCES (search permission is required to
-// resolve a name inside the directory). dir_list_work must only treat
-// ENOENT from that lstat as "vanished, skip"; any other error (EACCES
-// here) must fail the whole listing instead of silently reporting zero
-// entries.
+// A directory readable but not searchable (0600: r without x) makes
+// scandir succeed (it only needs read on the directory itself) while
+// lstat-ing each surviving entry fails with EACCES (search permission is
+// required to resolve a name inside the directory). dir_list_work must
+// only treat ENOENT from that lstat as "vanished, skip"; any other error
+// (EACCES here) must fail the whole listing instead of silently reporting
+// zero entries.
 TEST_F(FileHandlerTest, DirListWithUnsearchableDirectoryReturnsPermissionDenied)
 {
     if (geteuid() == 0)

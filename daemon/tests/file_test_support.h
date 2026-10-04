@@ -124,16 +124,16 @@ class ScopedChmod
         uv_fs_req_cleanup(&stat_req);
 
         uv_fs_t chmod_req;
-        EXPECT_EQ(uv_fs_chmod(nullptr, &chmod_req, path_.c_str(), mode, nullptr),
-                  0);
+        EXPECT_EQ(
+            uv_fs_chmod(nullptr, &chmod_req, path_.c_str(), mode, nullptr), 0);
         uv_fs_req_cleanup(&chmod_req);
     }
     ~ScopedChmod()
     {
         uv_fs_t chmod_req;
-        EXPECT_EQ(
-            uv_fs_chmod(nullptr, &chmod_req, path_.c_str(), prev_mode_, nullptr),
-            0);
+        EXPECT_EQ(uv_fs_chmod(nullptr, &chmod_req, path_.c_str(), prev_mode_,
+                              nullptr),
+                  0);
         uv_fs_req_cleanup(&chmod_req);
     }
     ScopedChmod(const ScopedChmod &) = delete;
