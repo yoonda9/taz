@@ -1,10 +1,12 @@
 #include "file.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <pb_decode.h>
+#include <pb_encode.h>
 #include <uv.h>
 
 #include "taz/error.h"
@@ -27,6 +29,10 @@
 
 /* DIR_MAKE's default mode when the request's permissions field is 0. */
 #define TAZ_DIR_DEFAULT_MODE 0755U
+
+/* DIR_LIST's per-batch entry cap, matching taz_v1_DirListResponse's own
+ * entries[] array size (DEC-003). */
+#define TAZ_DIR_LIST_BATCH_MAX 64U
 
 #ifndef _WIN32
 #define TAZ_PASSWD_PATH "/etc/passwd"
@@ -967,6 +973,336 @@ void handle_dir_make(taz_dispatch_t *d, const taz_frame_header_t *header,
     fctx->req = req;
 
     if (taz_work_submit(d, header->stream_id, dir_make_work, dir_make_done,
+                        fctx) != 0)
+    {
+        free(fctx);
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+                       "work submit failed", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+}
+
+/* One scanned directory entry, captured on the pool thread and later
+ * re-encoded into DirEntry batches on the loop thread. name mirrors
+ * taz_v1_DirEntry.name's size. */
+typedef struct
+{
+    char name[256];
+    taz_v1_Kind kind;
+    uint64_t size;
+} dir_list_entry_t;
+
+/* Carries everything dir_list_work/dir_list_done need. entries/count/
+ * capacity form a growable array built on the pool thread; dir_list_done
+ * frees it after encoding. */
+typedef struct
+{
+    taz_dispatch_write_fn_t write_fn;
+    void *write_ctx;
+    uint32_t stream_id;
+    uint16_t opcode;
+    taz_v1_DirListRequest req;
+
+    int ok;
+    taz_v1_ErrorCode error_code;
+    const char *detail;
+
+    dir_list_entry_t *entries;
+    size_t count;
+    size_t capacity;
+} dir_list_ctx_t;
+
+/* Appends one entry, growing the array geometrically. Returns 0 on OOM
+ * (including an overflowing capacity*sizeof(entry)) without touching
+ * fctx's existing array. */
+static int dir_list_append(dir_list_ctx_t *fctx, const char *name,
+                           taz_v1_Kind kind, uint64_t size)
+{
+    if (fctx->count == fctx->capacity)
+    {
+        const size_t new_capacity = (fctx->capacity == 0U)
+                                        ? TAZ_DIR_LIST_BATCH_MAX
+                                        : fctx->capacity * 2U;
+        dir_list_entry_t *grown;
+
+        if (new_capacity > (SIZE_MAX / sizeof(*grown)))
+        {
+            return 0;
+        }
+        grown = (dir_list_entry_t *)realloc(fctx->entries,
+                                            new_capacity * sizeof(*grown));
+        if (grown == NULL)
+        {
+            return 0;
+        }
+        fctx->entries = grown;
+        fctx->capacity = new_capacity;
+    }
+
+    {
+        dir_list_entry_t *e = &fctx->entries[fctx->count];
+        (void)strncpy(e->name, name, sizeof(e->name) - 1U);
+        e->name[sizeof(e->name) - 1U] = '\0';
+        e->kind = kind;
+        e->size = size;
+    }
+    fctx->count++;
+    return 1;
+}
+
+/* Pool thread: lstat the top-level path first - never scandir straight
+ * away - so a path that is a regular file reports a stable error other
+ * than NOT_FOUND instead of whatever scandir's own ENOTDIR happens to
+ * map to on this platform (mem-1791144055-c0a1: POSIX ENOTDIR now maps to
+ * NOT_FOUND via taz_error_from_errno, which would otherwise violate the
+ * "path is a file -> error != NOT_FOUND" row). Then scandir, filtering
+ * hidden names and lstat-ing each survivor; an entry that vanished
+ * between scandir and lstat is skipped rather than failing the whole
+ * listing. */
+static void dir_list_work(void *user)
+{
+    dir_list_ctx_t *fctx = (dir_list_ctx_t *)user;
+    uv_fs_t stat_req;
+    uv_fs_t scan_req;
+    uv_dirent_t ent;
+
+    if (uv_fs_lstat(NULL, &stat_req, fctx->req.path, NULL) < 0)
+    {
+        fctx->ok = 0;
+        fctx->error_code = taz_error_from_fs_req(&stat_req);
+        fctx->detail = taz_error_fs_detail(&stat_req);
+        uv_fs_req_cleanup(&stat_req);
+        return;
+    }
+    if (taz_fsutil_kind_from_mode(stat_req.statbuf.st_mode) !=
+        taz_v1_Kind_KIND_DIR)
+    {
+        uv_fs_req_cleanup(&stat_req);
+        fctx->ok = 0;
+        fctx->error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+        fctx->detail = "path is not a directory";
+        return;
+    }
+    uv_fs_req_cleanup(&stat_req);
+
+    if (uv_fs_scandir(NULL, &scan_req, fctx->req.path, 0, NULL) < 0)
+    {
+        fctx->ok = 0;
+        fctx->error_code = taz_error_from_fs_req(&scan_req);
+        fctx->detail = taz_error_fs_detail(&scan_req);
+        uv_fs_req_cleanup(&scan_req);
+        return;
+    }
+
+    while (uv_fs_scandir_next(&scan_req, &ent) != UV_EOF)
+    {
+        char *child;
+        uv_fs_t lstat_req;
+
+        if (!fctx->req.include_hidden && taz_fsutil_is_hidden(ent.name))
+        {
+            continue;
+        }
+
+        child = taz_fsutil_join(fctx->req.path, ent.name);
+        if (child == NULL)
+        {
+            fctx->ok = 0;
+            fctx->error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+            fctx->detail = "out of memory";
+            uv_fs_req_cleanup(&scan_req);
+            return;
+        }
+
+        if (uv_fs_lstat(NULL, &lstat_req, child, NULL) < 0)
+        {
+            /* Vanished between scandir and lstat: skip, not an error. */
+            uv_fs_req_cleanup(&lstat_req);
+            free(child);
+            continue;
+        }
+        free(child);
+
+        {
+            const taz_v1_Kind kind =
+                taz_fsutil_kind_from_mode(lstat_req.statbuf.st_mode);
+            const uint64_t size = (kind == taz_v1_Kind_KIND_FILE)
+                                      ? lstat_req.statbuf.st_size
+                                      : 0U;
+            uv_fs_req_cleanup(&lstat_req);
+
+            if (!dir_list_append(fctx, ent.name, kind, size))
+            {
+                fctx->ok = 0;
+                fctx->error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+                fctx->detail = "out of memory";
+                uv_fs_req_cleanup(&scan_req);
+                return;
+            }
+        }
+    }
+    uv_fs_req_cleanup(&scan_req);
+
+    fctx->ok = 1;
+}
+
+/* Loop thread (pure computation, no I/O): encodes fctx->entries into
+ * batches of at most TAZ_DIR_LIST_BATCH_MAX DirEntry each (the struct's
+ * own array limit), concatenating each batch's encoded bytes into one
+ * growable buffer. The do/while runs its body at least once, so an empty
+ * listing still produces one (zero-length) iteration rather than no
+ * buffer at all - taz_response_send_encoded turns that into a single
+ * RESPONSE frame with an empty payload. Returns 0 on an encoding/
+ * allocation failure; out_buf and out_len are valid (and must still be
+ * freed) either way. */
+static int dir_list_encode(const dir_list_ctx_t *fctx, uint8_t **out_buf,
+                           size_t *out_len)
+{
+    uint8_t *buf = NULL;
+    size_t buf_len = 0U;
+    size_t i = 0U;
+
+    do
+    {
+        taz_v1_DirListResponse batch = taz_v1_DirListResponse_init_zero;
+        size_t batch_count = 0U;
+        size_t batch_size = 0U;
+
+        while (i < fctx->count && batch_count < TAZ_DIR_LIST_BATCH_MAX)
+        {
+            taz_v1_DirEntry *e = &batch.entries[batch_count];
+            (void)strncpy(e->name, fctx->entries[i].name, sizeof(e->name) - 1U);
+            e->name[sizeof(e->name) - 1U] = '\0';
+            e->kind = fctx->entries[i].kind;
+            e->size = fctx->entries[i].size;
+            batch_count++;
+            i++;
+        }
+        batch.entries_count = (pb_size_t)batch_count;
+
+        if (!pb_get_encoded_size(&batch_size, taz_v1_DirListResponse_fields,
+                                 &batch))
+        {
+            *out_buf = buf;
+            *out_len = buf_len;
+            return 0;
+        }
+
+        if (batch_size > 0U)
+        {
+            uint8_t *grown = (uint8_t *)realloc(buf, buf_len + batch_size);
+            if (grown == NULL)
+            {
+                *out_buf = buf;
+                *out_len = buf_len;
+                return 0;
+            }
+            buf = grown;
+
+            {
+                pb_ostream_t ostream =
+                    pb_ostream_from_buffer(buf + buf_len, batch_size);
+                if (!pb_encode(&ostream, taz_v1_DirListResponse_fields, &batch))
+                {
+                    *out_buf = buf;
+                    *out_len = buf_len;
+                    return 0;
+                }
+                buf_len += ostream.bytes_written;
+            }
+        }
+    } while (i < fctx->count);
+
+    *out_buf = buf;
+    *out_len = buf_len;
+    return 1;
+}
+
+static void dir_list_done(void *user, int closing)
+{
+    dir_list_ctx_t *fctx = (dir_list_ctx_t *)user;
+
+    if (!closing)
+    {
+        if (fctx->ok)
+        {
+            uint8_t *buf = NULL;
+            size_t buf_len = 0U;
+
+            if (dir_list_encode(fctx, &buf, &buf_len))
+            {
+                taz_response_send_encoded(fctx->write_fn, fctx->write_ctx,
+                                          fctx->stream_id, fctx->opcode, buf,
+                                          buf_len);
+            }
+            else
+            {
+                taz_error_send(fctx->write_fn, fctx->write_ctx, fctx->stream_id,
+                               fctx->opcode,
+                               taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+                               "out of memory", NULL);
+            }
+            free(buf);
+        }
+        else
+        {
+            taz_error_send(fctx->write_fn, fctx->write_ctx, fctx->stream_id,
+                           fctx->opcode, fctx->error_code, "list failed",
+                           fctx->detail);
+        }
+    }
+    free(fctx->entries);
+    free(fctx);
+}
+
+void handle_dir_list(taz_dispatch_t *d, const taz_frame_header_t *header,
+                     const uint8_t *payload, taz_dispatch_write_fn_t write_fn,
+                     void *ctx)
+{
+    taz_v1_DirListRequest req = taz_v1_DirListRequest_init_zero;
+    dir_list_ctx_t *fctx;
+
+    if (payload != NULL && header->length > 0U)
+    {
+        pb_istream_t istream =
+            pb_istream_from_buffer(payload, (size_t)header->length);
+        if (!pb_decode(&istream, taz_v1_DirListRequest_fields, &req))
+        {
+            taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                           taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                           "decode DirListRequest failed", NULL);
+            taz_dispatch_stream_done(d, header->stream_id);
+            return;
+        }
+    }
+
+    if (req.path[0] == '\0')
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                       "path is required", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+
+    fctx = (dir_list_ctx_t *)calloc(1U, sizeof(*fctx));
+    if (fctx == NULL)
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
+                       NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+    fctx->write_fn = write_fn;
+    fctx->write_ctx = ctx;
+    fctx->stream_id = header->stream_id;
+    fctx->opcode = header->opcode;
+    fctx->req = req;
+
+    if (taz_work_submit(d, header->stream_id, dir_list_work, dir_list_done,
                         fctx) != 0)
     {
         free(fctx);

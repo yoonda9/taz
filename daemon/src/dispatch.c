@@ -219,6 +219,7 @@ static const opcode_entry_t OPCODE_TABLE[] = {
      true},
     {NULL, handle_file_chmod, (uint16_t)taz_v1_Opcode_OPCODE_FILE_CHMOD, true},
     {NULL, handle_dir_make, (uint16_t)taz_v1_Opcode_OPCODE_DIR_MAKE, true},
+    {NULL, handle_dir_list, (uint16_t)taz_v1_Opcode_OPCODE_DIR_LIST, true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))

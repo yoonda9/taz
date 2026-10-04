@@ -73,6 +73,23 @@ extern "C"
                          const uint8_t *payload,
                          taz_dispatch_write_fn_t write_fn, void *ctx);
 
+    /* Async DIR_LIST handler: decode the request, reject an empty path
+     * with INVALID_REQUEST, then on the thread pool lstat the top-level
+     * path first (so a regular-file path reports a stable error other
+     * than NOT_FOUND instead of whatever scandir's own ENOTDIR happens to
+     * map to on this platform) and uv_fs_scandir it, filtering hidden
+     * names unless include_hidden and uv_fs_lstat-ing each survivor
+     * (joined on the heap; an entry that vanished between scandir and
+     * lstat is skipped). On the loop thread, encodes the collected
+     * entries into batches of at most 64 DirEntry each, concatenates the
+     * encoded bytes, and sends them via taz_response_send_encoded (so a
+     * listing larger than one frame is split without ever cutting an
+     * entry in half; an empty directory is one RESPONSE with zero
+     * entries). Closes the stream itself. */
+    void handle_dir_list(taz_dispatch_t *d, const taz_frame_header_t *header,
+                         const uint8_t *payload,
+                         taz_dispatch_write_fn_t write_fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif
