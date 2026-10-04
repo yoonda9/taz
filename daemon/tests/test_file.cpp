@@ -14,6 +14,11 @@
 #include <pb_encode.h>
 #include <uv.h>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
 #include "handlers/file.h"
 #include "taz/dispatch.h"
 #include "taz/frame.h"
@@ -138,6 +143,48 @@ std::vector<uint8_t> encode_create_request(const std::string &path,
     buf.resize(ostream.bytes_written);
     return buf;
 }
+
+// Appends a length-delimited field (string/bytes wire type 2) with the given
+// field number, varint-encoded length, then raw bytes.
+void append_bytes_field(std::vector<uint8_t> &out, uint32_t field_number,
+                        const std::string &data)
+{
+    out.push_back(static_cast<uint8_t>((field_number << 3U) | 2U));
+    size_t len = data.size();
+    do
+    {
+        uint8_t byte = static_cast<uint8_t>(len & 0x7FU);
+        len >>= 7U;
+        if (len != 0U)
+        {
+            byte |= 0x80U;
+        }
+        out.push_back(byte);
+    } while (len != 0U);
+    out.insert(out.end(), data.begin(), data.end());
+}
+
+#ifndef _WIN32
+// Exact-mode assertions on files created via uv_fs_open depend on the
+// process umask (e.g. 'umask 077' turns a requested 0644 into 0600); pin a
+// known umask for the test's duration and restore the caller's on exit.
+class ScopedUmask
+{
+  public:
+    explicit ScopedUmask(mode_t mask) : prev_(umask(mask))
+    {
+    }
+    ~ScopedUmask()
+    {
+        (void)umask(prev_);
+    }
+    ScopedUmask(const ScopedUmask &) = delete;
+    ScopedUmask &operator=(const ScopedUmask &) = delete;
+
+  private:
+    mode_t prev_;
+};
+#endif
 
 std::vector<uint8_t> encode_delete_request(const std::string &path)
 {
@@ -702,6 +749,11 @@ TEST_F(FileHandlerTest, CreateUnderMissingDirectoryReturnsNotFound)
 #ifndef _WIN32
 TEST_F(FileHandlerTest, CreateWithExplicitModeHonoursPermissions)
 {
+    // An explicit, non-zero permissions field is passed straight to
+    // uv_fs_open's mode argument, so the umask still applies to it exactly
+    // as it would to a local open(2) call; pin a known umask so the
+    // expected mode doesn't depend on the ambient one.
+    const ScopedUmask umask_guard(022);
     const std::string path = JoinDir("created.txt");
 
     DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
@@ -715,6 +767,7 @@ TEST_F(FileHandlerTest, CreateWithExplicitModeHonoursPermissions)
 
 TEST_F(FileHandlerTest, CreateWithZeroPermissionsDefaultsToDefaultMode)
 {
+    const ScopedUmask umask_guard(022);
     const std::string path = JoinDir("created.txt");
 
     DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
@@ -764,6 +817,48 @@ TEST_F(FileHandlerTest, CreateUndecodablePayloadIsInvalidRequest)
 
     EXPECT_EQ(RefCount(), 0);
     EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+TEST_F(FileHandlerTest, CreateWithDuplicateContentFieldKeepsLastContent)
+{
+    // content (field 2) is FT_CALLBACK; nanopb invokes decode_file_content
+    // once per occurrence of the tag on the wire, so a request encoding the
+    // field twice must behave like any other proto3 scalar: last occurrence
+    // wins. decode_file_content must free the first buffer before replacing
+    // it with the second (ASan catches a leak here if it doesn't).
+    const std::string path = JoinDir("created.txt");
+    std::vector<uint8_t> payload;
+    append_bytes_field(payload, 1U, path);
+    append_bytes_field(payload, 2U, "aaaa");
+    append_bytes_field(payload, 2U, "bbbb");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE, payload, 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(ReadFileBytes(path), "bbbb");
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CreateConnectionClosingWhileInFlightSendsNothing)
+{
+    // Mirrors ConnectionClosingWhileInFlightSendsNothing for FILE_STAT, but
+    // FILE_CREATE is the only handler that owns a heap buffer (fctx->content)
+    // freed in its done() callback on the closing path - exercise it with
+    // non-empty content so ASan/valgrind actually cover that free.
+    const std::string path = JoinDir("created.txt");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CREATE,
+                    encode_create_request(path, "payload-bytes", 0U), 8U,
+                    [this]() { SetConnClosing(1); });
+
+    EXPECT_EQ(Frames().size(), 0U);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), 1);
+    EXPECT_EQ(UnrefCount(), 1);
 }
 
 // ---------------------------------------------------------------------------

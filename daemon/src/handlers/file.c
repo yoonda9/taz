@@ -215,6 +215,9 @@ static bool decode_file_content(pb_istream_t *stream, const pb_field_t *field,
             return false;
         }
     }
+    /* Proto3 "last wins": a repeated occurrence of this field replaces, not
+     * appends to, the previous decode. Free it before overwriting. */
+    free(content->data);
     content->data = buf;
     content->len = len;
     return true;
