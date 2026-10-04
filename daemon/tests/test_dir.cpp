@@ -61,6 +61,7 @@ TEST_F(FileHandlerTest, DirMakeCreatesDirectory)
 #ifndef _WIN32
     EXPECT_EQ(FileMode(path) & 0700U, 0700U);
 #endif
+    EXPECT_TRUE(PathIsDir(path));
 
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());
@@ -138,9 +139,9 @@ TEST_F(FileHandlerTest, DirMakeWithParentsCreatesAllMissingComponents)
     ASSERT_TRUE(pb_decode(&istream, taz_v1_DirMakeResponse_fields, &resp));
     EXPECT_TRUE(resp.success);
 
-    EXPECT_TRUE(PathExists(JoinDir("a")));
-    EXPECT_TRUE(PathExists(JoinDir("a/b")));
-    EXPECT_TRUE(PathExists(JoinDir("a/b/c")));
+    EXPECT_TRUE(PathIsDir(JoinDir("a")));
+    EXPECT_TRUE(PathIsDir(JoinDir("a/b")));
+    EXPECT_TRUE(PathIsDir(JoinDir("a/b/c")));
 
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());

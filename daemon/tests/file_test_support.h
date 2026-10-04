@@ -26,6 +26,7 @@
 
 #include "taz/dispatch.h"
 #include "taz/frame.h"
+#include "taz/fsutil.h"
 #include "taz/v1/common.pb.h"
 
 // ---------------------------------------------------------------------------
@@ -294,6 +295,21 @@ class FileHandlerTest : public ::testing::Test
         const int rc = uv_fs_lstat(nullptr, &req, path.c_str(), nullptr);
         uv_fs_req_cleanup(&req);
         return rc == 0;
+    }
+
+    // Kind check via the same taz_fsutil_kind_from_mode the handlers use,
+    // so this reflects the daemon's own notion of "directory" (including
+    // the Windows FILE_ATTRIBUTE_DIRECTORY-derived mode bits), not just a
+    // raw S_ISDIR on a platform where libuv's st_mode may be synthesized.
+    static bool PathIsDir(const std::string &path)
+    {
+        uv_fs_t req;
+        const int rc = uv_fs_lstat(nullptr, &req, path.c_str(), nullptr);
+        const bool is_dir =
+            (rc == 0) && (taz_fsutil_kind_from_mode(req.statbuf.st_mode) ==
+                          taz_v1_Kind_KIND_DIR);
+        uv_fs_req_cleanup(&req);
+        return is_dir;
     }
 
     // On Windows this is never POSIX-exact (libuv derives it from the
