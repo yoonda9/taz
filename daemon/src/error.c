@@ -48,6 +48,7 @@ taz_v1_ErrorCode taz_error_from_errno(int errnum)
         case EEXIST:
             return taz_v1_ErrorCode_ERROR_CODE_ALREADY_EXISTS;
         case ESRCH:
+        case ENOTDIR:
             return taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
         default:
             return taz_v1_ErrorCode_ERROR_CODE_INTERNAL;

@@ -189,7 +189,30 @@ TEST_F(FileHandlerTest,
     const std::vector<uint8_t> body = frame_payload(Frames()[0]);
     pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
     ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
-    EXPECT_NE(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_ALREADY_EXISTS);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DirMakeWithoutParentsThroughFileReturnsNotFound)
+{
+    const std::string a_path = JoinDir("a");
+    WriteFile(a_path, "not a directory");
+    const std::string path = JoinDir("a/sub");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_MAKE,
+                    encode_dir_make_request(path, 0U, false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
 
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());

@@ -87,6 +87,12 @@ TEST(ErrorFromErrno, UnknownMapsToInternal)
               taz_v1_ErrorCode_ERROR_CODE_INTERNAL);
 }
 
+TEST(ErrorFromErrno, EnotdirMapsToNotFound)
+{
+    EXPECT_EQ(taz_error_from_errno(ENOTDIR),
+              taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+}
+
 // ---------------------------------------------------------------------------
 // taz_error_from_win32 (Windows only)
 // ---------------------------------------------------------------------------
