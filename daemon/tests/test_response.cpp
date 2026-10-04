@@ -1,6 +1,8 @@
 // Unit tests for taz_response_send (response splitter).
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -157,6 +159,41 @@ bool collect_decoded_entries(pb_istream_t *stream,
     }
     entries->push_back(entry);
     return true;
+}
+
+// Fill a DirEntry with name "entry-%04d" (idx), padding the rest of the
+// 256-byte name buffer with filler bytes so each entry is large enough
+// (~260 B) to force a multi-entry DirListResponse past one RESPONSE frame.
+void fill_entry(taz_v1_DirEntry &entry, int idx)
+{
+    char name[sizeof(entry.name)];
+    const int n = std::snprintf(name, sizeof(name), "entry-%04d", idx);
+    std::memset(name + n, 'x', sizeof(name) - 1U - static_cast<size_t>(n));
+    name[sizeof(name) - 1U] = '\0';
+    (void)memcpy(entry.name, name, sizeof(entry.name));
+    entry.kind = taz_v1_Kind_KIND_FILE;
+    entry.size = static_cast<uint64_t>(idx);
+}
+
+// Encode a DirListResponse of `count` entries starting at `start_idx` and
+// append the encoded bytes to `out`.
+void encode_dir_list_batch(std::vector<uint8_t> &out, int start_idx, int count)
+{
+    taz_v1_DirListResponse resp = taz_v1_DirListResponse_init_zero;
+    resp.entries_count = static_cast<pb_size_t>(count);
+    for (int j = 0; j < count; j++)
+    {
+        fill_entry(resp.entries[static_cast<size_t>(j)], start_idx + j);
+    }
+
+    size_t size = 0U;
+    ASSERT_TRUE(
+        pb_get_encoded_size(&size, taz_v1_DirListResponse_fields, &resp));
+    std::vector<uint8_t> buf(size);
+    pb_ostream_t os = pb_ostream_from_buffer(buf.data(), buf.size());
+    ASSERT_TRUE(pb_encode(&os, taz_v1_DirListResponse_fields, &resp));
+    out.insert(out.end(), buf.begin(),
+               buf.begin() + static_cast<long>(os.bytes_written));
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +539,120 @@ TEST(ResponseSplitter, AllFramesWithinPayloadLimit)
                   static_cast<size_t>(TAZ_FRAME_HEADER_SIZE) + h.length)
             << "frame " << i << " size mismatch";
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test: taz_response_send_encoded splits a pre-encoded DirListResponse
+// ---------------------------------------------------------------------------
+
+TEST(ResponseSendEncoded, LargeDirListingSplitsAcrossFrames)
+{
+    // Five 64-entry batches concatenated, as DEC-003's DIR_LIST handler will
+    // do: 320 entries of ~260 B each, well past the 64 KiB RESPONSE limit.
+    static const int kBatches = 5;
+    static const int kPerBatch = 64;
+    static const int kTotal = kBatches * kPerBatch;
+
+    std::vector<uint8_t> encoded;
+    for (int b = 0; b < kBatches; b++)
+    {
+        encode_dir_list_batch(encoded, b * kPerBatch, kPerBatch);
+    }
+
+    WriteCtx wctx;
+    taz_response_send_encoded(
+        capture_write, &wctx, 9U,
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_DIR_LIST), encoded.data(),
+        encoded.size());
+
+    ASSERT_GE(wctx.frames.size(), 2U);
+
+    std::vector<taz_v1_DirEntry> decoded;
+    size_t total_count = 0U;
+    for (size_t fi = 0U; fi < wctx.frames.size(); fi++)
+    {
+        const taz_frame_header_t h = unpack_header(wctx.frames[fi]);
+        EXPECT_EQ(h.type,
+                  static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE))
+            << "frame " << fi;
+        EXPECT_LE(h.length,
+                  static_cast<uint32_t>(TAZ_FRAME_MAX_PAYLOAD_RESPONSE))
+            << "frame " << fi;
+
+        const bool is_last = (fi + 1U == wctx.frames.size());
+        const bool has_continuation =
+            (h.flags & static_cast<uint8_t>(
+                           taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION)) != 0U;
+        EXPECT_EQ(has_continuation, !is_last) << "frame " << fi;
+
+        DirListResponseCb resp{};
+        std::vector<taz_v1_DirEntry> frame_entries;
+        resp.entries.funcs.decode = collect_decoded_entries;
+        resp.entries.arg = &frame_entries;
+        pb_istream_t stream = pb_istream_from_buffer(
+            wctx.frames[fi].data() + TAZ_FRAME_HEADER_SIZE,
+            wctx.frames[fi].size() -
+                static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+        ASSERT_TRUE(pb_decode(&stream, &DirListResponseCb_msg, &resp))
+            << "frame " << fi << " does not decode as a DirListResponse";
+
+        total_count += frame_entries.size();
+        decoded.insert(decoded.end(), frame_entries.begin(),
+                       frame_entries.end());
+    }
+
+    EXPECT_EQ(total_count, static_cast<size_t>(kTotal));
+    ASSERT_EQ(decoded.size(), static_cast<size_t>(kTotal));
+    for (int i = 0; i < kTotal; i++)
+    {
+        const char *name = decoded[static_cast<size_t>(i)].name;
+        ASSERT_EQ(std::strncmp(name, "entry-", 6U), 0) << "entry " << i;
+        char *end = nullptr;
+        const long parsed = std::strtol(name + 6, &end, 10);
+        ASSERT_NE(end, name + 6) << "entry " << i << " has no digits";
+        EXPECT_EQ(parsed, i) << "entries must stay in order";
+        EXPECT_EQ(decoded[static_cast<size_t>(i)].kind, taz_v1_Kind_KIND_FILE)
+            << "entry " << i;
+        EXPECT_EQ(decoded[static_cast<size_t>(i)].size,
+                  static_cast<uint64_t>(i))
+            << "entry " << i;
+    }
+}
+
+TEST(ResponseSendEncoded, SmallDirListingSingleFrame)
+{
+    std::vector<uint8_t> encoded;
+    encode_dir_list_batch(encoded, 0, 10);
+
+    WriteCtx wctx;
+    taz_response_send_encoded(
+        capture_write, &wctx, 10U,
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_DIR_LIST), encoded.data(),
+        encoded.size());
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    const taz_frame_header_t h = unpack_header(wctx.frames[0]);
+    EXPECT_EQ(h.flags & static_cast<uint8_t>(
+                            taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION),
+              0U);
+    EXPECT_EQ(h.length, static_cast<uint32_t>(encoded.size()));
+}
+
+TEST(ResponseSendEncoded, EmptyBufferYieldsOneEmptyFrame)
+{
+    WriteCtx wctx;
+    taz_response_send_encoded(
+        capture_write, &wctx, 11U,
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_DIR_LIST), nullptr, 0U);
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    const taz_frame_header_t h = unpack_header(wctx.frames[0]);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(h.flags, static_cast<uint8_t>(taz_v1_FrameFlag_FRAME_FLAG_NONE));
+    EXPECT_EQ(h.length, 0U);
+    EXPECT_EQ(wctx.frames[0].size(),
+              static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
 }
 
 } // namespace

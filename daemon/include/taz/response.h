@@ -31,6 +31,15 @@ extern "C"
                            uint32_t stream_id, uint16_t opcode,
                            const pb_msgdesc_t *fields, const void *msg);
 
+    /* Deliver an already-encoded protobuf message (buf, len) as one or more
+     * RESPONSE frames, per the same splitting rules as taz_response_send.
+     * Use this when the caller builds the encoded bytes itself, e.g. by
+     * concatenating several batch-encoded messages whose repeated elements
+     * must stay wire-compatible with a single decode. */
+    void taz_response_send_encoded(taz_dispatch_write_fn_t write_fn, void *ctx,
+                                   uint32_t stream_id, uint16_t opcode,
+                                   const uint8_t *buf, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

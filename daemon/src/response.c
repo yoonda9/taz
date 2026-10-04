@@ -104,7 +104,10 @@ static void flush_frame(taz_dispatch_write_fn_t write_fn, void *ctx,
     h.length = (uint32_t)pay_len;
     h.stream_id = stream_id;
     taz_frame_pack_header(&h, buf);
-    (void)memcpy(buf + TAZ_FRAME_HEADER_SIZE, payload, pay_len);
+    if (pay_len > 0U)
+    {
+        (void)memcpy(buf + TAZ_FRAME_HEADER_SIZE, payload, pay_len);
+    }
 
     write_fn(buf, total, ctx);
     free(buf);
@@ -315,6 +318,22 @@ static void send_chunked(taz_dispatch_write_fn_t write_fn, void *ctx,
  * Public API
  * ------------------------------------------------------------------------- */
 
+void taz_response_send_encoded(taz_dispatch_write_fn_t write_fn, void *ctx,
+                               uint32_t stream_id, uint16_t opcode,
+                               const uint8_t *buf, size_t len)
+{
+    if (len <= TAZ_FRAME_MAX_PAYLOAD_RESPONSE)
+    {
+        flush_frame(write_fn, ctx, stream_id, opcode, buf, len,
+                    (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE);
+    }
+    else
+    {
+        /* Too large for one frame: split field-by-field. */
+        send_chunked(write_fn, ctx, stream_id, opcode, buf, len);
+    }
+}
+
 void taz_response_send(taz_dispatch_write_fn_t write_fn, void *ctx,
                        uint32_t stream_id, uint16_t opcode,
                        const pb_msgdesc_t *fields, const void *msg)
@@ -341,16 +360,7 @@ void taz_response_send(taz_dispatch_write_fn_t write_fn, void *ctx,
         return;
     }
 
-    if (os.bytes_written <= TAZ_FRAME_MAX_PAYLOAD_RESPONSE)
-    {
-        flush_frame(write_fn, ctx, stream_id, opcode, encoded, os.bytes_written,
-                    (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE);
-    }
-    else
-    {
-        /* Too large for one frame: split field-by-field. */
-        send_chunked(write_fn, ctx, stream_id, opcode, encoded,
-                     os.bytes_written);
-    }
+    taz_response_send_encoded(write_fn, ctx, stream_id, opcode, encoded,
+                              os.bytes_written);
     free(encoded);
 }
