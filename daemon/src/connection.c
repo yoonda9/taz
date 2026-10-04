@@ -54,6 +54,11 @@ static void dispatch_conn_unref_cb(void *ctx)
     conn_unref((taz_conn_t *)ctx);
 }
 
+static int dispatch_conn_closing_cb(void *ctx)
+{
+    return ((taz_conn_t *)ctx)->closing;
+}
+
 static void on_write_done(uv_write_t *req, int status)
 {
     write_req_t *wr = (write_req_t *)req;
@@ -286,6 +291,7 @@ void taz_conn_on_new_connection(uv_stream_t *server, int status)
     conn->dispatch.conn_ref = dispatch_conn_ref_cb;
     conn->dispatch.conn_unref = dispatch_conn_unref_cb;
     conn->dispatch.conn_ctx = conn;
+    conn->dispatch.conn_closing = dispatch_conn_closing_cb;
 
     rc = uv_tcp_init(loop, &conn->handle);
     if (rc != 0)

@@ -100,6 +100,15 @@ void taz_dispatch_conn_unref(taz_dispatch_t *d)
     }
 }
 
+int taz_dispatch_conn_closing(const taz_dispatch_t *d)
+{
+    if (d->conn_closing == NULL)
+    {
+        return 0;
+    }
+    return d->conn_closing(d->conn_ctx);
+}
+
 /* --------------------------------------------------------------------------
  * Frame-writing helpers
  * -------------------------------------------------------------------------- */

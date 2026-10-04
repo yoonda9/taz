@@ -245,6 +245,7 @@ add_library(
     src/response.c
     src/exec.c
     src/server.c
+    src/work.c
     src/dispatch.c
     src/connection.c
     src/handlers/version.c

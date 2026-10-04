@@ -22,7 +22,8 @@ add_executable(
     test_error.cpp
     test_response.cpp
     test_exec.cpp
-    test_command.cpp)
+    test_command.cpp
+    test_work.cpp)
 # taz::proto comes in transitively via taz_core; taz_cxx_warnings carries C++
 # warning flags without the C-only -Wstrict-prototypes/-Wmissing-prototypes.
 target_link_libraries(taz_tests PRIVATE taz_core taz_cxx_warnings

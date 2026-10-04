@@ -29,6 +29,10 @@ extern "C"
      * production). */
     typedef void (*taz_dispatch_conn_ref_fn_t)(void *ctx);
 
+    /* Reports whether the owning connection has begun closing. ctx is
+     * conn_ctx below (the taz_conn_t * in production). */
+    typedef int (*taz_dispatch_conn_closing_fn_t)(void *ctx);
+
     /* Per-connection dispatch state. */
     typedef struct taz_dispatch_s
     {
@@ -52,6 +56,12 @@ extern "C"
         taz_dispatch_conn_ref_fn_t conn_ref;
         taz_dispatch_conn_ref_fn_t conn_unref;
         void *conn_ctx;
+        /* Queried by taz_work.c after a pool work item finishes, to decide
+         * whether its completion may still write to the connection. Set
+         * alongside conn_ref/conn_unref by connection.c; left NULL by
+         * taz_dispatch_init, in which case taz_dispatch_conn_closing
+         * reports 0, which is what pure unit tests see. */
+        taz_dispatch_conn_closing_fn_t conn_closing;
     } taz_dispatch_t;
 
     /* Initialise a dispatch context to the empty state. */
@@ -92,6 +102,10 @@ extern "C"
      * dispatch with no connection.c behind it). */
     void taz_dispatch_conn_ref(taz_dispatch_t *d);
     void taz_dispatch_conn_unref(taz_dispatch_t *d);
+
+    /* 0 when conn_closing is unset (a pure unit-test dispatch with no
+     * connection.c behind it); otherwise conn_closing(conn_ctx). */
+    int taz_dispatch_conn_closing(const taz_dispatch_t *d);
 
     /* True if opcode's handler manages its own stream lifetime (does not get
      * closed automatically by taz_dispatch_frame); false for synchronous and
