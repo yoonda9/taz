@@ -90,6 +90,23 @@ extern "C"
                          const uint8_t *payload,
                          taz_dispatch_write_fn_t write_fn, void *ctx);
 
+    /* Async DIR_REMOVE handler: decode the request, reject an empty path
+     * with INVALID_REQUEST, then on the thread pool lstat the top-level
+     * path first (so a regular-file path reports a stable error other
+     * than NOT_FOUND instead of whatever uv_fs_rmdir's own ENOTDIR happens
+     * to map to on this platform; a missing path reports NOT_FOUND).
+     * With recursive == false this is a single uv_fs_rmdir (non-empty ->
+     * INTERNAL with detail). With recursive == true it first walks the
+     * tree post-order (scandir + join + lstat each child: a symlink or
+     * regular file is unlinked, never followed; a subdirectory is
+     * recursed into and then rmdir'd), aborting on the first error, then
+     * rmdir's the now-empty top-level directory. Replies with a
+     * DirRemoveResponse(success=true) or an error. Closes the stream
+     * itself. */
+    void handle_dir_remove(taz_dispatch_t *d, const taz_frame_header_t *header,
+                           const uint8_t *payload,
+                           taz_dispatch_write_fn_t write_fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

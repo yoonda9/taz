@@ -1348,3 +1348,352 @@ void handle_dir_list(taz_dispatch_t *d, const taz_frame_header_t *header,
         return;
     }
 }
+
+/* Carries everything dir_remove_work/dir_remove_done need. */
+typedef struct
+{
+    taz_dispatch_write_fn_t write_fn;
+    void *write_ctx;
+    uint32_t stream_id;
+    uint16_t opcode;
+    taz_v1_DirRemoveRequest req;
+
+    int ok;
+    taz_v1_ErrorCode error_code;
+    const char *detail;
+    taz_v1_DirRemoveResponse resp;
+} dir_remove_ctx_t;
+
+/* One level of dir_remove_tree's walk: an open scandir result for one
+ * directory still being drained, plus the heap path it was opened on.
+ * scan_opened distinguishes "not yet opened" from "open, needs cleanup"
+ * (both on the happy path, once its last entry is consumed, and during
+ * error unwind). */
+typedef struct
+{
+    char *path;
+    uv_fs_t scan_req;
+    int scan_opened;
+} dir_remove_frame_t;
+
+/* Iteratively removes path and everything beneath it, post-order, with no
+ * C-level recursion (clang-tidy's misc-no-recursion forbids it here): an
+ * explicit heap stack holds one frame per directory level still being
+ * drained, mirroring what real recursion would put on the call stack.
+ * Each frame holds exactly one open uv_fs_t scandir result at a time,
+ * cleaned up the moment that level's last entry is consumed and before
+ * its own rmdir - so at most one scandir per level is ever open, matching
+ * the design's recursion-depth-equals-tree-depth risk note. Within a
+ * directory, a child that is itself a directory (lstat-ed, never
+ * followed) pushes a new frame to be drained next; anything else
+ * (regular file or symlink - read-only or not, since libuv clears
+ * Windows' READONLY attribute before unlinking and POSIX unlink does not
+ * care) is unlinked immediately, so a symlink is removed itself and
+ * never resolved into another tree. The first failure anywhere unwinds
+ * every still-open frame (cleaning up its scandir, freeing its path) and
+ * returns 0 with error_code/detail set; everything removed up to that
+ * point stays removed, and the rest of the tree - including whatever the
+ * failing entry pointed at, if it was a symlink - is left untouched. */
+static int dir_remove_tree(const char *path, taz_v1_ErrorCode *error_code,
+                           const char **detail)
+{
+    dir_remove_frame_t *stack;
+    size_t count = 1U;
+    size_t capacity = 1U;
+    int ok = 1;
+    const size_t path_len = strlen(path);
+
+    stack = (dir_remove_frame_t *)calloc(1U, sizeof(*stack));
+    if (stack == NULL)
+    {
+        *error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+        *detail = "out of memory";
+        return 0;
+    }
+    stack[0].path = (char *)malloc(path_len + 1U);
+    if (stack[0].path == NULL)
+    {
+        free(stack);
+        *error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+        *detail = "out of memory";
+        return 0;
+    }
+    (void)memcpy(stack[0].path, path, path_len + 1U);
+
+    while (count > 0U)
+    {
+        dir_remove_frame_t *top = &stack[count - 1U];
+        uv_dirent_t ent;
+
+        if (!top->scan_opened)
+        {
+            if (uv_fs_scandir(NULL, &top->scan_req, top->path, 0, NULL) < 0)
+            {
+                *error_code = taz_error_from_fs_req(&top->scan_req);
+                *detail = taz_error_fs_detail(&top->scan_req);
+                uv_fs_req_cleanup(&top->scan_req);
+                ok = 0;
+                break;
+            }
+            top->scan_opened = 1;
+        }
+
+        if (uv_fs_scandir_next(&top->scan_req, &ent) == UV_EOF)
+        {
+            uv_fs_t rmdir_req;
+
+            uv_fs_req_cleanup(&top->scan_req);
+            top->scan_opened = 0;
+
+            if (uv_fs_rmdir(NULL, &rmdir_req, top->path, NULL) < 0)
+            {
+                *error_code = taz_error_from_fs_req(&rmdir_req);
+                *detail = taz_error_fs_detail(&rmdir_req);
+                uv_fs_req_cleanup(&rmdir_req);
+                ok = 0;
+                break;
+            }
+            uv_fs_req_cleanup(&rmdir_req);
+
+            free(top->path);
+            count--;
+            continue;
+        }
+
+        {
+            char *child = taz_fsutil_join(top->path, ent.name);
+            uv_fs_t lstat_req;
+            int is_dir;
+
+            if (child == NULL)
+            {
+                *error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+                *detail = "out of memory";
+                ok = 0;
+                break;
+            }
+
+            if (uv_fs_lstat(NULL, &lstat_req, child, NULL) < 0)
+            {
+                *error_code = taz_error_from_fs_req(&lstat_req);
+                *detail = taz_error_fs_detail(&lstat_req);
+                uv_fs_req_cleanup(&lstat_req);
+                free(child);
+                ok = 0;
+                break;
+            }
+            is_dir = (taz_fsutil_kind_from_mode(lstat_req.statbuf.st_mode) ==
+                      taz_v1_Kind_KIND_DIR);
+            uv_fs_req_cleanup(&lstat_req);
+
+            if (is_dir)
+            {
+                if (count == capacity)
+                {
+                    const size_t new_capacity = capacity * 2U;
+                    dir_remove_frame_t *grown;
+
+                    if (new_capacity > (SIZE_MAX / sizeof(*grown)))
+                    {
+                        free(child);
+                        *error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+                        *detail = "out of memory";
+                        ok = 0;
+                        break;
+                    }
+                    grown = (dir_remove_frame_t *)realloc(
+                        stack, new_capacity * sizeof(*grown));
+                    if (grown == NULL)
+                    {
+                        free(child);
+                        *error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+                        *detail = "out of memory";
+                        ok = 0;
+                        break;
+                    }
+                    stack = grown;
+                    capacity = new_capacity;
+                }
+
+                stack[count].path = child;
+                stack[count].scan_opened = 0;
+                count++;
+            }
+            else
+            {
+                uv_fs_t unlink_req;
+                if (uv_fs_unlink(NULL, &unlink_req, child, NULL) < 0)
+                {
+                    *error_code = taz_error_from_fs_req(&unlink_req);
+                    *detail = taz_error_fs_detail(&unlink_req);
+                    uv_fs_req_cleanup(&unlink_req);
+                    free(child);
+                    ok = 0;
+                    break;
+                }
+                uv_fs_req_cleanup(&unlink_req);
+                free(child);
+            }
+        }
+    }
+
+    /* Unwind whatever frames remain (all of them on success, since the
+     * loop above only exits early via break on failure): each still owns
+     * an open scandir (cleaned up here, if scan_opened) and a path
+     * (freed here). */
+    while (count > 0U)
+    {
+        dir_remove_frame_t *top = &stack[count - 1U];
+        if (top->scan_opened)
+        {
+            uv_fs_req_cleanup(&top->scan_req);
+        }
+        free(top->path);
+        count--;
+    }
+    free(stack);
+
+    return ok;
+}
+
+/* Pool thread: lstat (never follow) the top-level path first - never jump
+ * straight to uv_fs_rmdir - so a path that is a regular file reports a
+ * stable error other than NOT_FOUND instead of whatever uv_fs_rmdir's own
+ * ENOTDIR maps to on this platform (POSIX ENOTDIR maps to NOT_FOUND via
+ * taz_error_from_errno, which would otherwise violate the "path is a file
+ * -> error != NOT_FOUND" row); a missing path's ENOENT -> NOT_FOUND is
+ * exactly what callers expect either way. uv_fs_rmdir never follows
+ * symlinks either, so lstat (not stat) here matches what the final rmdir
+ * would actually do: a symlink at the top level, even one pointing at a
+ * directory, is reported as "not a directory" rather than silently
+ * resolved. Without recursive, a single uv_fs_rmdir handles everything
+ * (non-empty -> INTERNAL with detail); with recursive, dir_remove_tree
+ * removes path and everything beneath it in one post-order walk. */
+static void dir_remove_work(void *user)
+{
+    dir_remove_ctx_t *fctx = (dir_remove_ctx_t *)user;
+    uv_fs_t stat_req;
+
+    if (uv_fs_lstat(NULL, &stat_req, fctx->req.path, NULL) < 0)
+    {
+        fctx->ok = 0;
+        fctx->error_code = taz_error_from_fs_req(&stat_req);
+        fctx->detail = taz_error_fs_detail(&stat_req);
+        uv_fs_req_cleanup(&stat_req);
+        return;
+    }
+    if (taz_fsutil_kind_from_mode(stat_req.statbuf.st_mode) !=
+        taz_v1_Kind_KIND_DIR)
+    {
+        uv_fs_req_cleanup(&stat_req);
+        fctx->ok = 0;
+        fctx->error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+        fctx->detail = "path is not a directory";
+        return;
+    }
+    uv_fs_req_cleanup(&stat_req);
+
+    if (fctx->req.recursive)
+    {
+        if (!dir_remove_tree(fctx->req.path, &fctx->error_code, &fctx->detail))
+        {
+            fctx->ok = 0;
+            return;
+        }
+    }
+    else
+    {
+        uv_fs_t rmdir_req;
+        if (uv_fs_rmdir(NULL, &rmdir_req, fctx->req.path, NULL) < 0)
+        {
+            fctx->ok = 0;
+            fctx->error_code = taz_error_from_fs_req(&rmdir_req);
+            fctx->detail = taz_error_fs_detail(&rmdir_req);
+            uv_fs_req_cleanup(&rmdir_req);
+            return;
+        }
+        uv_fs_req_cleanup(&rmdir_req);
+    }
+
+    fctx->resp.success = true;
+    fctx->ok = 1;
+}
+
+static void dir_remove_done(void *user, int closing)
+{
+    dir_remove_ctx_t *fctx = (dir_remove_ctx_t *)user;
+
+    if (!closing)
+    {
+        if (fctx->ok)
+        {
+            taz_response_send(fctx->write_fn, fctx->write_ctx, fctx->stream_id,
+                              fctx->opcode, taz_v1_DirRemoveResponse_fields,
+                              &fctx->resp);
+        }
+        else
+        {
+            taz_error_send(fctx->write_fn, fctx->write_ctx, fctx->stream_id,
+                           fctx->opcode, fctx->error_code, "remove failed",
+                           fctx->detail);
+        }
+    }
+    free(fctx);
+}
+
+void handle_dir_remove(taz_dispatch_t *d, const taz_frame_header_t *header,
+                       const uint8_t *payload, taz_dispatch_write_fn_t write_fn,
+                       void *ctx)
+{
+    taz_v1_DirRemoveRequest req = taz_v1_DirRemoveRequest_init_zero;
+    dir_remove_ctx_t *fctx;
+
+    if (payload != NULL && header->length > 0U)
+    {
+        pb_istream_t istream =
+            pb_istream_from_buffer(payload, (size_t)header->length);
+        if (!pb_decode(&istream, taz_v1_DirRemoveRequest_fields, &req))
+        {
+            taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                           taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                           "decode DirRemoveRequest failed", NULL);
+            taz_dispatch_stream_done(d, header->stream_id);
+            return;
+        }
+    }
+
+    if (req.path[0] == '\0')
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                       "path is required", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+
+    fctx = (dir_remove_ctx_t *)calloc(1U, sizeof(*fctx));
+    if (fctx == NULL)
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
+                       NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+    fctx->write_fn = write_fn;
+    fctx->write_ctx = ctx;
+    fctx->stream_id = header->stream_id;
+    fctx->opcode = header->opcode;
+    fctx->req = req;
+
+    if (taz_work_submit(d, header->stream_id, dir_remove_work, dir_remove_done,
+                        fctx) != 0)
+    {
+        free(fctx);
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+                       "work submit failed", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+}

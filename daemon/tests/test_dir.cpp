@@ -61,6 +61,22 @@ std::vector<uint8_t> encode_dir_list_request(const std::string &path,
     return buf;
 }
 
+std::vector<uint8_t> encode_dir_remove_request(const std::string &path,
+                                               bool recursive)
+{
+    taz_v1_DirRemoveRequest req = taz_v1_DirRemoveRequest_init_zero;
+    if (!path.empty())
+    {
+        (void)strncpy(req.path, path.c_str(), sizeof(req.path) - 1U);
+    }
+    req.recursive = recursive;
+    std::vector<uint8_t> buf(taz_v1_DirRemoveRequest_size);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(pb_encode(&ostream, taz_v1_DirRemoveRequest_fields, &req));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
 // Callback-based mirror of taz_v1_DirListResponse with no static-array cap
 // on entry count (same pattern as test_response.cpp's DirListResponseCb,
 // redeclared here since PB_BIND's generated symbols must stay scoped to
@@ -854,6 +870,275 @@ TEST_F(FileHandlerTest, DirListConnectionClosingWhileInFlightSendsNothing)
 {
     DispatchRequest(taz_v1_Opcode_OPCODE_DIR_LIST,
                     encode_dir_list_request(Dir(), false), 8U,
+                    [this]() { SetConnClosing(1); });
+
+    EXPECT_EQ(Frames().size(), 0U);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), 1);
+    EXPECT_EQ(UnrefCount(), 1);
+}
+
+TEST_F(FileHandlerTest, DirRemoveOfEmptyDirectorySucceeds)
+{
+    const std::string path = JoinDir("subdir");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, path.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(path, false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+
+    taz_v1_DirRemoveResponse resp = taz_v1_DirRemoveResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_DirRemoveResponse_fields, &resp));
+    EXPECT_TRUE(resp.success);
+    EXPECT_FALSE(PathExists(path));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest,
+       DirRemoveNonRecursiveOnNonEmptyDirReturnsErrorNotNotFoundAndSurvives)
+{
+    const std::string path = JoinDir("subdir");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, path.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(path + "/a.txt", "hi");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(path, false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_NE(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_TRUE(PathIsDir(path));
+    EXPECT_TRUE(PathExists(path + "/a.txt"));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest,
+       DirRemoveRecursiveRemovesTreeButLeavesOutsideSymlinkTargetUntouched)
+{
+    const std::string outside = JoinDir("outside");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, outside.c_str(), 0755, nullptr),
+              0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(outside + "/file.txt", "outside");
+
+    const std::string target = JoinDir("target");
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, target.c_str(), 0755, nullptr),
+              0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(target + "/a.txt", "a");
+    WriteFile(target + "/readonly.txt", "ro");
+    {
+        uv_fs_t chmod_req;
+        ASSERT_EQ(uv_fs_chmod(nullptr, &chmod_req,
+                              (target + "/readonly.txt").c_str(), 0444,
+                              nullptr),
+                  0);
+        uv_fs_req_cleanup(&chmod_req);
+    }
+    const std::string sub = target + "/sub";
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, sub.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(sub + "/b.txt", "b");
+
+    bool have_symlink = false;
+    {
+        uv_fs_t symlink_req;
+        const int rc = uv_fs_symlink(nullptr, &symlink_req, "../outside",
+                                     (target + "/link_to_outside").c_str(),
+                                     UV_FS_SYMLINK_DIR, nullptr);
+        uv_fs_req_cleanup(&symlink_req);
+#ifdef _WIN32
+        if (rc == UV_EPERM || rc == UV_EACCES)
+        {
+            have_symlink = false;
+        }
+        else
+        {
+            ASSERT_EQ(rc, 0);
+            have_symlink = true;
+        }
+#else
+        ASSERT_EQ(rc, 0);
+        have_symlink = true;
+#endif
+    }
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(target, true), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+
+    taz_v1_DirRemoveResponse resp = taz_v1_DirRemoveResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_DirRemoveResponse_fields, &resp));
+    EXPECT_TRUE(resp.success);
+
+    EXPECT_FALSE(PathExists(target));
+    EXPECT_TRUE(PathIsDir(outside));
+    EXPECT_TRUE(PathExists(outside + "/file.txt"));
+    (void)have_symlink;
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DirRemoveMissingPathReturnsNotFound)
+{
+    const std::string path = JoinDir("missing");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(path, false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DirRemoveRecursiveOfMissingPathReturnsNotFound)
+{
+    const std::string path = JoinDir("missing");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(path, true), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DirRemoveNonRecursivePathIsFileReturnsErrorNotNotFound)
+{
+    const std::string path = JoinDir("file.txt");
+    WriteFile(path, "hi");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(path, false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_NE(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_TRUE(PathExists(path));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DirRemoveRecursivePathIsFileReturnsErrorNotNotFound)
+{
+    const std::string path = JoinDir("file.txt");
+    WriteFile(path, "hi");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(path, true), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_NE(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_TRUE(PathExists(path));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest,
+       DirRemoveEmptyPathIsInvalidRequestWithoutTouchingThePool)
+{
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request("", false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "path is required");
+
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+TEST_F(FileHandlerTest, DirRemoveUndecodablePayloadIsInvalidRequest)
+{
+    const std::vector<uint8_t> payload{0x0AU, 0xC8U, 0x01U};
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE, payload, 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+TEST_F(FileHandlerTest, DirRemoveConnectionClosingWhileInFlightSendsNothing)
+{
+    const std::string path = JoinDir("subdir");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, path.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(path, false), 8U,
                     [this]() { SetConnClosing(1); });
 
     EXPECT_EQ(Frames().size(), 0U);
