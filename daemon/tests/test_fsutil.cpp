@@ -127,6 +127,9 @@ TEST(ChmodUnrepresentable, SpecialBitsAreUnrepresentable)
 TEST(ChmodUnrepresentable, GroupOtherWriteWithoutOwnerWriteIsUnrepresentable)
 {
     EXPECT_NE(taz_fsutil_chmod_unrepresentable(0422U), 0U);
+    // All read bits are present here, so this isolates the group/other-write
+    // clause from the missing-read-bit clause above.
+    EXPECT_NE(taz_fsutil_chmod_unrepresentable(0466U), 0U);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,11 +317,21 @@ TEST_F(PasswdNameFromUid, NonNumericUidFieldIsSkipped)
 TEST_F(PasswdNameFromUid, OverlongLineIsSkippedNotMisparsed)
 {
     // A line longer than the internal buffer must never have its tail
-    // reparsed as a fresh "name:x:uid:..." entry.
-    WriteFile(std::string(505, 'A') + "evil:x:1000:1000::/h:/bin/sh\n");
+    // reparsed as a fresh "name:x:uid:..." entry. 511 'A' chars fill the
+    // internal line buffer (PASSWD_LINE_MAX == 512) exactly, so the tail
+    // left behind is "evil:x:1000:...", a line that would misparse as a
+    // match for uid 1000 if the drain logic were missing.
+    WriteFile(std::string(511, 'A') + "evil:x:1000:1000::/h:/bin/sh\n");
     char buf[64];
     EXPECT_EQ(
         taz_passwd_name_from_uid(Path().c_str(), 1000UL, buf, sizeof(buf)), 0);
+}
+
+TEST_F(PasswdNameFromUid, ZeroBufsizeReturnsZero)
+{
+    WriteFile("dave:x:9:9:Dave:/home/dave:/bin/bash\n");
+    char buf[64];
+    EXPECT_EQ(taz_passwd_name_from_uid(Path().c_str(), 9UL, buf, 0U), 0);
 }
 
 TEST_F(PasswdNameFromUid, EmptyNameFieldIsSkipped)
