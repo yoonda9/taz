@@ -191,6 +191,17 @@ class FileStatTest : public ::testing::Test
         uv_fs_req_cleanup(&close_req);
     }
 
+    // The umask applies to uv_fs_open's mode argument, so a freshly written
+    // file's permissions are not reliably 0644 (e.g. 'umask 077' => 0600).
+    // Tests that assert an exact mode must pin it explicitly first.
+    static void ChmodFile(const std::string &path, int mode)
+    {
+        uv_fs_t chmod_req;
+        ASSERT_EQ(uv_fs_chmod(nullptr, &chmod_req, path.c_str(), mode, nullptr),
+                  0);
+        uv_fs_req_cleanup(&chmod_req);
+    }
+
     // Drives one FILE_STAT REQUEST through taz_dispatch_frame. If
     // check_in_flight is set, it runs right after dispatch returns but
     // before the loop runs, to observe state while the work is still
@@ -236,6 +247,11 @@ class FileStatTest : public ::testing::Test
         return conn_.unref_count;
     }
 
+    void SetConnClosing(int closing)
+    {
+        conn_.closing = closing;
+    }
+
   private:
     uv_loop_t loop_{};
     taz_dispatch_t d_{};
@@ -250,6 +266,7 @@ TEST_F(FileStatTest, RegularFileReportsSizeAndKind)
 {
     const std::string path = JoinDir("hello.txt");
     WriteFile(path, "hello"); // 5 bytes
+    ChmodFile(path, 0644);    // pin the mode regardless of umask
 
     DispatchStatRequest(encode_stat_request(path), 1U);
 
@@ -273,6 +290,14 @@ TEST_F(FileStatTest, RegularFileReportsSizeAndKind)
     const uint64_t delta =
         now >= resp.modified ? now - resp.modified : resp.modified - now;
     EXPECT_LE(delta, 5U);
+
+    // created == 0 when the platform reports no birth time, else recent.
+    if (resp.created != 0U)
+    {
+        const uint64_t created_delta =
+            now >= resp.created ? now - resp.created : resp.created - now;
+        EXPECT_LE(created_delta, 5U);
+    }
 
 #ifndef _WIN32
     EXPECT_STRNE(resp.owner, "");
@@ -350,6 +375,7 @@ TEST_F(FileStatTest, MissingPathReturnsNotFoundWithDetail)
     pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
     ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
     EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+    EXPECT_STREQ(err.message, "stat failed");
     EXPECT_STRNE(err.detail, "");
 
     EXPECT_EQ(ActiveStreamCount(), 0U);
@@ -369,8 +395,34 @@ TEST_F(FileStatTest, EmptyPathIsInvalidRequestWithoutTouchingThePool)
     pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
     ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
     EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "path is required");
 
     // Never queued to the pool: no ref was ever taken.
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+TEST_F(FileStatTest, EmptyPathFieldInNonEmptyPayloadIsInvalidRequest)
+{
+    // Tag 1 (path), wire type 2 (LEN), explicit zero length: unlike
+    // encode_stat_request(""), this payload is non-empty, so dispatch takes
+    // the pb_decode branch (payload != NULL && header->length > 0) rather
+    // than the empty-payload shortcut, and still decodes to an empty path.
+    const std::vector<uint8_t> payload{0x0AU, 0x00U};
+
+    DispatchStatRequest(payload, 9U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "path is required");
+
     EXPECT_EQ(RefCount(), 0);
     EXPECT_EQ(ActiveStreamCount(), 0U);
 }
@@ -411,6 +463,25 @@ TEST_F(FileStatTest, StreamIsActiveAndConnectionRefdWhileInFlight)
                         });
 
     ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), 1);
+    EXPECT_EQ(UnrefCount(), 1);
+}
+
+TEST_F(FileStatTest, ConnectionClosingWhileInFlightSendsNothing)
+{
+    const std::string path = JoinDir("hello.txt");
+    WriteFile(path, "hello");
+
+    // Simulate the connection closing after the work has been handed to the
+    // pool but before the loop has run its after-work callback: file_stat_done
+    // must still free fctx exactly once, release the stream and unref the
+    // connection, but must not write a response (checked by ASan/valgrind
+    // for the free; checked here for the behavioural side).
+    DispatchStatRequest(encode_stat_request(path), 8U,
+                        [this]() { SetConnClosing(1); });
+
+    EXPECT_EQ(Frames().size(), 0U);
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), 1);
     EXPECT_EQ(UnrefCount(), 1);

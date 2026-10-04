@@ -47,7 +47,9 @@ static void file_stat_work(void *user)
     file_stat_ctx_t *fctx = (file_stat_ctx_t *)user;
     uv_fs_t req;
     uint64_t st_mode;
+#ifndef _WIN32
     uint64_t st_uid;
+#endif
 
     if (uv_fs_lstat(NULL, &req, fctx->req.path, NULL) < 0)
     {
@@ -59,7 +61,9 @@ static void file_stat_work(void *user)
     }
 
     st_mode = req.statbuf.st_mode;
+#ifndef _WIN32
     st_uid = req.statbuf.st_uid;
+#endif
     fctx->resp.size = req.statbuf.st_size;
     fctx->resp.permissions = (uint32_t)(st_mode & TAZ_FS_MODE_BITS);
     fctx->resp.modified = (uint64_t)req.statbuf.st_mtim.tv_sec;
