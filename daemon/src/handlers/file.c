@@ -1043,8 +1043,7 @@ static int dir_list_append(dir_list_ctx_t *fctx, const char *name,
 
     {
         dir_list_entry_t *e = &fctx->entries[fctx->count];
-        (void)strncpy(e->name, name, sizeof(e->name) - 1U);
-        e->name[sizeof(e->name) - 1U] = '\0';
+        taz_fsutil_truncate_utf8(name, e->name, sizeof(e->name));
         e->kind = kind;
         e->size = size;
     }
@@ -1052,15 +1051,19 @@ static int dir_list_append(dir_list_ctx_t *fctx, const char *name,
     return 1;
 }
 
-/* Pool thread: lstat the top-level path first - never scandir straight
- * away - so a path that is a regular file reports a stable error other
- * than NOT_FOUND instead of whatever scandir's own ENOTDIR happens to
- * map to on this platform (mem-1791144055-c0a1: POSIX ENOTDIR now maps to
- * NOT_FOUND via taz_error_from_errno, which would otherwise violate the
- * "path is a file -> error != NOT_FOUND" row). Then scandir, filtering
- * hidden names and lstat-ing each survivor; an entry that vanished
- * between scandir and lstat is skipped rather than failing the whole
- * listing. */
+/* Pool thread: stat (following symlinks) the top-level path first - never
+ * scandir straight away - so a path that is a regular file reports a
+ * stable error other than NOT_FOUND instead of whatever scandir's own
+ * ENOTDIR happens to map to on this platform (mem-1791144055-c0a1: POSIX
+ * ENOTDIR now maps to NOT_FOUND via taz_error_from_errno, which would
+ * otherwise violate the "path is a file -> error != NOT_FOUND" row).
+ * Following symlinks here (not lstat) means a symlink to a directory lists
+ * the target's entries like opendir/ls would, instead of failing with
+ * "path is not a directory"; a dangling symlink still fails this stat with
+ * ENOENT -> NOT_FOUND, same as a missing path. Then scandir, filtering
+ * hidden names and lstat-ing each survivor (entries themselves are never
+ * followed); an entry that vanished between scandir and lstat is skipped
+ * rather than failing the whole listing. */
 static void dir_list_work(void *user)
 {
     dir_list_ctx_t *fctx = (dir_list_ctx_t *)user;
@@ -1068,7 +1071,7 @@ static void dir_list_work(void *user)
     uv_fs_t scan_req;
     uv_dirent_t ent;
 
-    if (uv_fs_lstat(NULL, &stat_req, fctx->req.path, NULL) < 0)
+    if (uv_fs_stat(NULL, &stat_req, fctx->req.path, NULL) < 0)
     {
         fctx->ok = 0;
         fctx->error_code = taz_error_from_fs_req(&stat_req);
@@ -1154,25 +1157,38 @@ static void dir_list_work(void *user)
  * growable buffer. The do/while runs its body at least once, so an empty
  * listing still produces one (zero-length) iteration rather than no
  * buffer at all - taz_response_send_encoded turns that into a single
- * RESPONSE frame with an empty payload. Returns 0 on an encoding/
- * allocation failure; out_buf and out_len are valid (and must still be
- * freed) either way. */
+ * RESPONSE frame with an empty payload. taz_v1_DirListResponse is ~17.5 KiB
+ * (64 x DirEntry{name[256]}) - too large for a stack frame on a 1 MiB
+ * Windows thread (MSVC /analyze C6262 is fatal under /WX; GCC's
+ * -Wframe-larger-than=16384 agrees), so it is heap-allocated once here and
+ * reused batch to batch; entries_count caps what nanopb actually encodes,
+ * so stale bytes left over from the previous batch past that count are
+ * never read. Returns 0 on an encoding/allocation failure; out_buf and
+ * out_len are valid (and must still be freed) either way. */
 static int dir_list_encode(const dir_list_ctx_t *fctx, uint8_t **out_buf,
                            size_t *out_len)
 {
     uint8_t *buf = NULL;
     size_t buf_len = 0U;
     size_t i = 0U;
+    taz_v1_DirListResponse *batch =
+        (taz_v1_DirListResponse *)calloc(1U, sizeof(*batch));
+
+    if (batch == NULL)
+    {
+        *out_buf = NULL;
+        *out_len = 0U;
+        return 0;
+    }
 
     do
     {
-        taz_v1_DirListResponse batch = taz_v1_DirListResponse_init_zero;
         size_t batch_count = 0U;
         size_t batch_size = 0U;
 
         while (i < fctx->count && batch_count < TAZ_DIR_LIST_BATCH_MAX)
         {
-            taz_v1_DirEntry *e = &batch.entries[batch_count];
+            taz_v1_DirEntry *e = &batch->entries[batch_count];
             (void)strncpy(e->name, fctx->entries[i].name, sizeof(e->name) - 1U);
             e->name[sizeof(e->name) - 1U] = '\0';
             e->kind = fctx->entries[i].kind;
@@ -1180,11 +1196,12 @@ static int dir_list_encode(const dir_list_ctx_t *fctx, uint8_t **out_buf,
             batch_count++;
             i++;
         }
-        batch.entries_count = (pb_size_t)batch_count;
+        batch->entries_count = (pb_size_t)batch_count;
 
         if (!pb_get_encoded_size(&batch_size, taz_v1_DirListResponse_fields,
-                                 &batch))
+                                 batch))
         {
+            free(batch);
             *out_buf = buf;
             *out_len = buf_len;
             return 0;
@@ -1195,6 +1212,7 @@ static int dir_list_encode(const dir_list_ctx_t *fctx, uint8_t **out_buf,
             uint8_t *grown = (uint8_t *)realloc(buf, buf_len + batch_size);
             if (grown == NULL)
             {
+                free(batch);
                 *out_buf = buf;
                 *out_len = buf_len;
                 return 0;
@@ -1204,8 +1222,9 @@ static int dir_list_encode(const dir_list_ctx_t *fctx, uint8_t **out_buf,
             {
                 pb_ostream_t ostream =
                     pb_ostream_from_buffer(buf + buf_len, batch_size);
-                if (!pb_encode(&ostream, taz_v1_DirListResponse_fields, &batch))
+                if (!pb_encode(&ostream, taz_v1_DirListResponse_fields, batch))
                 {
+                    free(batch);
                     *out_buf = buf;
                     *out_len = buf_len;
                     return 0;
@@ -1215,6 +1234,7 @@ static int dir_list_encode(const dir_list_ctx_t *fctx, uint8_t **out_buf,
         }
     } while (i < fctx->count);
 
+    free(batch);
     *out_buf = buf;
     *out_len = buf_len;
     return 1;

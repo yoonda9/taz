@@ -41,6 +41,14 @@ extern "C"
      * separator). 0 when path has no such prefix. */
     size_t taz_fsutil_root_prefix_len(const char *path);
 
+    /* Copies name into buf (NUL-terminated, at most bufsize - 1 bytes of
+     * name). When name does not fit, the copy is trimmed at the last
+     * complete UTF-8 codepoint boundary rather than mid-codepoint (DEC-009):
+     * a long non-ASCII NTFS name can need up to 765 UTF-8 bytes for 255
+     * UTF-16 units, well past DirEntry.name's 256-byte field. No-op when
+     * bufsize is 0. */
+    void taz_fsutil_truncate_utf8(const char *name, char *buf, size_t bufsize);
+
     /* Parse passwd_path (an /etc/passwd-style "name:x:uid:..." file) for
      * the line whose third field equals uid. On a match, copies the name
      * into buf (truncated, NUL-terminated, to bufsize) and returns 1.

@@ -553,6 +553,77 @@ TEST_F(FileHandlerTest, DirListReturnsEntriesWithKindsAndSizes)
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
+TEST_F(FileHandlerTest, DirListOfSymlinkToDirectoryListsTargetEntries)
+{
+    const std::string real_path = JoinDir("real");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(
+        uv_fs_mkdir(nullptr, &mkdir_req, real_path.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(JoinDir("real/file.txt"), "hi");
+
+    const std::string link_path = JoinDir("link");
+    uv_fs_t symlink_req;
+    const int rc = uv_fs_symlink(nullptr, &symlink_req, "real",
+                                 link_path.c_str(), UV_FS_SYMLINK_DIR, nullptr);
+    uv_fs_req_cleanup(&symlink_req);
+#ifdef _WIN32
+    if (rc == UV_EPERM || rc == UV_EACCES)
+    {
+        GTEST_SKIP() << "no symlink privilege on this Windows host";
+    }
+#endif
+    ASSERT_EQ(rc, 0);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_LIST,
+                    encode_dir_list_request(link_path, false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+
+    taz_v1_DirListResponse resp = taz_v1_DirListResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_DirListResponse_fields, &resp));
+
+    ASSERT_EQ(resp.entries_count, 1);
+    EXPECT_STREQ(resp.entries[0].name, "file.txt");
+    EXPECT_EQ(resp.entries[0].kind, taz_v1_Kind_KIND_FILE);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DirListOfDanglingSymlinkReturnsNotFound)
+{
+    const std::string link_path = JoinDir("link");
+    uv_fs_t symlink_req;
+    const int rc = uv_fs_symlink(nullptr, &symlink_req, "does-not-exist",
+                                 link_path.c_str(), 0, nullptr);
+    uv_fs_req_cleanup(&symlink_req);
+#ifdef _WIN32
+    if (rc == UV_EPERM || rc == UV_EACCES)
+    {
+        GTEST_SKIP() << "no symlink privilege on this Windows host";
+    }
+#endif
+    ASSERT_EQ(rc, 0);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_LIST,
+                    encode_dir_list_request(link_path, false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
 TEST_F(FileHandlerTest, DirListIncludesHiddenEntriesOnlyWhenRequested)
 {
     WriteFile(JoinDir(".hidden"), "x");

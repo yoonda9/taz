@@ -12,6 +12,11 @@
 #define MODE_GROUP_OTHER_WRITE 0022U
 #define MODE_OWNER_WRITE       0200U
 
+/* UTF-8 continuation byte (10xxxxxx): mask selects the top two bits, tag is
+ * the value they must have (DEC-009). */
+#define UTF8_CONT_MASK 0xC0U
+#define UTF8_CONT_TAG  0x80U
+
 #ifdef _WIN32
 #define FSUTIL_SEP '\\'
 /* The Win32 long-path prefix. */
@@ -189,6 +194,34 @@ size_t taz_fsutil_root_prefix_len(const char *path)
         return 1U;
     }
     return 0U;
+}
+
+void taz_fsutil_truncate_utf8(const char *name, char *buf, size_t bufsize)
+{
+    size_t len;
+
+    if (bufsize == 0U)
+    {
+        return;
+    }
+
+    len = strlen(name);
+    if (len >= bufsize)
+    {
+        len = bufsize - 1U;
+        /* name[len] is the first byte that would be dropped; back up while
+         * it is a UTF-8 continuation byte (10xxxxxx) so a multi-byte
+         * codepoint is never split between the kept and dropped halves.
+         * Already-invalid byte sequences (arbitrary bytes are a valid
+         * POSIX filename) are trimmed the same way, which is harmless. */
+        while ((len > 0U) &&
+               (((unsigned char)name[len] & UTF8_CONT_MASK) == UTF8_CONT_TAG))
+        {
+            len--;
+        }
+    }
+    (void)memcpy(buf, name, len);
+    buf[len] = '\0';
 }
 
 /* strtoul base for the decimal uid field. */

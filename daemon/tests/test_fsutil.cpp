@@ -133,6 +133,53 @@ TEST(ChmodUnrepresentable, GroupOtherWriteWithoutOwnerWriteIsUnrepresentable)
 }
 
 // ---------------------------------------------------------------------------
+// taz_fsutil_truncate_utf8
+// ---------------------------------------------------------------------------
+
+TEST(TruncateUtf8, NameThatFitsIsCopiedWhole)
+{
+    char buf[8];
+    taz_fsutil_truncate_utf8("abc", buf, sizeof(buf));
+    EXPECT_STREQ(buf, "abc");
+}
+
+TEST(TruncateUtf8, AsciiOverflowTrimsAtByteBoundary)
+{
+    char buf[4];
+    taz_fsutil_truncate_utf8("abcdef", buf, sizeof(buf));
+    EXPECT_STREQ(buf, "abc");
+}
+
+TEST(TruncateUtf8, NeverSplitsAMultiByteCodepoint)
+{
+    // U+20AC (EUR SIGN) encodes as the 3 bytes E2 82 AC. A capacity that
+    // lands inside it must drop the whole codepoint, not emit a truncated,
+    // invalid tail.
+    const char name[] = "ab\xE2\x82\xAC"
+                        "cd";
+    char buf[8];
+
+    taz_fsutil_truncate_utf8(name, buf, 3U); // room for "ab" only
+    EXPECT_STREQ(buf, "ab");
+
+    taz_fsutil_truncate_utf8(name, buf, 4U); // 1 byte into the codepoint
+    EXPECT_STREQ(buf, "ab");
+
+    taz_fsutil_truncate_utf8(name, buf, 5U); // 2 bytes into the codepoint
+    EXPECT_STREQ(buf, "ab");
+
+    taz_fsutil_truncate_utf8(name, buf, 6U); // the full codepoint fits
+    EXPECT_STREQ(buf, "ab\xE2\x82\xAC");
+}
+
+TEST(TruncateUtf8, ZeroBufsizeIsANoOp)
+{
+    char buf[1] = {'x'};
+    taz_fsutil_truncate_utf8("abc", buf, 0U);
+    EXPECT_EQ(buf[0], 'x');
+}
+
+// ---------------------------------------------------------------------------
 // taz_fsutil_is_sep
 // ---------------------------------------------------------------------------
 
