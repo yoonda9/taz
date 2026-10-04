@@ -1054,16 +1054,19 @@ static int dir_list_append(dir_list_ctx_t *fctx, const char *name,
 /* Pool thread: stat (following symlinks) the top-level path first - never
  * scandir straight away - so a path that is a regular file reports a
  * stable error other than NOT_FOUND instead of whatever scandir's own
- * ENOTDIR happens to map to on this platform (mem-1791144055-c0a1: POSIX
- * ENOTDIR now maps to NOT_FOUND via taz_error_from_errno, which would
- * otherwise violate the "path is a file -> error != NOT_FOUND" row).
+ * ENOTDIR maps to on this platform (POSIX ENOTDIR maps to NOT_FOUND via
+ * taz_error_from_errno, which would otherwise violate the "path is a file
+ * -> error != NOT_FOUND" row).
  * Following symlinks here (not lstat) means a symlink to a directory lists
  * the target's entries like opendir/ls would, instead of failing with
  * "path is not a directory"; a dangling symlink still fails this stat with
  * ENOENT -> NOT_FOUND, same as a missing path. Then scandir, filtering
  * hidden names and lstat-ing each survivor (entries themselves are never
- * followed); an entry that vanished between scandir and lstat is skipped
- * rather than failing the whole listing. */
+ * followed). Only an ENOENT from that lstat (the entry vanished between
+ * scandir and lstat) is skipped rather than failing the whole listing; any
+ * other lstat failure (e.g. EACCES from a directory that can be read but
+ * not searched) fails the listing instead of silently dropping the
+ * entry. */
 static void dir_list_work(void *user)
 {
     dir_list_ctx_t *fctx = (dir_list_ctx_t *)user;
@@ -1119,14 +1122,26 @@ static void dir_list_work(void *user)
             return;
         }
 
-        if (uv_fs_lstat(NULL, &lstat_req, child, NULL) < 0)
         {
-            /* Vanished between scandir and lstat: skip, not an error. */
-            uv_fs_req_cleanup(&lstat_req);
+            const int lstat_rc = uv_fs_lstat(NULL, &lstat_req, child, NULL);
             free(child);
-            continue;
+            if (lstat_rc < 0)
+            {
+                if (lstat_rc == UV_ENOENT)
+                {
+                    /* Vanished between scandir and lstat: skip, not an
+                     * error. */
+                    uv_fs_req_cleanup(&lstat_req);
+                    continue;
+                }
+                fctx->ok = 0;
+                fctx->error_code = taz_error_from_fs_req(&lstat_req);
+                fctx->detail = taz_error_fs_detail(&lstat_req);
+                uv_fs_req_cleanup(&lstat_req);
+                uv_fs_req_cleanup(&scan_req);
+                return;
+            }
         }
-        free(child);
 
         {
             const taz_v1_Kind kind =

@@ -106,6 +106,43 @@ class ScopedUmask
   private:
     mode_t prev_;
 };
+
+// Pins a path's POSIX mode bits for the duration of the test, restoring the
+// mode observed at construction time on scope exit (via lstat, not a
+// hardcoded value) so TearDown's RemoveTree can still traverse a directory
+// a test deliberately made unsearchable. Uses EXPECT_ rather than ASSERT_
+// in the constructor/destructor since the latter would return out of a
+// function with no return type.
+class ScopedChmod
+{
+  public:
+    ScopedChmod(std::string path, int mode) : path_(std::move(path))
+    {
+        uv_fs_t stat_req;
+        EXPECT_EQ(uv_fs_lstat(nullptr, &stat_req, path_.c_str(), nullptr), 0);
+        prev_mode_ = static_cast<int>(stat_req.statbuf.st_mode & 07777U);
+        uv_fs_req_cleanup(&stat_req);
+
+        uv_fs_t chmod_req;
+        EXPECT_EQ(uv_fs_chmod(nullptr, &chmod_req, path_.c_str(), mode, nullptr),
+                  0);
+        uv_fs_req_cleanup(&chmod_req);
+    }
+    ~ScopedChmod()
+    {
+        uv_fs_t chmod_req;
+        EXPECT_EQ(
+            uv_fs_chmod(nullptr, &chmod_req, path_.c_str(), prev_mode_, nullptr),
+            0);
+        uv_fs_req_cleanup(&chmod_req);
+    }
+    ScopedChmod(const ScopedChmod &) = delete;
+    ScopedChmod &operator=(const ScopedChmod &) = delete;
+
+  private:
+    std::string path_;
+    int prev_mode_ = 0;
+};
 #endif
 
 // ---------------------------------------------------------------------------

@@ -16,6 +16,10 @@
 #include <pb_encode.h>
 #include <uv.h>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #include "file_test_support.h"
 #include "handlers/file.h"
 #include "taz/v1/common.pb.h"
@@ -767,6 +771,48 @@ TEST_F(FileHandlerTest, DirListPathIsFileReturnsErrorNotNotFound)
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());
 }
+
+#ifndef _WIN32
+// Probe for mem-1791147651-a703 / review.rejected on ab80693: a directory
+// readable but not searchable (0600: r without x) makes scandir succeed
+// (it only needs read on the directory itself) while lstat-ing each
+// surviving entry fails with EACCES (search permission is required to
+// resolve a name inside the directory). dir_list_work must only treat
+// ENOENT from that lstat as "vanished, skip"; any other error (EACCES
+// here) must fail the whole listing instead of silently reporting zero
+// entries.
+TEST_F(FileHandlerTest, DirListWithUnsearchableDirectoryReturnsPermissionDenied)
+{
+    if (geteuid() == 0)
+    {
+        GTEST_SKIP() << "root bypasses directory search permission checks";
+    }
+
+    const std::string sub = JoinDir("sub");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, sub.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(sub + "/a.txt", "hi");
+
+    const ScopedChmod unsearchable(sub, 0600);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_LIST,
+                    encode_dir_list_request(sub, false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_PERMISSION_DENIED);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+#endif
 
 TEST_F(FileHandlerTest, DirListEmptyPathIsInvalidRequestWithoutTouchingThePool)
 {
