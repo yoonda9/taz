@@ -46,6 +46,18 @@ extern "C"
                             const uint8_t *payload,
                             taz_dispatch_write_fn_t write_fn, void *ctx);
 
+    /* Async FILE_CHMOD handler: decode the request, reject an empty path
+     * with INVALID_REQUEST, then uv_fs_chmod(path, permissions & 07777) on
+     * the thread pool. On Windows, uv_fs_chmod only honours the owner-write
+     * bit (READONLY attribute); on success there, after-work prints a
+     * stderr warning when taz_fsutil_chmod_unrepresentable says the
+     * requested mode cannot be faithfully represented. Replies with a
+     * FileChmodResponse(success=true) or an error. Closes the stream
+     * itself. */
+    void handle_file_chmod(taz_dispatch_t *d, const taz_frame_header_t *header,
+                           const uint8_t *payload,
+                           taz_dispatch_write_fn_t write_fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

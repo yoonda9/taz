@@ -37,6 +37,7 @@ size_t taz_payload_capability(uint8_t *buf, size_t bufsize)
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_FILE_STAT;
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_FILE_CREATE;
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_FILE_DELETE;
+        msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_FILE_CHMOD;
         msg.operations_count = op;
     }
     msg.compression_count = 1U;

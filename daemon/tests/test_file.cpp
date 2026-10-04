@@ -200,6 +200,22 @@ std::vector<uint8_t> encode_delete_request(const std::string &path)
     return buf;
 }
 
+std::vector<uint8_t> encode_chmod_request(const std::string &path,
+                                          uint32_t permissions)
+{
+    taz_v1_FileChmodRequest req = taz_v1_FileChmodRequest_init_zero;
+    if (!path.empty())
+    {
+        (void)strncpy(req.path, path.c_str(), sizeof(req.path) - 1U);
+    }
+    req.permissions = permissions;
+    std::vector<uint8_t> buf(taz_v1_FileChmodRequest_size);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(pb_encode(&ostream, taz_v1_FileChmodRequest_fields, &req));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
 // ---------------------------------------------------------------------------
 // Fixture: real loop, fake dispatch, a scratch directory removed in
 // TearDown.
@@ -352,7 +368,9 @@ class FileHandlerTest : public ::testing::Test
         return rc == 0;
     }
 
-#ifndef _WIN32
+    // On Windows this is never POSIX-exact (libuv derives it from the
+    // READONLY attribute), but the 0222/0200 write bits this file's chmod
+    // tests check do reflect that attribute faithfully.
     static uint64_t FileMode(const std::string &path)
     {
         uv_fs_t req;
@@ -361,7 +379,6 @@ class FileHandlerTest : public ::testing::Test
         uv_fs_req_cleanup(&req);
         return mode;
     }
-#endif
 
     static std::string ReadFileBytes(const std::string &path)
     {
@@ -999,4 +1016,135 @@ TEST_F(FileHandlerTest, DeleteUndecodablePayloadIsInvalidRequest)
 
     EXPECT_EQ(RefCount(), 0);
     EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+// ---------------------------------------------------------------------------
+// FILE_CHMOD
+// ---------------------------------------------------------------------------
+
+#ifndef _WIN32
+TEST_F(FileHandlerTest, ChmodSetsExactModeOnPosix)
+{
+    const std::string path = JoinDir("hello.txt");
+    WriteFile(path, "hello");
+    ChmodFile(path, 0644);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CHMOD,
+                    encode_chmod_request(path, 0600U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(h.opcode, static_cast<uint16_t>(taz_v1_Opcode_OPCODE_FILE_CHMOD));
+
+    taz_v1_FileChmodResponse resp = taz_v1_FileChmodResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_FileChmodResponse_fields, &resp));
+    EXPECT_TRUE(resp.success);
+    EXPECT_EQ(FileMode(path), 0600U);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CHMOD,
+                    encode_chmod_request(path, 0644U), 2U);
+    ASSERT_EQ(Frames().size(), 2U);
+    EXPECT_EQ(FileMode(path), 0644U);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+#endif
+
+#ifdef _WIN32
+TEST_F(FileHandlerTest, ChmodTogglesReadOnlyAttributeOnWindows)
+{
+    const std::string path = JoinDir("hello.txt");
+    WriteFile(path, "hello");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CHMOD,
+                    encode_chmod_request(path, 0444U), 1U);
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(FileMode(path) & 0222U, 0U);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CHMOD,
+                    encode_chmod_request(path, 0644U), 2U);
+    ASSERT_EQ(Frames().size(), 2U);
+    EXPECT_NE(FileMode(path) & 0200U, 0U);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+#endif
+
+TEST_F(FileHandlerTest, ChmodMissingReturnsNotFound)
+{
+    const std::string path = JoinDir("does-not-exist");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CHMOD,
+                    encode_chmod_request(path, 0644U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+    EXPECT_STRNE(err.detail, "");
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, ChmodEmptyPathIsInvalidRequestWithoutTouchingThePool)
+{
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CHMOD,
+                    encode_chmod_request("", 0644U), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "path is required");
+
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+TEST_F(FileHandlerTest, ChmodUndecodablePayloadIsInvalidRequest)
+{
+    const std::vector<uint8_t> payload{0x0AU, 0xC8U, 0x01U};
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CHMOD, payload, 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+}
+
+TEST_F(FileHandlerTest, ChmodConnectionClosingWhileInFlightSendsNothing)
+{
+    const std::string path = JoinDir("hello.txt");
+    WriteFile(path, "hello");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CHMOD,
+                    encode_chmod_request(path, 0600U), 8U,
+                    [this]() { SetConnClosing(1); });
+
+    EXPECT_EQ(Frames().size(), 0U);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), 1);
+    EXPECT_EQ(UnrefCount(), 1);
 }

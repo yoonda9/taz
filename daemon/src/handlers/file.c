@@ -502,3 +502,140 @@ void handle_file_delete(taz_dispatch_t *d, const taz_frame_header_t *header,
         return;
     }
 }
+
+/* Carries everything file_chmod_work/file_chmod_done need. unrepresentable
+ * is only meaningful (and only computed) on Windows, where uv_fs_chmod
+ * honours just the owner-write bit. */
+typedef struct
+{
+    taz_dispatch_write_fn_t write_fn;
+    void *write_ctx;
+    uint32_t stream_id;
+    uint16_t opcode;
+    taz_v1_FileChmodRequest req;
+
+    int ok;
+    taz_v1_ErrorCode error_code;
+    const char *detail;
+    taz_v1_FileChmodResponse resp;
+#ifdef _WIN32
+    uint32_t unrepresentable;
+#endif
+} file_chmod_ctx_t;
+
+/* Pool thread: a single uv_fs_chmod, masked to the POSIX permission bits. */
+static void file_chmod_work(void *user)
+{
+    file_chmod_ctx_t *fctx = (file_chmod_ctx_t *)user;
+    uv_fs_t req;
+    const uint32_t mode = fctx->req.permissions & TAZ_FS_MODE_BITS;
+
+    if (uv_fs_chmod(NULL, &req, fctx->req.path, (int)mode, NULL) < 0)
+    {
+        fctx->ok = 0;
+        fctx->error_code = taz_error_from_fs_req(&req);
+        fctx->detail = taz_error_fs_detail(&req);
+        uv_fs_req_cleanup(&req);
+        return;
+    }
+    uv_fs_req_cleanup(&req);
+
+#ifdef _WIN32
+    fctx->unrepresentable = taz_fsutil_chmod_unrepresentable(mode);
+#endif
+
+    fctx->resp.success = true;
+    fctx->ok = 1;
+}
+
+/* Loop thread: on a successful, non-closing chmod on Windows, warn when the
+ * requested mode could not be faithfully represented by the single
+ * owner-write bit libuv actually toggles there. */
+static void file_chmod_done(void *user, int closing)
+{
+    file_chmod_ctx_t *fctx = (file_chmod_ctx_t *)user;
+
+    if (!closing)
+    {
+        if (fctx->ok)
+        {
+#ifdef _WIN32
+            if (fctx->unrepresentable != 0U)
+            {
+                (void)fprintf(
+                    stderr,
+                    "tazd: warning: chmod %s: mode %04o is only partially "
+                    "honoured on Windows (owner-write bit only)\n",
+                    fctx->req.path, (unsigned int)fctx->req.permissions);
+            }
+#endif
+            taz_response_send(fctx->write_fn, fctx->write_ctx, fctx->stream_id,
+                              fctx->opcode, taz_v1_FileChmodResponse_fields,
+                              &fctx->resp);
+        }
+        else
+        {
+            taz_error_send(fctx->write_fn, fctx->write_ctx, fctx->stream_id,
+                           fctx->opcode, fctx->error_code, "chmod failed",
+                           fctx->detail);
+        }
+    }
+    free(fctx);
+}
+
+void handle_file_chmod(taz_dispatch_t *d, const taz_frame_header_t *header,
+                       const uint8_t *payload, taz_dispatch_write_fn_t write_fn,
+                       void *ctx)
+{
+    taz_v1_FileChmodRequest req = taz_v1_FileChmodRequest_init_zero;
+    file_chmod_ctx_t *fctx;
+
+    if (payload != NULL && header->length > 0U)
+    {
+        pb_istream_t istream =
+            pb_istream_from_buffer(payload, (size_t)header->length);
+        if (!pb_decode(&istream, taz_v1_FileChmodRequest_fields, &req))
+        {
+            taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                           taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                           "decode FileChmodRequest failed", NULL);
+            taz_dispatch_stream_done(d, header->stream_id);
+            return;
+        }
+    }
+
+    if (req.path[0] == '\0')
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                       "path is required", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+
+    fctx = (file_chmod_ctx_t *)calloc(1U, sizeof(*fctx));
+    if (fctx == NULL)
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
+                       NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+    fctx->write_fn = write_fn;
+    fctx->write_ctx = ctx;
+    fctx->stream_id = header->stream_id;
+    fctx->opcode = header->opcode;
+    fctx->req = req;
+
+    if (taz_work_submit(d, header->stream_id, file_chmod_work, file_chmod_done,
+                        fctx) != 0)
+    {
+        free(fctx);
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+                       "work submit failed", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+}
