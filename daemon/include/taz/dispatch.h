@@ -56,7 +56,7 @@ extern "C"
         taz_dispatch_conn_ref_fn_t conn_ref;
         taz_dispatch_conn_ref_fn_t conn_unref;
         void *conn_ctx;
-        /* Queried by taz_work.c after a pool work item finishes, to decide
+        /* Queried by work.c after a pool work item finishes, to decide
          * whether its completion may still write to the connection. Set
          * alongside conn_ref/conn_unref by connection.c; left NULL by
          * taz_dispatch_init, in which case taz_dispatch_conn_closing

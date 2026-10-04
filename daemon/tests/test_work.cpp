@@ -50,6 +50,13 @@ struct WorkCtx
     uv_thread_t done_thread{};
     int done_calls = 0;
     int done_closing = -1;
+    // Set by the test before submitting, so the done callback can record
+    // state at call time and prove the module's ordering guarantee: done
+    // runs before stream_done and unref.
+    const taz_dispatch_t *d = nullptr;
+    const FakeConn *conn = nullptr;
+    size_t active_count_at_done = 0U;
+    int unref_count_at_done = -1;
 };
 
 void CaptureWork(void *user)
@@ -64,6 +71,8 @@ void CaptureDone(void *user, int closing)
     w->done_thread = uv_thread_self();
     w->done_calls++;
     w->done_closing = closing;
+    w->active_count_at_done = w->d->active_count;
+    w->unref_count_at_done = w->conn->unref_count;
 }
 
 } // namespace
@@ -80,6 +89,8 @@ TEST(Work, RunsOffLoopThreadAndCompletesOnLoopThread)
     d.active_count = 1U;
 
     WorkCtx w;
+    w.d = &d;
+    w.conn = &conn;
     const uv_thread_t test_thread = uv_thread_self();
 
     ASSERT_EQ(taz_work_submit(&d, 42U, CaptureWork, CaptureDone, &w), 0);
@@ -94,6 +105,10 @@ TEST(Work, RunsOffLoopThreadAndCompletesOnLoopThread)
     EXPECT_TRUE(uv_thread_equal(&w.done_thread, &test_thread));
     EXPECT_EQ(w.done_calls, 1);
     EXPECT_EQ(w.done_closing, 0);
+    // done must run before stream_done and unref: at done time the stream
+    // is still active and the connection has not yet been unreffed.
+    EXPECT_EQ(w.active_count_at_done, 1U);
+    EXPECT_EQ(w.unref_count_at_done, 0);
     EXPECT_EQ(d.active_count, 0U);
     EXPECT_EQ(conn.ref_count, 1);
     EXPECT_EQ(conn.unref_count, 1);
@@ -108,6 +123,13 @@ struct BlockingWorkCtx
     uv_sem_t release{};
     int done_calls = 0;
     int done_closing = -1;
+    // Set by the test before submitting, so the done callback can record
+    // state at call time and prove the module's ordering guarantee: done
+    // runs before stream_done and unref.
+    const taz_dispatch_t *d = nullptr;
+    const FakeConn *conn = nullptr;
+    size_t active_count_at_done = 0U;
+    int unref_count_at_done = -1;
 };
 
 void BlockingWork(void *user)
@@ -122,6 +144,8 @@ void BlockingDone(void *user, int closing)
     auto *w = static_cast<BlockingWorkCtx *>(user);
     w->done_calls++;
     w->done_closing = closing;
+    w->active_count_at_done = w->d->active_count;
+    w->unref_count_at_done = w->conn->unref_count;
 }
 
 } // namespace
@@ -138,6 +162,8 @@ TEST(Work, CloseWhileInFlightStillDeliversDoneWithClosingTrue)
     d.active_count = 1U;
 
     BlockingWorkCtx w;
+    w.d = &d;
+    w.conn = &conn;
     ASSERT_EQ(uv_sem_init(&w.started, 0U), 0);
     ASSERT_EQ(uv_sem_init(&w.release, 0U), 0);
 
@@ -159,6 +185,10 @@ TEST(Work, CloseWhileInFlightStillDeliversDoneWithClosingTrue)
 
     EXPECT_EQ(w.done_calls, 1);
     EXPECT_EQ(w.done_closing, 1);
+    // done must run before stream_done and unref: at done time the stream
+    // is still active and the connection has not yet been unreffed.
+    EXPECT_EQ(w.active_count_at_done, 1U);
+    EXPECT_EQ(w.unref_count_at_done, 0);
     EXPECT_EQ(d.active_count, 0U);
     EXPECT_EQ(conn.ref_count, 1);
     EXPECT_EQ(conn.unref_count, 1);
@@ -181,6 +211,10 @@ TEST(Work, TwoSubmissionsOnDifferentStreamsCompleteIndependently)
 
     WorkCtx w1;
     WorkCtx w2;
+    w1.d = &d;
+    w1.conn = &conn;
+    w2.d = &d;
+    w2.conn = &conn;
     ASSERT_EQ(taz_work_submit(&d, 1U, CaptureWork, CaptureDone, &w1), 0);
     ASSERT_EQ(taz_work_submit(&d, 2U, CaptureWork, CaptureDone, &w2), 0);
     EXPECT_EQ(conn.ref_count, 2);
