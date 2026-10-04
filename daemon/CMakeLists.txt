@@ -246,6 +246,7 @@ add_library(
     src/exec.c
     src/server.c
     src/work.c
+    src/fsutil.c
     src/dispatch.c
     src/connection.c
     src/handlers/version.c
