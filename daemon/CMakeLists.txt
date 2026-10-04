@@ -260,6 +260,9 @@ target_include_directories(taz_core PUBLIC include)
 # own headers, so include order alone cannot prevent it.
 if(WIN32)
     target_compile_definitions(taz_core PUBLIC WIN32_LEAN_AND_MEAN)
+    # GetNamedSecurityInfoW / LookupAccountSidW (handlers/file.c Windows
+    # owner lookup) live in Advapi32.lib.
+    target_link_libraries(taz_core PRIVATE Advapi32)
 endif()
 # taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
 # to the C++ GoogleTest target that links taz_core.

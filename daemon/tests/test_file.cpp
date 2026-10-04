@@ -495,6 +495,28 @@ TEST_F(FileHandlerTest, RegularFileReportsSizeAndKind)
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
+#ifdef _WIN32
+TEST_F(FileHandlerTest, OwnerIsResolvedViaWindowsSecurityApi)
+{
+    const std::string path = JoinDir("owned.txt");
+    WriteFile(path, "hello");
+
+    DispatchStatRequest(encode_stat_request(path), 100U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_FileStatResponse resp = taz_v1_FileStatResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_FileStatResponse_fields, &resp));
+
+    EXPECT_STRNE(resp.owner, "");
+    EXPECT_NE(strchr(resp.owner, '\\'), nullptr);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+#endif
+
 TEST_F(FileHandlerTest, DirectoryReportsKindDir)
 {
     const std::string path = JoinDir("subdir");

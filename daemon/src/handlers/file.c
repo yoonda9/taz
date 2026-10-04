@@ -13,6 +13,11 @@
 #include "taz/v1/file.pb.h"
 #include "taz/work.h"
 
+#ifdef _WIN32
+#include <aclapi.h>
+#include <windows.h>
+#endif
+
 /* POSIX permission bits: owner/group/other rwx plus setuid/setgid/sticky. */
 #define TAZ_FS_MODE_BITS 07777U
 
@@ -42,6 +47,66 @@ typedef struct
     const char *detail;
     taz_v1_FileStatResponse resp;
 } file_stat_ctx_t;
+
+#ifdef _WIN32
+/* Best-effort "DOMAIN\name" owner lookup (DEC-007): any failure along the
+ * way (conversion, GetNamedSecurityInfoW, LookupAccountSidW) leaves owner
+ * untouched (already "" from the caller's calloc) rather than failing the
+ * stat. Runs on the pool thread; touches no shared state. */
+static void file_stat_owner_win32(const char *path, char *owner,
+                                  size_t owner_size)
+{
+    PSID owner_sid = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    WCHAR *wpath;
+    const ssize_t wlen = uv_wtf8_length_as_utf16(path);
+
+    if (wlen <= 0)
+    {
+        return;
+    }
+    wpath = (WCHAR *)malloc((size_t)wlen * sizeof(WCHAR));
+    if (wpath == NULL)
+    {
+        return;
+    }
+    uv_wtf8_to_utf16(path, wpath, (size_t)wlen);
+
+    if (GetNamedSecurityInfoW(wpath, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                              &owner_sid, NULL, NULL, NULL,
+                              &sd) == ERROR_SUCCESS &&
+        owner_sid != NULL)
+    {
+        WCHAR name[256];
+        WCHAR domain[256];
+        DWORD name_len = (DWORD)(sizeof(name) / sizeof(name[0]));
+        DWORD domain_len = (DWORD)(sizeof(domain) / sizeof(domain[0]));
+        SID_NAME_USE use;
+
+        if (LookupAccountSidW(NULL, owner_sid, name, &name_len, domain,
+                              &domain_len, &use))
+        {
+            char name_utf8[256];
+            char domain_utf8[256];
+
+            if (WideCharToMultiByte(CP_UTF8, 0, domain, -1, domain_utf8,
+                                    (int)sizeof(domain_utf8), NULL, NULL) > 0 &&
+                WideCharToMultiByte(CP_UTF8, 0, name, -1, name_utf8,
+                                    (int)sizeof(name_utf8), NULL, NULL) > 0)
+            {
+                (void)snprintf(owner, owner_size, "%s\\%s", domain_utf8,
+                               name_utf8);
+            }
+        }
+    }
+
+    if (sd != NULL)
+    {
+        LocalFree(sd);
+    }
+    free(wpath);
+}
+#endif
 
 /* Pool thread: touches only fctx->req (input) and fctx->{ok,error_code,
  * detail,resp} (output) - never d, a connection, or a uv_* handle outside
@@ -94,6 +159,9 @@ static void file_stat_work(void *user)
         (void)snprintf(fctx->resp.owner, sizeof(fctx->resp.owner), "%lu",
                        (unsigned long)st_uid);
     }
+#else
+    file_stat_owner_win32(fctx->req.path, fctx->resp.owner,
+                          sizeof(fctx->resp.owner));
 #endif
 
     fctx->ok = 1;

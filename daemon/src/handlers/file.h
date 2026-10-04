@@ -15,8 +15,9 @@ extern "C"
      * INVALID_REQUEST, then uv_fs_lstat (and, for a symlink, uv_fs_readlink)
      * the path on the thread pool and reply with a FileStatResponse (kind,
      * size, permissions, modified, created, owner, link_target). Owner is
-     * resolved from /etc/passwd on POSIX and left empty on Windows (a later
-     * task adds the Windows lookup). Closes the stream itself
+     * resolved from /etc/passwd on POSIX; on Windows via
+     * GetNamedSecurityInfoW + LookupAccountSidW as "DOMAIN\name", falling
+     * back to "" on any failure. Closes the stream itself
      * (taz_dispatch_stream_done), either synchronously on a decode/
      * validation failure or later from the work-done callback. */
     void handle_file_stat(taz_dispatch_t *d, const taz_frame_header_t *header,
