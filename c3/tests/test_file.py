@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+from collections.abc import Callable
 from typing import cast
 from unittest.mock import MagicMock, patch
 
@@ -161,7 +162,10 @@ class TestFileCreate:
         client, mock_sock = _connected_client_with_sock(
             _success_bytes(common_pb2.OPCODE_FILE_CREATE, file_pb2.FileCreateResponse)
         )
-        client.file.create("/srv/app/hello.txt", content=b"hi", permissions=0o600)
+        result = client.file.create(  # type: ignore[func-returns-value]
+            "/srv/app/hello.txt", content=b"hi", permissions=0o600
+        )
+        assert result is None
         sent = b"".join(mock_sock.sent)
         req = file_pb2.FileCreateRequest()
         req.ParseFromString(sent[HEADER_SIZE:])
@@ -173,7 +177,10 @@ class TestFileCreate:
         client, mock_sock = _connected_client_with_sock(
             _success_bytes(common_pb2.OPCODE_FILE_CREATE, file_pb2.FileCreateResponse)
         )
-        client.file.create("/srv/app/empty.txt")
+        result = client.file.create(  # type: ignore[func-returns-value]
+            "/srv/app/empty.txt"
+        )
+        assert result is None
         sent = b"".join(mock_sock.sent)
         req = file_pb2.FileCreateRequest()
         req.ParseFromString(sent[HEADER_SIZE:])
@@ -212,10 +219,12 @@ class TestFileCreate:
         client = _connected_client(
             _success_bytes(common_pb2.OPCODE_FILE_CREATE, file_pb2.FileCreateResponse)
         )
-        # Should not raise even with an explicit per-call keepalive override.
-        client.file.create(
-            "/srv/app/hello.txt", keepalive=Keepalive(idle=60.0, timeout=10.0)
-        )
+        kv = Keepalive(idle=60.0, timeout=10.0)
+        with patch.object(
+            client._dispatcher, "recv_response", wraps=client._dispatcher.recv_response
+        ) as mock_recv:
+            client.file.create("/srv/app/hello.txt", keepalive=kv)
+        assert mock_recv.call_args.args[1] is kv
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +237,10 @@ class TestFileDelete:
         client, mock_sock = _connected_client_with_sock(
             _success_bytes(common_pb2.OPCODE_FILE_DELETE, file_pb2.FileDeleteResponse)
         )
-        client.file.delete("/srv/app/gone.txt")
+        result = client.file.delete(  # type: ignore[func-returns-value]
+            "/srv/app/gone.txt"
+        )
+        assert result is None
         sent = b"".join(mock_sock.sent)
         req = file_pb2.FileDeleteRequest()
         req.ParseFromString(sent[HEADER_SIZE:])
@@ -247,6 +259,17 @@ class TestFileDelete:
         assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
         assert exc_info.value.message == "path not found"
         assert exc_info.value.detail == "/srv/app/missing.txt"
+
+    def test_delete_forwards_per_call_keepalive(self) -> None:
+        client = _connected_client(
+            _success_bytes(common_pb2.OPCODE_FILE_DELETE, file_pb2.FileDeleteResponse)
+        )
+        kv = Keepalive(idle=60.0, timeout=10.0)
+        with patch.object(
+            client._dispatcher, "recv_response", wraps=client._dispatcher.recv_response
+        ) as mock_recv:
+            client.file.delete("/srv/app/gone.txt", keepalive=kv)
+        assert mock_recv.call_args.args[1] is kv
 
 
 # ---------------------------------------------------------------------------
@@ -343,10 +366,12 @@ class TestFileStat:
         client = _connected_client(
             _response_bytes(common_pb2.OPCODE_FILE_STAT, resp.SerializeToString())
         )
-        # Should not raise even with an explicit per-call keepalive override.
-        client.file.stat(
-            "/srv/app/hello.txt", keepalive=Keepalive(idle=60.0, timeout=10.0)
-        )
+        kv = Keepalive(idle=60.0, timeout=10.0)
+        with patch.object(
+            client._dispatcher, "recv_response", wraps=client._dispatcher.recv_response
+        ) as mock_recv:
+            client.file.stat("/srv/app/hello.txt", keepalive=kv)
+        assert mock_recv.call_args.args[1] is kv
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +384,10 @@ class TestFileChmod:
         client, mock_sock = _connected_client_with_sock(
             _success_bytes(common_pb2.OPCODE_FILE_CHMOD, file_pb2.FileChmodResponse)
         )
-        client.file.chmod("/srv/app/hello.txt", 0o600)
+        result = client.file.chmod(  # type: ignore[func-returns-value]
+            "/srv/app/hello.txt", 0o600
+        )
+        assert result is None
         sent = b"".join(mock_sock.sent)
         req = file_pb2.FileChmodRequest()
         req.ParseFromString(sent[HEADER_SIZE:])
@@ -380,6 +408,17 @@ class TestFileChmod:
         assert exc_info.value.message == "path not found"
         assert exc_info.value.detail == "/srv/app/missing.txt"
 
+    def test_chmod_forwards_per_call_keepalive(self) -> None:
+        client = _connected_client(
+            _success_bytes(common_pb2.OPCODE_FILE_CHMOD, file_pb2.FileChmodResponse)
+        )
+        kv = Keepalive(idle=60.0, timeout=10.0)
+        with patch.object(
+            client._dispatcher, "recv_response", wraps=client._dispatcher.recv_response
+        ) as mock_recv:
+            client.file.chmod("/srv/app/hello.txt", 0o600, keepalive=kv)
+        assert mock_recv.call_args.args[1] is kv
+
 
 # ---------------------------------------------------------------------------
 # Local opcode gating
@@ -387,9 +426,26 @@ class TestFileChmod:
 
 
 class TestFileUnadvertised:
-    def test_unadvertised_opcode_raises_not_supported_locally(self) -> None:
-        client = _connected_client(operations=[common_pb2.OPCODE_PING])
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda client: client.file.create("/srv/app/hello.txt"),
+            lambda client: client.file.delete("/srv/app/hello.txt"),
+            lambda client: client.file.stat("/srv/app/hello.txt"),
+            lambda client: client.file.chmod("/srv/app/hello.txt", 0o600),
+        ],
+        ids=["create", "delete", "stat", "chmod"],
+    )
+    def test_unadvertised_opcode_raises_not_supported_locally(
+        self, call: Callable[[TazClient], None]
+    ) -> None:
+        client, mock_sock = _connected_client_with_sock(
+            operations=[common_pb2.OPCODE_PING]
+        )
         with pytest.raises(TazError) as exc_info:
-            client.file.stat("/srv/app/hello.txt")
+            call(client)
         assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
         assert not client._conn.closed
+        # Nothing was sent: the opcode was gated locally against capabilities.
+        assert mock_sock.sendmsg.call_count == 0
+        assert mock_sock.sendall.call_count == 0
