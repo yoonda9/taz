@@ -962,6 +962,16 @@ TEST_F(FileHandlerTest,
     uv_fs_req_cleanup(&mkdir_req);
     WriteFile(sub + "/b.txt", "b");
 
+    // A third nesting level (target/sub/subsub) pushes the walk's heap
+    // stack to 3 open frames, past its initial capacity of 1: one grow
+    // 1->2 for sub, a second grow 2->4 for subsub. Without this, the
+    // 2->4 realloc path is never exercised by any test.
+    const std::string subsub = sub + "/subsub";
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, subsub.c_str(), 0755, nullptr),
+              0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(subsub + "/c.txt", "c");
+
     bool have_symlink = false;
     {
         uv_fs_t symlink_req;
@@ -1002,11 +1012,165 @@ TEST_F(FileHandlerTest,
     EXPECT_FALSE(PathExists(target));
     EXPECT_TRUE(PathIsDir(outside));
     EXPECT_TRUE(PathExists(outside + "/file.txt"));
-    (void)have_symlink;
+    if (have_symlink)
+    {
+        EXPECT_FALSE(PathExists(target + "/link_to_outside"));
+    }
 
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());
 }
+
+// dir_remove_work's top-level check must lstat (never stat) the request
+// path: a symlink to a directory is KIND_SYMLINK, not KIND_DIR, so it is
+// rejected before dir_remove_tree ever runs - the walk never follows the
+// link into real/, and real/keep.txt survives. Mutating that lstat to a
+// stat would instead walk into real/ through the link, unlink keep.txt,
+// then fail rmdir() on the symlink itself (ENOTDIR) - still an error, but
+// only after silently destroying real's contents.
+TEST_F(FileHandlerTest,
+       DirRemoveNonRecursiveOnSymlinkToDirLeavesTargetUntouched)
+{
+    const std::string real = JoinDir("real");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, real.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(real + "/keep.txt", "keep");
+
+    const std::string link = JoinDir("link");
+    uv_fs_t symlink_req;
+    const int rc = uv_fs_symlink(nullptr, &symlink_req, "real", link.c_str(),
+                                 UV_FS_SYMLINK_DIR, nullptr);
+    uv_fs_req_cleanup(&symlink_req);
+#ifdef _WIN32
+    if (rc == UV_EPERM || rc == UV_EACCES)
+    {
+        GTEST_SKIP() << "no symlink privilege on this Windows host";
+    }
+#endif
+    ASSERT_EQ(rc, 0);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(link, false), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_NE(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_TRUE(PathExists(link));
+    EXPECT_TRUE(PathExists(real + "/keep.txt"));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, DirRemoveRecursiveOnSymlinkToDirLeavesTargetUntouched)
+{
+    const std::string real = JoinDir("real");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, real.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(real + "/keep.txt", "keep");
+
+    const std::string link = JoinDir("link");
+    uv_fs_t symlink_req;
+    const int rc = uv_fs_symlink(nullptr, &symlink_req, "real", link.c_str(),
+                                 UV_FS_SYMLINK_DIR, nullptr);
+    uv_fs_req_cleanup(&symlink_req);
+#ifdef _WIN32
+    if (rc == UV_EPERM || rc == UV_EACCES)
+    {
+        GTEST_SKIP() << "no symlink privilege on this Windows host";
+    }
+#endif
+    ASSERT_EQ(rc, 0);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(link, true), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_NE(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_TRUE(PathExists(link));
+    EXPECT_TRUE(PathExists(real + "/keep.txt"));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+#ifndef _WIN32
+// A directory with r-x but not w- (0555) lets dir_remove_tree scandir into
+// it and lstat its child, but the final uv_fs_unlink on that child fails
+// with EACCES (write permission on the containing directory is required
+// to remove an entry from it) - the first error anywhere in the walk, at
+// depth 3 (t/s1/s2/s3), with two open scandirs still above it on the heap
+// stack. Exercises the mid-walk unwind (every still-open frame's scandir
+// cleaned up, every frame's path freed) under ASan/valgrind, and confirms
+// the failing entry (and everything above it) survives untouched.
+TEST_F(FileHandlerTest,
+       DirRemoveRecursiveMidWalkPermissionFailureLeavesLockedSubtreeIntact)
+{
+    if (geteuid() == 0)
+    {
+        GTEST_SKIP() << "root bypasses directory write permission checks";
+    }
+
+    const std::string t = JoinDir("t");
+    uv_fs_t mkdir_req;
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, t.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(t + "/a.txt", "a");
+
+    const std::string s1 = t + "/s1";
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, s1.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(s1 + "/x.txt", "x");
+
+    const std::string s2 = s1 + "/s2";
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, s2.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+
+    const std::string s3 = s2 + "/s3";
+    ASSERT_EQ(uv_fs_mkdir(nullptr, &mkdir_req, s3.c_str(), 0755, nullptr), 0);
+    uv_fs_req_cleanup(&mkdir_req);
+    WriteFile(s3 + "/locked.txt", "locked");
+
+    const ScopedChmod no_write(s3, 0555);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_DIR_REMOVE,
+                    encode_dir_remove_request(t, true), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_frame_header_t h = unpack_header(Frames()[0]);
+    EXPECT_EQ(h.type, static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[0]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_PERMISSION_DENIED);
+
+    EXPECT_TRUE(PathExists(s3 + "/locked.txt"));
+    EXPECT_TRUE(PathIsDir(s3));
+    EXPECT_TRUE(PathIsDir(s2));
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+#endif
 
 TEST_F(FileHandlerTest, DirRemoveMissingPathReturnsNotFound)
 {
