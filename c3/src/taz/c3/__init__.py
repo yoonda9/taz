@@ -6,12 +6,15 @@ from taz.c3.errors import (
     TazError,
     TazProtocolError,
 )
+from taz.c3.file import FileStat, Kind
 from taz.c3.settings import Backlog, Keepalive
 
 __all__ = [
     "Backlog",
     "CommandResult",
+    "FileStat",
     "Keepalive",
+    "Kind",
     "TazClient",
     "TazConnectionError",
     "TazConnectionLost",
