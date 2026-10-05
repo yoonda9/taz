@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 _REQUEST_LIMIT = DEFAULT_MAX_PAYLOAD[common_pb2.FRAME_TYPE_REQUEST]
 
 
-class Kind(enum.Enum):
+class Kind(enum.IntEnum):
     """Filesystem entry kind, mirroring ``taz.v1.common_pb2.Kind``."""
 
     UNSPECIFIED = common_pb2.KIND_UNSPECIFIED
@@ -27,6 +27,12 @@ class Kind(enum.Enum):
     DIR = common_pb2.KIND_DIR
     SYMLINK = common_pb2.KIND_SYMLINK
     OTHER = common_pb2.KIND_OTHER
+
+    @classmethod
+    def _missing_(cls, value: object) -> Kind:
+        # proto3 enums are open: a newer daemon may send a kind this client
+        # lacks, which should degrade to OTHER rather than raise.
+        return cls.OTHER
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +74,8 @@ class FileNamespace:
         payload = req.SerializeToString()
         if len(payload) > _REQUEST_LIMIT:
             raise ValueError(
-                f"content ({len(content)} bytes) makes the request "
-                f"{len(payload)} bytes, exceeding the {_REQUEST_LIMIT}-byte "
-                "REQUEST frame limit; use file.put for larger files"
+                f"content of {len(content)} bytes exceeds the REQUEST "
+                f"payload limit ({_REQUEST_LIMIT}); use file.put"
             )
         self._client._call(
             common_pb2.OPCODE_FILE_CREATE,

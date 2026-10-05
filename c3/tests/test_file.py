@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import socket
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 from taz.c3.client import TazClient
 from taz.c3.errors import TazError
-from taz.c3.file import FileStat, Kind
+from taz.c3.file import _REQUEST_LIMIT, FileStat, Kind
 from taz.c3.protocol.frame import HEADER_SIZE, Frame, pack_header
 from taz.c3.settings import Keepalive
 from taz.v1 import common_pb2, file_pb2
@@ -71,8 +72,9 @@ def _error_bytes(
     code: common_pb2.ErrorCode,
     message: str,
     stream_id: int = 1,
+    detail: str = "",
 ) -> bytes:
-    info = common_pb2.ErrorInfo(code=code, message=message)
+    info = common_pb2.ErrorInfo(code=code, message=message, detail=detail)
     payload = info.SerializeToString()
     header = pack_header(
         Frame(
@@ -183,8 +185,11 @@ class TestFileCreate:
         self,
     ) -> None:
         client, mock_sock = _connected_client_with_sock()
-        with pytest.raises(ValueError, match=r"file\.put"):
-            client.file.create("/srv/app/big.bin", content=b"x" * (100 * 1024))
+        content = b"x" * (100 * 1024)
+        with pytest.raises(ValueError, match=r"file\.put") as exc_info:
+            client.file.create("/srv/app/big.bin", content=content)
+        assert str(len(content)) in str(exc_info.value)
+        assert str(_REQUEST_LIMIT) in str(exc_info.value)
         # Only the capability handshake's bytes were ever read; nothing sent.
         assert mock_sock.sendmsg.call_count == 0
         assert mock_sock.sendall.call_count == 0
@@ -194,11 +199,23 @@ class TestFileCreate:
             common_pb2.OPCODE_FILE_CREATE,
             common_pb2.ERROR_CODE_ALREADY_EXISTS,
             "path already exists",
+            detail="/srv/app/exists.txt",
         )
         client = _connected_client(err)
         with pytest.raises(TazError) as exc_info:
             client.file.create("/srv/app/exists.txt")
         assert exc_info.value.code == common_pb2.ERROR_CODE_ALREADY_EXISTS
+        assert exc_info.value.message == "path already exists"
+        assert exc_info.value.detail == "/srv/app/exists.txt"
+
+    def test_create_forwards_per_call_keepalive(self) -> None:
+        client = _connected_client(
+            _success_bytes(common_pb2.OPCODE_FILE_CREATE, file_pb2.FileCreateResponse)
+        )
+        # Should not raise even with an explicit per-call keepalive override.
+        client.file.create(
+            "/srv/app/hello.txt", keepalive=Keepalive(idle=60.0, timeout=10.0)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -222,11 +239,14 @@ class TestFileDelete:
             common_pb2.OPCODE_FILE_DELETE,
             common_pb2.ERROR_CODE_NOT_FOUND,
             "path not found",
+            detail="/srv/app/missing.txt",
         )
         client = _connected_client(err)
         with pytest.raises(TazError) as exc_info:
             client.file.delete("/srv/app/missing.txt")
         assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+        assert exc_info.value.message == "path not found"
+        assert exc_info.value.detail == "/srv/app/missing.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +255,14 @@ class TestFileDelete:
 
 
 class TestFileStat:
+    def test_kind_values_match_wire_protocol(self) -> None:
+        # Kind is an IntEnum, so members compare equal to their wire value.
+        assert int(Kind.UNSPECIFIED) == 0
+        assert int(Kind.FILE) == 1
+        assert int(Kind.DIR) == 2
+        assert int(Kind.SYMLINK) == 3
+        assert int(Kind.OTHER) == 4
+
     def test_stat_returns_file_stat(self) -> None:
         resp = file_pb2.FileStatResponse(
             size=42,
@@ -287,16 +315,38 @@ class TestFileStat:
         )
         assert client.file.stat("/dev/null").kind == Kind.OTHER
 
+    def test_stat_unknown_kind_maps_to_other(self) -> None:
+        # As parsed from a newer daemon (proto3 enums are open).
+        future_kind = cast(common_pb2.Kind, 99)
+        resp = file_pb2.FileStatResponse(kind=future_kind)
+        client = _connected_client(
+            _response_bytes(common_pb2.OPCODE_FILE_STAT, resp.SerializeToString())
+        )
+        assert client.file.stat("/srv/app/mystery").kind == Kind.OTHER
+
     def test_stat_missing_path_raises_not_found(self) -> None:
         err = _error_bytes(
             common_pb2.OPCODE_FILE_STAT,
             common_pb2.ERROR_CODE_NOT_FOUND,
             "path not found",
+            detail="/srv/app/missing.txt",
         )
         client = _connected_client(err)
         with pytest.raises(TazError) as exc_info:
             client.file.stat("/srv/app/missing.txt")
         assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+        assert exc_info.value.message == "path not found"
+        assert exc_info.value.detail == "/srv/app/missing.txt"
+
+    def test_stat_forwards_per_call_keepalive(self) -> None:
+        resp = file_pb2.FileStatResponse(kind=common_pb2.KIND_FILE)
+        client = _connected_client(
+            _response_bytes(common_pb2.OPCODE_FILE_STAT, resp.SerializeToString())
+        )
+        # Should not raise even with an explicit per-call keepalive override.
+        client.file.stat(
+            "/srv/app/hello.txt", keepalive=Keepalive(idle=60.0, timeout=10.0)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -321,11 +371,14 @@ class TestFileChmod:
             common_pb2.OPCODE_FILE_CHMOD,
             common_pb2.ERROR_CODE_NOT_FOUND,
             "path not found",
+            detail="/srv/app/missing.txt",
         )
         client = _connected_client(err)
         with pytest.raises(TazError) as exc_info:
             client.file.chmod("/srv/app/missing.txt", 0o600)
         assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+        assert exc_info.value.message == "path not found"
+        assert exc_info.value.detail == "/srv/app/missing.txt"
 
 
 # ---------------------------------------------------------------------------
