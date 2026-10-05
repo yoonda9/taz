@@ -251,9 +251,10 @@ class TestFileCreate:
     def test_create_content_one_byte_over_request_limit_raises(self) -> None:
         path = "/p"
         content = _content_at_serialized_size(path, _REQUEST_LIMIT) + b"x"
-        assert file_pb2.FileCreateRequest(
-            path=path, content=content
-        ).ByteSize() == _REQUEST_LIMIT + 1
+        assert (
+            file_pb2.FileCreateRequest(path=path, content=content).ByteSize()
+            == _REQUEST_LIMIT + 1
+        )
         client, mock_sock = _connected_client_with_sock()
         with pytest.raises(ValueError, match=r"file\.put"):
             client.file.create(path, content=content)
@@ -508,3 +509,21 @@ class TestFileUnadvertised:
         # Nothing was sent: the opcode was gated locally against capabilities.
         assert mock_sock.sendmsg.call_count == 0
         assert mock_sock.sendall.call_count == 0
+
+
+class TestFileExports:
+    def test_file_stat_exported_from_taz_c3(self) -> None:
+        import taz.c3
+
+        assert taz.c3.FileStat is FileStat
+
+    def test_kind_exported_from_taz_c3(self) -> None:
+        import taz.c3
+
+        assert taz.c3.Kind is Kind
+
+    def test_both_in_all(self) -> None:
+        import taz.c3
+
+        assert "FileStat" in taz.c3.__all__
+        assert "Kind" in taz.c3.__all__
