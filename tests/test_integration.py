@@ -13,9 +13,20 @@ import psutil
 import pytest
 from google.protobuf import empty_pb2
 from taz.c3 import CommandResult, Keepalive, TazClient, TazConnectionLost, TazError
+from taz.c3.file import Kind
 from taz.v1 import command_pb2, common_pb2, daemon_control_pb2
 
 from tests.conftest import Daemon
+
+_FILE_OPCODES = {
+    common_pb2.OPCODE_FILE_CREATE,
+    common_pb2.OPCODE_FILE_DELETE,
+    common_pb2.OPCODE_FILE_STAT,
+    common_pb2.OPCODE_FILE_CHMOD,
+    common_pb2.OPCODE_DIR_MAKE,
+    common_pb2.OPCODE_DIR_LIST,
+    common_pb2.OPCODE_DIR_REMOVE,
+}
 
 _DAEMON_CMAKELISTS = Path(__file__).resolve().parents[1] / "daemon" / "CMakeLists.txt"
 
@@ -310,6 +321,138 @@ class TestCommandExecSlowKeepalive:
             )
         assert result.exit_code == 0
         assert result.timed_out is False
+
+
+class TestFileOps:
+    """``FILE_CREATE``/``DELETE``/``STAT``/``CHMOD`` through the typed client API."""
+
+    _posix = sys.platform != "win32"
+
+    def test_create_then_stat_reports_metadata(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "created.txt"
+        taz_client.file.create(str(path), content=b"Hello from TAZ")
+        info = taz_client.file.stat(str(path))
+        assert info.size == 14
+        assert info.kind == Kind.FILE
+        assert info.link_target == ""
+        assert abs(info.modified - time.time()) < 60
+        if self._posix:
+            assert info.owner != ""
+
+    def test_chmod_changes_permissions(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "chmod.txt"
+        taz_client.file.create(str(path))
+        if self._posix:
+            taz_client.file.chmod(str(path), 0o644)
+            assert taz_client.file.stat(str(path)).permissions == 0o644
+            taz_client.file.chmod(str(path), 0o600)
+            assert taz_client.file.stat(str(path)).permissions == 0o600
+        else:
+            taz_client.file.chmod(str(path), 0o444)
+            assert taz_client.file.stat(str(path)).permissions & 0o222 == 0
+            assert os.access(path, os.W_OK) is False
+
+    def test_delete_removes_file_and_stat_then_raises_not_found(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "deleteme.txt"
+        taz_client.file.create(str(path))
+        taz_client.file.delete(str(path))
+        assert not path.exists()
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.stat(str(path))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_delete_nonexistent_raises_not_found(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.delete(str(tmp_path / "no-such-file"))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_create_existing_raises_already_exists(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "exists.txt"
+        taz_client.file.create(str(path))
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.create(str(path))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_ALREADY_EXISTS
+
+    def test_stat_nonexistent_raises_not_found(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.stat(str(tmp_path / "no-such-file"))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_create_under_missing_directory_raises_not_found(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.create(str(tmp_path / "no-such-dir" / "created.txt"))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_delete_directory_raises_and_directory_survives(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        sub = tmp_path / "subdir"
+        sub.mkdir()
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.delete(str(sub))
+        assert exc_info.value.code != common_pb2.ERROR_CODE_NOT_FOUND
+        assert sub.is_dir()
+
+    def test_symlink_reports_kind_symlink_and_target(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "target.txt"
+        target.write_text("x")
+        link = tmp_path / "link"
+        try:
+            os.symlink("target.txt", link)
+        except OSError:
+            pytest.skip("symlink privilege")
+        info = taz_client.file.stat(str(link))
+        assert info.kind == Kind.SYMLINK
+        assert info.link_target == "target.txt"
+        assert taz_client.file.stat(str(target)).kind == Kind.FILE
+
+    def test_create_oversized_content_raises_value_error_without_round_trip(
+        self,
+        taz_client: TazClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def _fail_on_send(*args: object, **kwargs: object) -> int:
+            pytest.fail("file.create must not round-trip oversized content")
+
+        monkeypatch.setattr(taz_client._conn, "send_request", _fail_on_send)
+        with pytest.raises(ValueError):
+            taz_client.file.create(str(tmp_path / "big.txt"), content=b"x" * 100 * 1024)
+
+    def test_capabilities_advertise_file_and_directory_opcodes(
+        self, taz_client: TazClient
+    ) -> None:
+        cap = taz_client.capabilities()
+        assert set(cap.operations) >= _FILE_OPCODES
+
+    def test_demo_create_stat_list(self, taz_client: TazClient, tmp_path: Path) -> None:
+        path = tmp_path / "hello.txt"
+        taz_client.file.create(str(path), content=b"Hello from TAZ")
+        info = taz_client.file.stat(str(path))
+        print(f"Size: {info.size}, Kind: {info.kind}")
+        listing = [
+            f"  {e.name} ({e.kind.name})"
+            for e in taz_client.directory.list(str(tmp_path))
+        ]
+        for line in listing:
+            print(line)
+        assert "  hello.txt (FILE)" in listing
 
 
 class TestConfigGet:
