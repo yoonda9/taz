@@ -14,7 +14,7 @@ import pytest
 from google.protobuf import empty_pb2
 from taz.c3 import CommandResult, Keepalive, TazClient, TazConnectionLost, TazError
 from taz.c3.file import Kind
-from taz.v1 import command_pb2, common_pb2, daemon_control_pb2
+from taz.v1 import command_pb2, common_pb2, daemon_control_pb2, file_pb2
 
 from tests.conftest import Daemon
 
@@ -51,6 +51,14 @@ def _py(snippet: str) -> list[str]:
 def _normalize(data: bytes) -> bytes:
     """Collapse Windows text-mode ``\\r\\n`` so output assertions are portable."""
     return data.replace(b"\r\n", b"\n")
+
+
+def _touch_files(directory: Path, count: int) -> set[str]:
+    """Create ``count`` empty files directly under ``directory``; return names."""
+    names = {f"f{i:04d}" for i in range(count)}
+    for name in names:
+        (directory / name).touch()
+    return names
 
 
 def _process_gone(pid: int) -> bool:
@@ -453,6 +461,153 @@ class TestFileOps:
         for line in listing:
             print(line)
         assert "  hello.txt (FILE)" in listing
+
+
+class TestDirectoryOps:
+    """``DIR_MAKE``/``LIST``/``REMOVE`` through the typed client API."""
+
+    def test_make_then_stat_reports_kind_dir(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "newdir"
+        taz_client.directory.make(str(path))
+        assert taz_client.file.stat(str(path)).kind == Kind.DIR
+
+    def test_make_existing_raises_already_exists(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "exists"
+        taz_client.directory.make(str(path))
+        with pytest.raises(TazError) as exc_info:
+            taz_client.directory.make(str(path))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_ALREADY_EXISTS
+
+    def test_make_nested_without_parents_raises_not_found(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.directory.make(str(tmp_path / "a" / "b" / "c"))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_make_nested_with_parents_creates_every_level(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        leaf = tmp_path / "a" / "b" / "c"
+        taz_client.directory.make(str(leaf), parents=True)
+        for level in (tmp_path / "a", tmp_path / "a" / "b", leaf):
+            assert taz_client.file.stat(str(level)).kind == Kind.DIR
+
+    def test_list_reports_kind_and_size_per_entry(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        (tmp_path / "file.txt").write_bytes(b"abc")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / ".hidden").write_bytes(b"")
+        try:
+            os.symlink("file.txt", tmp_path / "link")
+        except OSError:
+            pytest.skip("symlink privilege")
+
+        visible = {
+            e.name: (e.kind, e.size) for e in taz_client.directory.list(str(tmp_path))
+        }
+        assert visible["file.txt"] == (Kind.FILE, 3)
+        assert visible["sub"] == (Kind.DIR, 0)
+        assert visible["link"] == (Kind.SYMLINK, 0)
+        assert ".hidden" not in visible
+
+        hidden = {
+            e.name
+            for e in taz_client.directory.list(str(tmp_path), include_hidden=True)
+        }
+        assert ".hidden" in hidden
+
+    def test_list_large_directory_returns_every_entry(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        names = _touch_files(tmp_path, 5000)
+        entries = taz_client.directory.list(str(tmp_path))
+        assert len(entries) == 5000
+        assert {e.name for e in entries} == names
+
+    def test_list_empty_directory_returns_empty_list(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert taz_client.directory.list(str(empty)) == []
+
+    def test_list_nonexistent_raises_not_found(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.directory.list(str(tmp_path / "no-such-dir"))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_remove_empty_directory(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "gone"
+        path.mkdir()
+        taz_client.directory.remove(str(path))
+        assert not path.exists()
+
+    def test_remove_nonempty_without_recursive_raises_and_survives(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "nonempty"
+        path.mkdir()
+        (path / "child.txt").write_bytes(b"x")
+        with pytest.raises(TazError):
+            taz_client.directory.remove(str(path))
+        assert path.exists()
+
+    def test_remove_recursive_deletes_tree(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "tree"
+        (root / "sub").mkdir(parents=True)
+        (root / "sub" / "child.txt").write_bytes(b"x")
+        readonly = root / "readonly.txt"
+        readonly.write_bytes(b"x")
+        readonly.chmod(0o444)
+        taz_client.directory.remove(str(root), recursive=True)
+        assert not root.exists()
+
+    def test_remove_nonexistent_raises_not_found(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.directory.remove(str(tmp_path / "no-such-dir"))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_closing_during_dir_list_work_stays_usable(
+        self, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        """A dangling DIR_LIST must not block a second connection or corrupt
+        the daemon's connection state: work callbacks run off the loop
+        thread (a data race there only shows under TSan), and a wrong
+        ``closing`` check in the after-work callback only shows under ASan
+        or Valgrind."""
+        _touch_files(tmp_path, 5000)
+        req = file_pb2.DirListRequest(path=str(tmp_path))
+
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        # 32 in-flight requests, never read: with the default libuv thread
+        # pool (4 workers) this guarantees some are queued and some running
+        # when the socket closes underneath them.
+        for _ in range(32):
+            victim._conn.send_request(
+                common_pb2.OPCODE_DIR_LIST, req.SerializeToString()
+            )
+        victim.close()
+
+        with TazClient("127.0.0.1", daemon.port) as other:
+            start = time.monotonic()
+            other.version()
+            assert time.monotonic() - start < 2.0
+            other.file.stat(str(tmp_path))
 
 
 class TestConfigGet:
