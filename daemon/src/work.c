@@ -24,6 +24,14 @@ static void on_work(uv_work_t *req)
     w->work(w->user);
 }
 
+/* Count of taz_work_submit calls that have not yet reached the end of
+ * on_after_work; touched only on the loop thread (taz_work_submit from
+ * frame dispatch, on_after_work as a uv_queue_work completion), so needs
+ * no lock. g_shutdown_loop is non-NULL once taz_work_request_shutdown has
+ * been called and is still waiting for g_outstanding to drain. */
+static size_t g_outstanding = 0U;
+static uv_loop_t *g_shutdown_loop = NULL;
+
 /* Loop thread, any status (including UV_ECANCELED, treated the same as a
  * normal completion): deliver the result, release the stream, unref the
  * connection, then free the wrapper. */
@@ -38,6 +46,14 @@ static void on_after_work(uv_work_t *req, int status)
     taz_dispatch_stream_done(w->d, w->stream_id);
     taz_dispatch_conn_unref(w->d);
     free(w);
+
+    g_outstanding--;
+    if (g_shutdown_loop != NULL && g_outstanding == 0U)
+    {
+        uv_loop_t *loop = g_shutdown_loop;
+        g_shutdown_loop = NULL;
+        uv_stop(loop);
+    }
 }
 
 int taz_work_submit(taz_dispatch_t *d, uint32_t stream_id, taz_work_fn_t work,
@@ -69,5 +85,16 @@ int taz_work_submit(taz_dispatch_t *d, uint32_t stream_id, taz_work_fn_t work,
         free(w);
         return rc;
     }
+    g_outstanding++;
     return 0;
+}
+
+void taz_work_request_shutdown(uv_loop_t *loop)
+{
+    if (g_outstanding == 0U)
+    {
+        uv_stop(loop);
+        return;
+    }
+    g_shutdown_loop = loop;
 }

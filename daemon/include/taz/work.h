@@ -32,6 +32,18 @@ extern "C"
                         taz_work_fn_t work, taz_work_done_fn_t done,
                         void *user);
 
+    /* Call from a signal/console-ctrl handler running on loop's own thread
+     * instead of uv_stop(loop) directly. uv_stop() halts the loop on the
+     * next iteration regardless of outstanding uv_queue_work items; since
+     * those run on a separate pool thread and post their completion back
+     * into *loop once done, stopping (and the caller returning from
+     * uv_run, then tearing down loop) while one is still in flight leaves
+     * the pool thread to post into freed/invalid memory. This defers the
+     * actual uv_stop() until every taz_work_submit call still outstanding
+     * has reached its on-loop-thread completion, or issues it immediately
+     * if none are outstanding. Idempotent; safe to call more than once. */
+    void taz_work_request_shutdown(uv_loop_t *loop);
+
 #ifdef __cplusplus
 }
 #endif

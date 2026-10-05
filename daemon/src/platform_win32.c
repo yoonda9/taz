@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "taz/platform.h"
+#include "taz/work.h"
 
 static uv_async_t g_stop_async;
 
@@ -17,7 +18,7 @@ static void on_stop_async(uv_async_t *handle)
 {
     uv_loop_t *loop = handle->loop;
     uv_close((uv_handle_t *)handle, NULL);
-    uv_stop(loop);
+    taz_work_request_shutdown(loop);
 }
 
 void taz_platform_init_signals(uv_loop_t *loop)

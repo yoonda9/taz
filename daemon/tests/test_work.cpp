@@ -197,6 +197,77 @@ TEST(Work, CloseWhileInFlightStillDeliversDoneWithClosingTrue)
     uv_sem_destroy(&w.release);
 }
 
+TEST(Work, RequestShutdownStopsImmediatelyWhenNothingOutstanding)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    // A handle that stays active on its own, so that without a stop
+    // request UV_RUN_DEFAULT would block on it instead of returning.
+    uv_timer_t never_fires;
+    ASSERT_EQ(uv_timer_init(&loop, &never_fires), 0);
+    ASSERT_EQ(uv_timer_start(&never_fires, [](uv_timer_t *) {}, 2000U, 0U), 0);
+
+    taz_work_request_shutdown(&loop);
+
+    // Returns promptly despite the still-active timer: nothing was
+    // outstanding, so the stop was issued immediately.
+    EXPECT_NE(uv_run(&loop, UV_RUN_DEFAULT), 0);
+
+    uv_close(reinterpret_cast<uv_handle_t *>(&never_fires), nullptr);
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(Work, RequestShutdownWaitsForOutstandingWorkBeforeStopping)
+{
+    // Regression test: a signal handler that called uv_stop() directly
+    // raced a still-running uv_queue_work item posting its completion back
+    // into the loop/connection the handler's caller was about to tear
+    // down, segfaulting on a pool thread. taz_work_request_shutdown must
+    // let the work finish (and its done callback run) before the loop is
+    // allowed to stop.
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    uv_timer_t never_fires;
+    ASSERT_EQ(uv_timer_init(&loop, &never_fires), 0);
+    ASSERT_EQ(uv_timer_start(&never_fires, [](uv_timer_t *) {}, 2000U, 0U), 0);
+
+    FakeConn conn;
+    taz_dispatch_t d;
+    InitFakeDispatch(&d, &loop, &conn);
+    d.active_streams[0] = 9U;
+    d.active_count = 1U;
+
+    BlockingWorkCtx w;
+    w.d = &d;
+    w.conn = &conn;
+    ASSERT_EQ(uv_sem_init(&w.started, 0U), 0);
+    ASSERT_EQ(uv_sem_init(&w.release, 0U), 0);
+
+    ASSERT_EQ(taz_work_submit(&d, 9U, BlockingWork, BlockingDone, &w), 0);
+    ASSERT_NE(uv_run(&loop, UV_RUN_NOWAIT), 0);
+    uv_sem_wait(&w.started);
+
+    taz_work_request_shutdown(&loop);
+    // Still running on the pool thread: must not have stopped yet.
+    EXPECT_EQ(w.done_calls, 0);
+
+    uv_sem_post(&w.release);
+    // Returns promptly despite the still-active timer: the deferred stop
+    // fired as soon as the work's done callback ran.
+    EXPECT_NE(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    EXPECT_EQ(w.done_calls, 1);
+
+    uv_close(reinterpret_cast<uv_handle_t *>(&never_fires), nullptr);
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    uv_sem_destroy(&w.started);
+    uv_sem_destroy(&w.release);
+}
+
 TEST(Work, TwoSubmissionsOnDifferentStreamsCompleteIndependently)
 {
     uv_loop_t loop;
