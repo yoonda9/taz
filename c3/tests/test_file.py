@@ -152,6 +152,31 @@ def _success_bytes(opcode: int, response_cls: type) -> bytes:
     return _response_bytes(opcode, response_cls(success=True).SerializeToString())
 
 
+def _content_at_serialized_size(path: str, target_size: int) -> bytes:
+    """Content bytes such that ``FileCreateRequest(path, content=...)`` serializes to
+    exactly ``target_size`` bytes.
+
+    Derives the content length from the actual wire encoding (varint tag/length
+    bytes included) instead of a hardcoded per-path overhead, since that overhead
+    depends on the length-prefix varint width, which itself depends on the content
+    length being solved for.
+    """
+
+    def size_for(n: int) -> int:
+        return file_pb2.FileCreateRequest(path=path, content=b"x" * n).ByteSize()
+
+    content_len = max(target_size - len(path) - 16, 0)
+    size = size_for(content_len)
+    while size < target_size:
+        content_len += 1
+        size = size_for(content_len)
+    while size > target_size:
+        content_len -= 1
+        size = size_for(content_len)
+    assert size == target_size
+    return b"x" * content_len
+
+
 # ---------------------------------------------------------------------------
 # file.create()
 # ---------------------------------------------------------------------------
@@ -198,6 +223,40 @@ class TestFileCreate:
         assert str(len(content)) in str(exc_info.value)
         assert str(_REQUEST_LIMIT) in str(exc_info.value)
         # Only the capability handshake's bytes were ever read; nothing sent.
+        assert mock_sock.sendmsg.call_count == 0
+        assert mock_sock.sendall.call_count == 0
+
+    def test_create_content_at_exact_request_limit_sends(self) -> None:
+        # The guard must measure the *serialized request*, not raw content
+        # length: this content's own length is under _REQUEST_LIMIT, but once
+        # wrapped in a FileCreateRequest (path + field tags/length varints)
+        # the serialized size lands on exactly _REQUEST_LIMIT, which must
+        # still be accepted.
+        path = "/p"
+        content = _content_at_serialized_size(path, _REQUEST_LIMIT)
+        assert len(content) < _REQUEST_LIMIT
+        client, mock_sock = _connected_client_with_sock(
+            _success_bytes(common_pb2.OPCODE_FILE_CREATE, file_pb2.FileCreateResponse)
+        )
+        result = client.file.create(  # type: ignore[func-returns-value]
+            path, content=content
+        )
+        assert result is None
+        sent = b"".join(mock_sock.sent)
+        req = file_pb2.FileCreateRequest()
+        req.ParseFromString(sent[HEADER_SIZE:])
+        assert len(req.content) == len(content)
+        assert req.ByteSize() == _REQUEST_LIMIT
+
+    def test_create_content_one_byte_over_request_limit_raises(self) -> None:
+        path = "/p"
+        content = _content_at_serialized_size(path, _REQUEST_LIMIT) + b"x"
+        assert file_pb2.FileCreateRequest(
+            path=path, content=content
+        ).ByteSize() == _REQUEST_LIMIT + 1
+        client, mock_sock = _connected_client_with_sock()
+        with pytest.raises(ValueError, match=r"file\.put"):
+            client.file.create(path, content=content)
         assert mock_sock.sendmsg.call_count == 0
         assert mock_sock.sendall.call_count == 0
 
