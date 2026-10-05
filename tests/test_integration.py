@@ -424,6 +424,8 @@ class TestFileOps:
         try:
             os.symlink("target.txt", link)
         except OSError:
+            if sys.platform != "win32":
+                raise
             pytest.skip("symlink privilege")
         info = taz_client.file.stat(str(link))
         assert info.kind == Kind.SYMLINK
@@ -503,17 +505,21 @@ class TestDirectoryOps:
         (tmp_path / "file.txt").write_bytes(b"abc")
         (tmp_path / "sub").mkdir()
         (tmp_path / ".hidden").write_bytes(b"")
+        have_link = True
         try:
             os.symlink("file.txt", tmp_path / "link")
         except OSError:
-            pytest.skip("symlink privilege")
+            if sys.platform != "win32":
+                raise
+            have_link = False
 
         visible = {
             e.name: (e.kind, e.size) for e in taz_client.directory.list(str(tmp_path))
         }
         assert visible["file.txt"] == (Kind.FILE, 3)
         assert visible["sub"] == (Kind.DIR, 0)
-        assert visible["link"] == (Kind.SYMLINK, 0)
+        if have_link:
+            assert visible["link"] == (Kind.SYMLINK, 0)
         assert ".hidden" not in visible
 
         hidden = {
