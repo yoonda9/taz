@@ -1,5 +1,11 @@
+# clang-analyzer-* is off for the C++ tests: its path-sensitive analysis of
+# every GoogleTest body was ~97% of clang-tidy's time (test_dir.cpp: 61 s
+# with it, 2 s without) and pushed the Windows lint job past its CI timeout.
+# The daemon sources keep it, plus GCC -fanalyzer and MSVC /analyze, and the
+# tests themselves run under ASan, TSan and Valgrind.
 InheritParentConfig: true
 Checks: >
+  -clang-analyzer-*,
   -readability-identifier-naming,
   -readability-magic-numbers,
   -performance-enum-size
