@@ -89,6 +89,19 @@ typedef struct
     taz_stream_done_fn_t cancel_done;
     void *cancel_done_arg;
 
+    /* Set by put_trigger_fail: the ERROR this transfer owes the client, held
+     * back until the temp-file unlink it also triggered has actually
+     * completed on the pool (put_cleanup_done), so the client never observes
+     * the ERROR before the unlink lands - sent at most once, by whichever of
+     * put_cleanup_done/put_submit_cleanup's failure branch gets there first.
+     * fail_message_buf backs fail_message because callers may pass a
+     * stack-local snprintf'd string that would otherwise dangle past this
+     * function's return. */
+    int fail_pending;
+    taz_v1_ErrorCode fail_code;
+    const char *fail_message;
+    char fail_message_buf[TAZ_FILE_PUT_SIZE_MISMATCH_MSG_LEN];
+
     /* Filled in by a work callback; read only by its done callback.
      * error_message overrides the generic "file.put failed" message when
      * set (e.g. a protocol-level wording the spec pins exactly); detail is
@@ -104,6 +117,7 @@ typedef struct
 
 static void put_release(put_ctx_t *pctx);
 static void put_submit_cleanup(put_ctx_t *pctx);
+static void put_send_pending_fail(put_ctx_t *pctx);
 static void put_trigger_fail(put_ctx_t *pctx, taz_v1_ErrorCode code,
                              const char *message);
 static void put_advance(put_ctx_t *pctx);
@@ -176,6 +190,13 @@ static void put_cleanup_done(void *user, int closing)
 
     put_fire_cancel_done(pctx);
 
+    /* The unlink above has now actually completed - safe to tell the
+     * client the transfer failed; a closing connection has no one to tell. */
+    if (!closing)
+    {
+        put_send_pending_fail(pctx);
+    }
+
     if (closing || pctx->final_seen)
     {
         put_release(pctx);
@@ -185,13 +206,38 @@ static void put_cleanup_done(void *user, int closing)
     pctx->state = PUT_STATE_DRAINING;
 }
 
+/* Sends the ERROR a put_trigger_fail call left pending, unless the
+ * connection is already closing (a write would be pointless). Must only be
+ * called once the temp-file unlink that same call triggered is actually
+ * complete (or could never be submitted at all), so the client never
+ * observes the ERROR before the unlink lands on disk. Idempotent: clears
+ * fail_pending so a later call (e.g. put_submit_cleanup's own failure
+ * branch racing put_cleanup_done) is a no-op. */
+static void put_send_pending_fail(put_ctx_t *pctx)
+{
+    if (!pctx->fail_pending)
+    {
+        return;
+    }
+    pctx->fail_pending = 0;
+
+    if (!taz_dispatch_conn_closing(pctx->d))
+    {
+        taz_error_send(pctx->write_fn, pctx->write_ctx, pctx->stream_id,
+                       pctx->opcode, pctx->fail_code, pctx->fail_message, NULL);
+    }
+}
+
 static void put_submit_cleanup(put_ctx_t *pctx)
 {
     if (taz_work_submit_step(pctx->d, put_cleanup_work, put_cleanup_done,
                              pctx) != 0)
     {
-        /* Nothing more we can safely do on the pool; release now rather
-         * than touch pctx again (best effort: the fd/temp may leak). */
+        /* The pool is unavailable, so the unlink this depended on can never
+         * run; there is nothing left to order the ERROR after, so send it
+         * now rather than losing it. Release now rather than touch pctx
+         * again (best effort: the fd/temp may leak). */
+        put_send_pending_fail(pctx);
         put_release(pctx);
         return;
     }
@@ -209,10 +255,16 @@ static void put_send_pool_error(const put_ctx_t *pctx)
                    pctx->error_detail);
 }
 
-/* Sends ERROR (unless the connection is already closing, in which case a
- * write would be pointless) and discards queued bytes, then either runs
- * cleanup now or - if a step is currently in flight on the pool thread, and
- * so owns the fd - defers it to that step's own done callback. */
+/* Discards queued bytes and starts the temp-file unlink, holding the ERROR
+ * this failure owes the client until that unlink actually completes
+ * (put_cleanup_done calls put_send_pending_fail) - never sending it first,
+ * which would let the client check for the temp file before it is actually
+ * gone. Either runs cleanup now or, if a step is currently in flight on the
+ * pool thread and so owns the fd, defers it to that step's own done
+ * callback (which itself runs cleanup without sending anything, since the
+ * real error is the one queued here). message may be a stack-local buffer
+ * (e.g. an snprintf'd size mismatch) - copied before returning, since
+ * sending is deferred past this function's return. */
 static void put_trigger_fail(put_ctx_t *pctx, taz_v1_ErrorCode code,
                              const char *message)
 {
@@ -226,11 +278,11 @@ static void put_trigger_fail(put_ctx_t *pctx, taz_v1_ErrorCode code,
     pctx->pending_len = 0U;
     pctx->state = PUT_STATE_ABORTING;
 
-    if (!taz_dispatch_conn_closing(pctx->d))
-    {
-        taz_error_send(pctx->write_fn, pctx->write_ctx, pctx->stream_id,
-                       pctx->opcode, code, message, NULL);
-    }
+    pctx->fail_pending = 1;
+    pctx->fail_code = code;
+    (void)snprintf(pctx->fail_message_buf, sizeof(pctx->fail_message_buf), "%s",
+                   message);
+    pctx->fail_message = pctx->fail_message_buf;
 
     if (pctx->work_in_flight)
     {
