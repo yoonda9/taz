@@ -9,10 +9,18 @@ import threading
 import time
 from pathlib import Path
 
+import crc32c
 import psutil
 import pytest
 from google.protobuf import empty_pb2
-from taz.c3 import CommandResult, Keepalive, TazClient, TazConnectionLost, TazError
+from taz.c3 import (
+    CommandResult,
+    FileTransfer,
+    Keepalive,
+    TazClient,
+    TazConnectionLost,
+    TazError,
+)
 from taz.c3.file import Kind
 from taz.v1 import command_pb2, common_pb2, daemon_control_pb2, file_pb2
 
@@ -26,6 +34,8 @@ _FILE_OPCODES = {
     common_pb2.OPCODE_DIR_MAKE,
     common_pb2.OPCODE_DIR_LIST,
     common_pb2.OPCODE_DIR_REMOVE,
+    common_pb2.OPCODE_FILE_PUT,
+    common_pb2.OPCODE_FILE_GET,
 }
 
 _DAEMON_CMAKELISTS = Path(__file__).resolve().parents[1] / "daemon" / "CMakeLists.txt"
@@ -614,6 +624,245 @@ class TestDirectoryOps:
             other.version()
             assert time.monotonic() - start < 2.0
             other.file.stat(str(tmp_path))
+
+
+class TestFileTransfer:
+    """``FILE_PUT``/``FILE_GET`` chunked transfers through the typed client API."""
+
+    @staticmethod
+    def _crc(data: bytes) -> bytes:
+        return crc32c.crc32c(data).to_bytes(4, "little")
+
+    @staticmethod
+    def _no_temps(directory: Path) -> None:
+        leftover = [p.name for p in directory.iterdir() if ".taz-" in p.name]
+        assert leftover == [], f"leftover temp files in {directory}: {leftover}"
+
+    @pytest.mark.parametrize("size", [1024, 0, 4 * 1024 * 1024 + 1])
+    def test_round_trip_bytes_and_checksum_match(
+        self, taz_client: TazClient, tmp_path: Path, size: int
+    ) -> None:
+        data = os.urandom(size)
+        src = tmp_path / "src.bin"
+        src.write_bytes(data)
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+        remote_path = remote_dir / "uploaded.bin"
+        checksum = self._crc(data)
+
+        put_result = taz_client.file.put(str(src), str(remote_path))
+        assert put_result == FileTransfer(size=size, checksum=checksum)
+        assert taz_client.file.stat(str(remote_path)).size == size
+        self._no_temps(remote_dir)
+
+        download = tmp_path / "downloaded.bin"
+        get_result = taz_client.file.get(str(remote_path), str(download))
+        assert get_result == put_result
+        assert download.read_bytes() == data
+        self._no_temps(tmp_path)
+
+    def test_put_reports_custom_permissions_on_posix(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        if sys.platform == "win32":
+            pytest.skip("permission bits are POSIX-only")
+        data = os.urandom(4 * 1024 * 1024 + 1)
+        src = tmp_path / "src.bin"
+        src.write_bytes(data)
+        remote_path = tmp_path / "uploaded.bin"
+        taz_client.file.put(str(src), str(remote_path), permissions=0o600)
+        assert taz_client.file.stat(str(remote_path)).permissions == 0o600
+
+    def test_overwrite_false_onto_existing_raises_and_leaves_bytes_untouched(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        remote_path = tmp_path / "existing.bin"
+        remote_path.write_bytes(b"old bytes")
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"new bytes, longer than old")
+
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.put(str(src), str(remote_path))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_ALREADY_EXISTS
+        assert remote_path.read_bytes() == b"old bytes"
+        self._no_temps(tmp_path)
+
+    def test_overwrite_true_replaces_existing_file(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        remote_path = tmp_path / "existing.bin"
+        remote_path.write_bytes(b"old bytes")
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"new bytes, longer than old")
+
+        taz_client.file.put(str(src), str(remote_path), overwrite=True)
+        assert remote_path.read_bytes() == b"new bytes, longer than old"
+
+    def test_put_to_missing_parent_raises_not_found(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"x")
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.put(str(src), str(tmp_path / "no-such-dir" / "dest.bin"))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_put_onto_directory_raises_invalid_request(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"x")
+        target_dir = tmp_path / "subdir"
+        target_dir.mkdir()
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.put(str(src), str(target_dir))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+
+    def test_get_nonexistent_raises_not_found(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.get(
+                str(tmp_path / "no-such.bin"), str(tmp_path / "local.bin")
+            )
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_get_directory_raises_invalid_request_and_leaves_no_local_temp(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        remote_dir = tmp_path / "remotedir"
+        remote_dir.mkdir()
+        with pytest.raises(TazError) as exc_info:
+            taz_client.file.get(str(remote_dir), str(tmp_path / "local.bin"))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+        self._no_temps(tmp_path)
+
+    def test_put_fewer_bytes_than_announced_size_raises_invalid_request(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        remote_path = tmp_path / "dest.bin"
+        kv = taz_client._keepalive
+        req = file_pb2.FilePutRequest(
+            dest=str(remote_path), size=100, permissions=0o644
+        )
+        stream_id = taz_client._conn.send_request(
+            common_pb2.OPCODE_FILE_PUT, req.SerializeToString()
+        )
+        ack = taz_client._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+        )
+        ack_resp = file_pb2.FilePutResponse()
+        ack_resp.ParseFromString(ack.payload)
+        assert ack_resp.ack.ready is True
+
+        taz_client._conn.send_file_chunk(stream_id, b"x" * 10, last=True)
+        frame = taz_client._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+        )
+        assert frame.type == common_pb2.FRAME_TYPE_ERROR
+        info = common_pb2.ErrorInfo()
+        info.ParseFromString(frame.payload)
+        assert info.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+
+        assert not remote_path.exists()
+        self._no_temps(tmp_path)
+        taz_client.ping()
+
+    def test_put_more_bytes_than_announced_size_raises_invalid_request(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        remote_path = tmp_path / "dest.bin"
+        kv = taz_client._keepalive
+        req = file_pb2.FilePutRequest(dest=str(remote_path), size=10, permissions=0o644)
+        stream_id = taz_client._conn.send_request(
+            common_pb2.OPCODE_FILE_PUT, req.SerializeToString()
+        )
+        ack = taz_client._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+        )
+        ack_resp = file_pb2.FilePutResponse()
+        ack_resp.ParseFromString(ack.payload)
+        assert ack_resp.ack.ready is True
+
+        taz_client._conn.send_file_chunk(stream_id, b"x" * 100, last=True)
+        frame = taz_client._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+        )
+        assert frame.type == common_pb2.FRAME_TYPE_ERROR
+        info = common_pb2.ErrorInfo()
+        info.ParseFromString(frame.payload)
+        assert info.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+
+        assert not remote_path.exists()
+        self._no_temps(tmp_path)
+        taz_client.ping()
+
+    def test_concurrent_uploads_from_two_clients_both_succeed(
+        self, taz_client: TazClient, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        data_a = os.urandom(512 * 1024)
+        data_b = os.urandom(512 * 1024)
+        src_a = tmp_path / "a.bin"
+        src_b = tmp_path / "b.bin"
+        src_a.write_bytes(data_a)
+        src_b.write_bytes(data_b)
+        dest_a = tmp_path / "dest_a.bin"
+        dest_b = tmp_path / "dest_b.bin"
+
+        results: dict[str, FileTransfer | BaseException] = {}
+
+        def upload(name: str, client: TazClient, src: Path, dest: Path) -> None:
+            try:
+                results[name] = client.file.put(str(src), str(dest))
+            except BaseException as exc:  # re-raised on the main thread below
+                results[name] = exc
+
+        with TazClient("127.0.0.1", daemon.port) as other:
+            t_a = threading.Thread(target=upload, args=("a", taz_client, src_a, dest_a))
+            t_b = threading.Thread(target=upload, args=("b", other, src_b, dest_b))
+            t_a.start()
+            t_b.start()
+            t_a.join(timeout=10)
+            t_b.join(timeout=10)
+
+            assert not t_a.is_alive()
+            assert not t_b.is_alive()
+
+        for name in ("a", "b"):
+            result = results[name]
+            if isinstance(result, BaseException):
+                raise result
+        assert results["a"] == FileTransfer(
+            size=len(data_a), checksum=self._crc(data_a)
+        )
+        assert results["b"] == FileTransfer(
+            size=len(data_b), checksum=self._crc(data_b)
+        )
+        assert dest_a.read_bytes() == data_a
+        assert dest_b.read_bytes() == data_b
+
+    def test_capabilities_advertise_put_get_and_cancel(
+        self, taz_client: TazClient
+    ) -> None:
+        cap = taz_client.capabilities()
+        ops = set(cap.operations)
+        assert common_pb2.OPCODE_FILE_PUT in ops
+        assert common_pb2.OPCODE_FILE_GET in ops
+        assert common_pb2.OPCODE_CANCEL in ops
+
+    def test_demo_put_then_get_large_file(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        data = os.urandom(1024 * 1024)
+        large_file = tmp_path / "large_file.bin"
+        large_file.write_bytes(data)
+        remote_path = tmp_path / "remote_large_file.bin"
+        downloaded = tmp_path / "downloaded.bin"
+
+        taz_client.file.put(str(large_file), str(remote_path))
+        taz_client.file.get(str(remote_path), str(downloaded))
+
+        assert downloaded.read_bytes() == data
 
 
 class TestConfigGet:
