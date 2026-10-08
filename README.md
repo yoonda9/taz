@@ -1,4 +1,8 @@
-# Test Agent Zero — TAZ, the Tasmanian daemonfish
+<p align="center">
+  <img src="docs/assets/taz-logo.png" alt="TAZ logo" width="200">
+</p>
+
+# Test Agent Zero, the Tasmanian daemonfish
 
 TAZ is a remote test daemon whose primary purpose is to facilitate tests running on remote hosts.
 
