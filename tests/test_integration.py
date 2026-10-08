@@ -9,7 +9,7 @@ import threading
 import time
 from pathlib import Path
 
-import crc32c
+import google_crc32c
 import psutil
 import pytest
 from google.protobuf import empty_pb2
@@ -631,7 +631,7 @@ class TestFileTransfer:
 
     @staticmethod
     def _crc(data: bytes) -> bytes:
-        return crc32c.crc32c(data).to_bytes(4, "little")
+        return google_crc32c.value(data).to_bytes(4, "little")
 
     @staticmethod
     def _no_temps(directory: Path) -> None:

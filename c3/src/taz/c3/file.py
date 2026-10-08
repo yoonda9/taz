@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import crc32c
+import google_crc32c
 
 from taz.c3.errors import TazChecksumError, TazError, TazProtocolError
 from taz.c3.protocol.frame import DEFAULT_MAX_PAYLOAD, Frame
@@ -214,7 +214,7 @@ class FileNamespace:
                             f"local file shrank during upload: read {sent}"
                             f" of {size} declared bytes"
                         )
-                    crc = crc32c.crc32c(data, crc)
+                    crc = google_crc32c.extend(crc, data)
                     client._conn.send_file_chunk(stream_id, data, last=last)
                     if last:
                         break
@@ -293,7 +293,7 @@ class FileNamespace:
                         if client._dispatcher._cancel_advertised():
                             client.cancel(stream_id, keepalive=kv)
                         raise
-                    crc = crc32c.crc32c(data, crc)
+                    crc = google_crc32c.extend(crc, data)
                     received += len(data)
                     if not frame.flags & common_pb2.FRAME_FLAG_CONTINUATION:
                         break

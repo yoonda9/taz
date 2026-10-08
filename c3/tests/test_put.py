@@ -6,7 +6,7 @@ import socket
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import crc32c
+import google_crc32c
 import pytest
 from taz.c3.client import TazClient
 from taz.c3.errors import TazChecksumError, TazError, TazProtocolError
@@ -213,7 +213,7 @@ class TestPut:
     def test_sends_file_put_request_with_metadata(self, tmp_path: Path) -> None:
         local = tmp_path / "src.bin"
         local.write_bytes(b"hello")
-        checksum = crc32c.crc32c(b"hello").to_bytes(4, "little")
+        checksum = google_crc32c.value(b"hello").to_bytes(4, "little")
         client, mock_sock = _connected_client_with_sock(
             _ack_bytes(), _confirm_bytes(5, checksum)
         )
@@ -232,7 +232,7 @@ class TestPut:
     def test_default_permissions_0644(self, tmp_path: Path) -> None:
         local = tmp_path / "src.bin"
         local.write_bytes(b"x")
-        checksum = crc32c.crc32c(b"x").to_bytes(4, "little")
+        checksum = google_crc32c.value(b"x").to_bytes(4, "little")
         client, mock_sock = _connected_client_with_sock(
             _ack_bytes(), _confirm_bytes(1, checksum)
         )
@@ -246,7 +246,7 @@ class TestPut:
         local = tmp_path / "src.bin"
         data = b"hello world"
         local.write_bytes(data)
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         client, mock_sock = _connected_client_with_sock(
             _ack_bytes(), _confirm_bytes(len(data), checksum)
         )
@@ -264,7 +264,7 @@ class TestPut:
     def test_zero_byte_file_sends_one_empty_last_chunk(self, tmp_path: Path) -> None:
         local = tmp_path / "empty.bin"
         local.write_bytes(b"")
-        checksum = crc32c.crc32c(b"").to_bytes(4, "little")
+        checksum = google_crc32c.value(b"").to_bytes(4, "little")
         assert checksum == b"\x00\x00\x00\x00"
         client, mock_sock = _connected_client_with_sock(
             _ack_bytes(), _confirm_bytes(0, checksum)
@@ -282,7 +282,7 @@ class TestPut:
         local = tmp_path / "src.bin"
         data = b"ABCDEFGHIJ"  # 10 bytes
         local.write_bytes(data)
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         client, mock_sock = _connected_client_with_sock(
             _ack_bytes(),
             _confirm_bytes(len(data), checksum),
@@ -361,7 +361,7 @@ class TestPut:
     ) -> None:
         local = tmp_path / "src.bin"
         local.write_bytes(b"data")
-        checksum = crc32c.crc32c(b"data").to_bytes(4, "little")
+        checksum = google_crc32c.value(b"data").to_bytes(4, "little")
         client, _ = _connected_client_with_sock(
             _ack_bytes(), _confirm_bytes(3, checksum)
         )
@@ -374,7 +374,7 @@ class TestPut:
         local = tmp_path / "src.bin"
         data = b"data"
         local.write_bytes(data)
-        local_checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        local_checksum = google_crc32c.value(data).to_bytes(4, "little")
         wrong_checksum = b"\xff\xff\xff\xff"
         client, _ = _connected_client_with_sock(
             _ack_bytes(), _confirm_bytes(len(data), wrong_checksum)
@@ -515,7 +515,7 @@ class TestPut:
     def test_keepalive_forwarded_to_every_receive(self, tmp_path: Path) -> None:
         local = tmp_path / "src.bin"
         local.write_bytes(b"data")
-        checksum = crc32c.crc32c(b"data").to_bytes(4, "little")
+        checksum = google_crc32c.value(b"data").to_bytes(4, "little")
         client, _ = _connected_client_with_sock(
             _ack_bytes(), _confirm_bytes(4, checksum)
         )

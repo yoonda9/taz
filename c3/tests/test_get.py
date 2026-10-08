@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import crc32c
+import google_crc32c
 import pytest
 from taz.c3.client import TazClient
 from taz.c3.errors import TazChecksumError, TazError, TazProtocolError
@@ -213,7 +213,7 @@ def _sent_frames(mock_sock: MagicMock) -> list[Frame]:
 class TestGet:
     def test_sends_file_get_request_with_src(self, tmp_path: Path) -> None:
         data = b"hello"
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         client, mock_sock = _connected_client_with_sock(
             _meta_bytes(len(data), checksum),
             _chunk_bytes(data, last=True),
@@ -231,7 +231,7 @@ class TestGet:
         self, tmp_path: Path
     ) -> None:
         data = b"hello world"
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         client, _ = _connected_client_with_sock(
             _meta_bytes(len(data), checksum),
             _chunk_bytes(data, last=True),
@@ -244,7 +244,7 @@ class TestGet:
         assert list(tmp_path.iterdir()) == [dest]
 
     def test_zero_byte_download(self, tmp_path: Path) -> None:
-        checksum = crc32c.crc32c(b"").to_bytes(4, "little")
+        checksum = google_crc32c.value(b"").to_bytes(4, "little")
         client, _ = _connected_client_with_sock(
             _meta_bytes(0, checksum),
             _chunk_bytes(b"", last=True),
@@ -258,7 +258,7 @@ class TestGet:
         self, tmp_path: Path
     ) -> None:
         data = b"ABCDEFGHIJ"
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         client, _ = _connected_client_with_sock(
             _meta_bytes(len(data), checksum),
             _chunk_bytes(b"ABCD", last=False),
@@ -290,7 +290,7 @@ class TestGet:
         self, tmp_path: Path
     ) -> None:
         data = b"partial"
-        checksum = crc32c.crc32c(data + b"more").to_bytes(4, "little")
+        checksum = google_crc32c.value(data + b"more").to_bytes(4, "little")
         client, _ = _connected_client_with_sock(
             _meta_bytes(len(data) + 4, checksum),
             _chunk_bytes(data, last=False),
@@ -311,7 +311,7 @@ class TestGet:
         self, tmp_path: Path
     ) -> None:
         data = b"partial"
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         client, _ = _connected_client_with_sock(
             _meta_bytes(len(data), checksum),
             _chunk_bytes(data, last=False),
@@ -327,7 +327,7 @@ class TestGet:
         self, tmp_path: Path
     ) -> None:
         data = b"short"
-        wrong_size_checksum = crc32c.crc32c(data + b"xxx").to_bytes(4, "little")
+        wrong_size_checksum = google_crc32c.value(data + b"xxx").to_bytes(4, "little")
         client, _ = _connected_client_with_sock(
             _meta_bytes(len(data) + 3, wrong_size_checksum),
             _chunk_bytes(data, last=True),
@@ -342,7 +342,7 @@ class TestGet:
         self, tmp_path: Path
     ) -> None:
         data = b"data"
-        actual_checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        actual_checksum = google_crc32c.value(data).to_bytes(4, "little")
         wrong_checksum = b"\xff\xff\xff\xff"
         client, _ = _connected_client_with_sock(
             _meta_bytes(len(data), wrong_checksum),
@@ -376,7 +376,7 @@ class TestGet:
         self, tmp_path: Path
     ) -> None:
         data = b"x" * 20
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         client, mock_sock = _connected_client_with_sock(
             _meta_bytes(len(data), checksum),
             _chunk_bytes(b"x" * 4, last=False),
@@ -429,7 +429,7 @@ class TestGet:
         self, tmp_path: Path
     ) -> None:
         data = b"x" * 20
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         client, mock_sock = _connected_client_with_sock(
             _meta_bytes(len(data), checksum),
             _chunk_bytes(b"x" * 4, last=False),
@@ -471,7 +471,7 @@ class TestGet:
 
     def test_keepalive_forwarded_to_every_receive(self, tmp_path: Path) -> None:
         data = b"data"
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         client, _ = _connected_client_with_sock(
             _meta_bytes(len(data), checksum),
             _chunk_bytes(data, last=True),
@@ -490,7 +490,7 @@ class TestGet:
         """The temp file must live in local_path's own directory for an atomic
         same-filesystem os.replace(), not in a platform tempdir."""
         data = b"data"
-        checksum = crc32c.crc32c(data).to_bytes(4, "little")
+        checksum = google_crc32c.value(data).to_bytes(4, "little")
         seen_dirs: list[str] = []
 
         def _recording_temp(

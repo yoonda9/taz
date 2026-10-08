@@ -17,6 +17,7 @@ the wire spec and protobuf schemas (`rpc/`) are the contract; the C daemon
 | `daemon/`           | C daemon (libuv + nanopb), CMake + Conan build      |
 | `c3/`               | Python client package (`import taz`)                |
 | `tests/`            | Integration tests (daemon + client)                 |
+| `typings/`          | Local type stubs for untyped dependencies (mypy)    |
 | `tools/dev.py`      | Cross-platform helpers behind `just` recipes        |
 | `tools/win.py`      | Disposable Windows VM on Proxmox (`just win*`)      |
 | `tools/winbuild.py` | Rebuilds the Windows templates (`tools/winimage/`)  |

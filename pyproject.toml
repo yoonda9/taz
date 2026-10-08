@@ -101,6 +101,8 @@ python_version = "3.12"
 strict = true
 files = ["c3/src", "c3/tests", "tests", "tools"]
 exclude = ["c3/src/taz/v1/"]
+# Local stubs for dependencies whose types do not reach mypy.
+mypy_path = "typings"
 
 [[tool.mypy.overrides]]
 module = ["taz.v1.*"]
