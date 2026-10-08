@@ -349,12 +349,14 @@ class TestGet:
             _chunk_bytes(data, last=True),
         )
         dest = tmp_path / "dest.bin"
+        preexisting = b"pre-existing content"
+        dest.write_bytes(preexisting)
         with pytest.raises(TazChecksumError) as exc_info:
             client.file.get("/remote/src", str(dest))
         assert exc_info.value.expected == wrong_checksum
         assert exc_info.value.actual == actual_checksum
-        assert not dest.exists()
-        assert list(tmp_path.iterdir()) == []
+        assert dest.read_bytes() == preexisting
+        assert list(tmp_path.iterdir()) == [dest]
 
     def test_not_advertised_raises_not_supported_and_sends_nothing(
         self, tmp_path: Path
