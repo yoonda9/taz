@@ -600,6 +600,60 @@ TEST_F(FileHandlerTest, PutMoreBytesThanAnnouncedErrorsImmediatelyThenDrains)
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
+// Regression for a daemon-thread race (put_on_chunk, loop thread, vs
+// put_write_work, pool thread, both touching pctx->written) that also made
+// the overshoot check under-count by the first chunk's writing_len: two
+// chunks are dispatched back to back with no intervening RunLoop, so the
+// first chunk's write step is still (verifiably, via work_in_flight)
+// in flight - unsynchronized with this test's main thread - when the
+// second, overshooting chunk arrives. The fix tracks accepted bytes on the
+// loop thread only, so the bound check never reads the pool-owned
+// `written`/`crc` fields and the overshoot is now caught immediately
+// rather than deferred to the finish-time size check (a different error
+// message: "more bytes than announced size", not "received N bytes,
+// announced M").
+TEST_F(FileHandlerTest, PutOvershootWhileWriteInFlightErrorsImmediately)
+{
+    const std::string dest = JoinDir("overshoot_in_flight.txt");
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 22U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, 10U, 0U, false), 22U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    // First chunk (6 bytes, fits under the announced 10) starts its write
+    // step on the pool. Second chunk (6 more, total 12 > 10) is dispatched
+    // immediately after with no RunLoop() in between, so work_in_flight is
+    // still set from the first chunk's step - the bound check below must
+    // not rely on the first step's written/crc having landed yet.
+    DispatchChunkNoRun(22U, std::vector<uint8_t>(6U, 'x'), /*last=*/false);
+    DispatchChunkNoRun(22U, std::vector<uint8_t>(6U, 'y'), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 1U);
+
+    RunLoop();
+
+    ASSERT_EQ(Frames().size(), 2U);
+    const taz_v1_ErrorInfo err = decode_error(Frames()[1]);
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "more bytes than announced size");
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_FALSE(PathExists(dest));
+    // The first chunk's write step was still in flight when the failure was
+    // triggered, so cleanup leaves the stream DRAINING (final_seen is still
+    // false - neither chunk carried the final flag) until the final chunk
+    // arrives and releases it.
+    EXPECT_EQ(ActiveStreamCount(), 1U);
+
+    DispatchChunk(22U, {}, /*last=*/true);
+    EXPECT_EQ(Frames().size(), 2U);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
 TEST_F(FileHandlerTest, PutFewerBytesThanAnnouncedErrorsOnFinalChunkAndReleases)
 {
     const std::string dest = JoinDir("short.txt");

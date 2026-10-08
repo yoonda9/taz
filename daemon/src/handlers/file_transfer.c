@@ -63,6 +63,14 @@ typedef struct
 
     put_state_t state;
 
+    /* Cumulative bytes ever enqueued by put_on_chunk, including bytes
+     * already moved into writing/written. Event-loop-thread owned (only
+     * put_on_chunk/put_advance touch it), so the request-size bound check
+     * below never races put_write_work's pool-thread update of written;
+     * written/crc stay pool-owned until the per-step done callback's
+     * happens-before makes them safe to read on the loop thread again. */
+    uint64_t accepted;
+
     uint64_t written;
     uint32_t crc;
 
@@ -400,13 +408,13 @@ static void put_on_chunk(void *user, const taz_frame_header_t *header,
         return;
     }
 
-    if (pctx->written + (uint64_t)pctx->pending_len + (uint64_t)len >
-        pctx->req.size)
+    if (pctx->accepted + (uint64_t)len > pctx->req.size)
     {
         put_trigger_fail(pctx, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
                          "more bytes than announced size");
         return;
     }
+    pctx->accepted += (uint64_t)len;
 
     if (len > 0U)
     {
