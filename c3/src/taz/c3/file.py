@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -239,3 +240,79 @@ class FileNamespace:
         if confirm_resp.confirm.checksum != checksum:
             raise TazChecksumError(checksum, confirm_resp.confirm.checksum)
         return FileTransfer(size=size, checksum=checksum)
+
+    def get(
+        self,
+        remote_path: str,
+        local_path: str,
+        keepalive: Keepalive | None = None,
+    ) -> FileTransfer:
+        """Download ``remote_path`` to ``local_path`` from FILE_CHUNK frames.
+
+        Writes into a temp file next to ``local_path`` and only renames it
+        into place once the daemon-declared size and CRC32C checksum match
+        the bytes actually received; raises ``TazChecksumError`` otherwise
+        and leaves no temp file behind.
+        """
+        client = self._client
+        kv = keepalive if keepalive is not None else client._keepalive
+
+        req = file_pb2.FileGetRequest(src=remote_path)
+        stream_id = client._conn.send_request(
+            common_pb2.OPCODE_FILE_GET, req.SerializeToString()
+        )
+
+        frame = client._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_GET
+        )
+        _raise_if_error(frame)
+        meta = file_pb2.FileGetResponse()
+        meta.ParseFromString(frame.payload)
+
+        local_dir = os.path.dirname(local_path) or "."
+        local_name = os.path.basename(local_path)
+        # Stays open across the whole receive loop below, closed explicitly
+        # on both the success and exception paths - not a `with`-scoped use.
+        tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            dir=local_dir, prefix=f"{local_name}.taz-", suffix=".tmp", delete=False
+        )
+        tmp_path = tmp.name
+
+        crc = 0
+        received = 0
+        try:
+            while True:
+                frame = client._dispatcher.recv_response(
+                    stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_GET
+                )
+                if frame.type == common_pb2.FRAME_TYPE_FILE_CHUNK:
+                    data = frame.payload
+                    try:
+                        tmp.write(data)
+                    except OSError:
+                        if client._dispatcher._cancel_advertised():
+                            client.cancel(stream_id, keepalive=kv)
+                        raise
+                    crc = crc32c.crc32c(data, crc)
+                    received += len(data)
+                    if not frame.flags & common_pb2.FRAME_FLAG_CONTINUATION:
+                        break
+                elif frame.type == common_pb2.FRAME_TYPE_ERROR:
+                    _raise_if_error(frame)
+                else:
+                    raise TazProtocolError(
+                        f"FILE_GET: unexpected frame type {frame.type} mid-transfer"
+                    )
+        except BaseException:
+            tmp.close()
+            os.unlink(tmp_path)
+            raise
+        tmp.close()
+
+        checksum = crc.to_bytes(4, "little")
+        if received != meta.size or checksum != meta.checksum:
+            os.unlink(tmp_path)
+            raise TazChecksumError(meta.checksum, checksum)
+
+        os.replace(tmp_path, local_path)
+        return FileTransfer(size=meta.size, checksum=checksum)
