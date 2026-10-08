@@ -864,6 +864,242 @@ class TestFileTransfer:
 
         assert downloaded.read_bytes() == data
 
+    def test_cancel_unknown_stream_returns_false(self, taz_client: TazClient) -> None:
+        assert taz_client.cancel(0xDEAD) is False
+
+    def test_cancel_upload_after_two_chunks_leaves_no_dest_or_temp(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+        dest = remote_dir / "dest.bin"
+        kv = taz_client._keepalive
+        req = file_pb2.FilePutRequest(dest=str(dest), size=1000, permissions=0o644)
+        stream_id = taz_client._conn.send_request(
+            common_pb2.OPCODE_FILE_PUT, req.SerializeToString()
+        )
+        ack = taz_client._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+        )
+        ack_resp = file_pb2.FilePutResponse()
+        ack_resp.ParseFromString(ack.payload)
+        assert ack_resp.ack.ready is True
+
+        taz_client._conn.send_file_chunk(stream_id, b"x" * 10, last=False)
+        taz_client._conn.send_file_chunk(stream_id, b"y" * 10, last=False)
+
+        assert taz_client.cancel(stream_id) is True
+
+        assert not dest.exists()
+        self._no_temps(remote_dir)
+        taz_client.ping()
+
+        # The stream_id and dest are free again: a fresh put() succeeds.
+        src = tmp_path / "src.bin"
+        src.write_bytes(b"after cancel")
+        result = taz_client.file.put(str(src), str(dest))
+        assert result == FileTransfer(
+            size=len(b"after cancel"), checksum=self._crc(b"after cancel")
+        )
+        assert dest.read_bytes() == b"after cancel"
+
+    def test_cancel_download_after_two_chunks_connection_stays_usable(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        # Large enough that the daemon's SENDING_CHUNKS stream genuinely
+        # blocks on its 256 KiB write-queue backpressure mark once we stop
+        # reading after 2 chunks (we never drain the socket further below) -
+        # a small file lets the daemon race ahead and finish the whole
+        # transfer before cancel() is sent, making "target not active"
+        # (cancelled=false) a real, observed flake instead of this test's
+        # intended "still SENDING_CHUNKS" case.
+        data = os.urandom(16 * 1024 * 1024)
+        src = tmp_path / "src.bin"
+        src.write_bytes(data)
+        remote_path = tmp_path / "remote.bin"
+        taz_client.file.put(str(src), str(remote_path))
+
+        kv = taz_client._keepalive
+        req = file_pb2.FileGetRequest(src=str(remote_path))
+        stream_id = taz_client._conn.send_request(
+            common_pb2.OPCODE_FILE_GET, req.SerializeToString()
+        )
+        meta_frame = taz_client._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_GET
+        )
+        meta = file_pb2.FileGetResponse()
+        meta.ParseFromString(meta_frame.payload)
+        assert meta.size == len(data)
+
+        for _ in range(2):
+            frame = taz_client._dispatcher.recv_response(
+                stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_GET
+            )
+            assert frame.type == common_pb2.FRAME_TYPE_FILE_CHUNK
+            assert frame.flags & common_pb2.FRAME_FLAG_CONTINUATION
+
+        assert taz_client.cancel(stream_id) is True
+
+        taz_client.ping()
+        download = tmp_path / "downloaded.bin"
+        get_result = taz_client.file.get(str(remote_path), str(download))
+        assert get_result == FileTransfer(size=len(data), checksum=self._crc(data))
+        assert download.read_bytes() == data
+
+    def test_closing_socket_mid_upload_leaves_no_dest_and_connection_stays_usable(
+        self, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+        dest = remote_dir / "dest.bin"
+
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        kv = victim._keepalive
+        req = file_pb2.FilePutRequest(dest=str(dest), size=100, permissions=0o644)
+        stream_id = victim._conn.send_request(
+            common_pb2.OPCODE_FILE_PUT, req.SerializeToString()
+        )
+        ack = victim._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+        )
+        ack_resp = file_pb2.FilePutResponse()
+        ack_resp.ParseFromString(ack.payload)
+        assert ack_resp.ack.ready is True
+        victim._conn.send_file_chunk(stream_id, b"x" * 10, last=False)
+
+        # Abrupt teardown: close the socket mid-transfer, no CANCEL sent, no
+        # final chunk - mirrors TestConnectionLifetime's exec-side variant.
+        victim.close()
+
+        with TazClient("127.0.0.1", daemon.port) as other:
+            start = time.monotonic()
+            other.version()
+            assert time.monotonic() - start < 2.0
+
+        assert not dest.exists()
+        self._no_temps(remote_dir)
+
+    def test_sigterm_mid_upload_raises_connection_lost_and_leaves_no_dest(
+        self, taz_client: TazClient, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        data = os.urandom(32 * 1024 * 1024)
+        src = tmp_path / "src.bin"
+        src.write_bytes(data)
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+        dest = remote_dir / "dest.bin"
+
+        errors: list[BaseException] = []
+
+        def upload() -> None:
+            try:
+                taz_client.file.put(str(src), str(dest))
+            except BaseException as exc:  # re-raised on the main thread below
+                errors.append(exc)
+
+        t = threading.Thread(target=upload)
+        t.start()
+        deadline = time.monotonic() + 10
+        while (
+            not any(".taz-" in p.name for p in remote_dir.iterdir())
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert any(".taz-" in p.name for p in remote_dir.iterdir()), (
+            "temp file never appeared"
+        )
+
+        daemon.stop()
+        t.join(timeout=10)
+        assert not t.is_alive()
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], TazConnectionLost)
+        assert not dest.exists()
+
+    def test_sigterm_mid_download_raises_connection_lost_and_leaves_no_local_temp(
+        self, taz_client: TazClient, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        data = os.urandom(32 * 1024 * 1024)
+        src = tmp_path / "src.bin"
+        src.write_bytes(data)
+        remote_path = tmp_path / "remote.bin"
+        taz_client.file.put(str(src), str(remote_path))
+
+        download = tmp_path / "downloaded.bin"
+        errors: list[BaseException] = []
+
+        def fetch() -> None:
+            try:
+                taz_client.file.get(str(remote_path), str(download))
+            except BaseException as exc:  # re-raised on the main thread below
+                errors.append(exc)
+
+        t = threading.Thread(target=fetch)
+        t.start()
+        deadline = time.monotonic() + 10
+        while (
+            not any(".taz-" in p.name for p in tmp_path.iterdir() if p.is_file())
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert any(".taz-" in p.name for p in tmp_path.iterdir() if p.is_file()), (
+            "local temp file never appeared"
+        )
+
+        daemon.stop()
+        t.join(timeout=10)
+        assert not t.is_alive()
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], TazConnectionLost)
+        assert not download.exists()
+        self._no_temps(tmp_path)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="no way to cap tazd.exe's memory from the fixture on Windows",
+    )
+    def test_large_upload_succeeds_under_a_tight_memory_cap(
+        self,
+        taz_client: TazClient,
+        daemon: Daemon,
+        daemon_binary: Path,
+        tmp_path: Path,
+    ) -> None:
+        if sys.platform == "win32":
+            return  # unreachable at runtime; gives mypy the platform narrowing
+        import resource
+
+        # One failed FILE_STAT warms the daemon's thread pool before the cap
+        # is set, matching the "already warmed" vms baseline this test relies
+        # on (a cold pool's first allocation would blow the cap instead).
+        with pytest.raises(TazError):
+            taz_client.file.stat(str(tmp_path / "does-not-exist"))
+        vms = psutil.Process(daemon.proc.pid).memory_info().vms
+        # ASan's own redzones/quarantine add real overhead across the
+        # ~1000 FILE_CHUNK allocations a 64 MiB/64 KiB-chunk upload makes,
+        # on top of whatever margin the daemon itself needs; a plain build
+        # only needs headroom for its own bounded chunk buffer. Both are
+        # still far tighter than "big enough to hold the whole 64 MiB file".
+        margin = (
+            256 * 1024 * 1024
+            if "asan" in str(daemon_binary).lower()
+            else 24 * 1024 * 1024
+        )
+        cap = vms + margin
+        resource.prlimit(daemon.proc.pid, resource.RLIMIT_AS, (cap, cap))
+
+        data = os.urandom(64 * 1024 * 1024)
+        src = tmp_path / "big.bin"
+        src.write_bytes(data)
+        dest = tmp_path / "remote_big.bin"
+
+        result = taz_client.file.put(str(src), str(dest))
+        assert result == FileTransfer(size=len(data), checksum=self._crc(data))
+        assert dest.read_bytes() == data
+
 
 class TestConfigGet:
     def test_config_get_all_returns_defaults(self, taz_client: TazClient) -> None:
