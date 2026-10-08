@@ -25,6 +25,7 @@ add_executable(
     test_command.cpp
     test_work.cpp
     test_fsutil.cpp
+    test_crc32c.cpp
     test_file.cpp
     test_dir.cpp)
 # taz::proto comes in transitively via taz_core; taz_cxx_warnings carries C++
