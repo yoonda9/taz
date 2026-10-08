@@ -624,6 +624,62 @@ TEST_F(FileHandlerTest, PutConnectionClosingWhileWriteInFlightAbortsAndReleases)
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
+// Regression for a swap-remove hazard in taz_dispatch_cancel_all: stream A
+// (lower array index) reaches DRAINING, whose abort() frees it
+// synchronously via taz_dispatch_stream_done, which swap-removes by moving
+// the last active entry into A's just-freed slot. Stream B (added after A,
+// so it starts out as that last entry) is still RECEIVING. If cancel_all
+// indexes the mutating active_streams[] array instead of re-looking up each
+// id it snapshotted up front, B gets swapped into A's freed slot and its own
+// abort() is skipped by the loop's increment - leaking B's put_ctx_t, fd,
+// and temp file.
+TEST_F(FileHandlerTest,
+       CancelAllAbortsLiveStreamSwappedIntoDrainingStreamsFreedSlot)
+{
+    const std::string dest_a = JoinDir("drain_a.txt");
+    const std::string dest_b = JoinDir("live_b.txt");
+    const size_t chunk_size = static_cast<size_t>(64U) * 1024U;
+
+    char *temp_b = taz_fsutil_temp_name(dest_b.c_str(), 51U);
+    ASSERT_NE(temp_b, nullptr);
+    const std::string temp_b_path(temp_b);
+    free(temp_b);
+
+    // Stream A: added first (array index 0). Announce 10 bytes, send 16 in
+    // one chunk so put_on_chunk synchronously triggers put_trigger_fail ->
+    // ABORTING -> (no work in flight) -> put_submit_cleanup; the RunLoop
+    // inside DispatchChunk drives put_cleanup_done, which lands in DRAINING
+    // since no final chunk has arrived yet.
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest_a, 10U, 0U, false), 50U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+    DispatchChunk(50U, std::vector<uint8_t>(16U, 'x'), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 2U);
+    ASSERT_EQ(ActiveStreamCount(), 1U); // A: DRAINING, still active.
+
+    // Stream B: added second (array index 1, the entry a swap-remove of
+    // index 0 would move into index 0). A live upload with a real temp file
+    // on disk and bytes already written, never finished.
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest_b, chunk_size * 2U, 0U, false),
+                    51U);
+    ASSERT_EQ(Frames().size(), 3U);
+    ExpectAck(Frames()[2]);
+    DispatchChunk(51U, std::vector<uint8_t>(chunk_size, 'a'), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 3U);
+    EXPECT_TRUE(PathExists(temp_b_path));
+    ASSERT_EQ(ActiveStreamCount(), 2U); // A: DRAINING, B: RECEIVING.
+
+    CloseConnectionAndCancelAll();
+    RunLoop();
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_FALSE(PathExists(temp_b_path));
+    EXPECT_FALSE(PathExists(dest_b));
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
 TEST_F(FileHandlerTest, PutShutdownRequestedMidUploadCleansUpAndStopsLoop)
 {
     const std::string dest = JoinDir("shutdownmid.txt");

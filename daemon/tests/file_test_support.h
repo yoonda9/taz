@@ -547,9 +547,11 @@ class FileHandlerTest : public ::testing::Test
     }
 
     // Mirrors conn_close(): mark the connection closing, then abort every
-    // active stream (handlers/file_transfer.c's abort op never calls
-    // taz_dispatch_stream_done synchronously, so a RunLoop() afterwards is
-    // still needed to observe the cleanup complete).
+    // active stream. handlers/file_transfer.c's abort op frees a DRAINING
+    // stream synchronously (taz_dispatch_stream_done included) but defers
+    // every other stream's release to a pool cleanup step, so a RunLoop()
+    // afterwards is still needed to observe the rest of the cleanup
+    // complete.
     void CloseConnectionAndCancelAll()
     {
         conn_.closing = 1;

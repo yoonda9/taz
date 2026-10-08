@@ -87,16 +87,33 @@ void taz_dispatch_set_stream_exec(taz_dispatch_t *d, uint32_t stream_id,
 
 void taz_dispatch_cancel_all(taz_dispatch_t *d)
 {
+    /* Snapshot the ids up front: an abort() call below may free its stream
+     * synchronously via taz_dispatch_stream_done, which swap-removes by
+     * moving the last active entry into the freed slot. Indexing the live
+     * array while iterating it would then skip whichever stream got swapped
+     * into the slot just visited. Re-looking up each snapshotted id instead
+     * is immune to that mutation: a stream already removed is simply not
+     * found and skipped. */
+    uint32_t ids[TAZ_DISPATCH_MAX_STREAMS];
+    const size_t n = d->active_count;
     size_t i;
-    for (i = 0U; i < d->active_count; ++i)
+
+    (void)memcpy(ids, d->active_streams, n * sizeof(ids[0]));
+
+    for (i = 0U; i < n; ++i)
     {
-        if (d->stream_execs[i] != NULL)
+        const size_t idx = stream_find(d, ids[i]);
+        if (idx >= d->active_count)
         {
-            taz_exec_cancel(d->stream_execs[i]);
+            continue;
         }
-        if (d->stream_ops[i] != NULL)
+        if (d->stream_execs[idx] != NULL)
         {
-            d->stream_ops[i]->abort(d->stream_user[i]);
+            taz_exec_cancel(d->stream_execs[idx]);
+        }
+        if (d->stream_ops[idx] != NULL)
+        {
+            d->stream_ops[idx]->abort(d->stream_user[idx]);
         }
     }
 }
