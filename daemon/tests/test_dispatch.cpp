@@ -724,6 +724,438 @@ TEST(Dispatch, OversizedVerdictIsNoOp)
 }
 
 // ---------------------------------------------------------------------------
+// taz_stream_ops_t: FILE_CHUNK routing, set_stream_ops, cancel_stream,
+// cancel_all abort, notify_writable, conn_write_queue_size/pause/resume
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+struct ChunkSink
+{
+    bool called = false;
+    bool payload_was_null = false;
+    taz_frame_header_t header{};
+    std::vector<uint8_t> payload;
+};
+
+void RecordChunk(void *user, const taz_frame_header_t *header,
+                 const uint8_t *payload)
+{
+    auto *sink = static_cast<ChunkSink *>(user);
+    sink->called = true;
+    sink->header = *header;
+    if (payload == nullptr)
+    {
+        sink->payload_was_null = true;
+    }
+    else
+    {
+        sink->payload.assign(payload, payload + header->length);
+    }
+}
+
+int RefuseCancel(void * /*user*/, taz_stream_done_fn_t /*done*/,
+                 void * /*done_arg*/)
+{
+    return 0;
+}
+
+void NoopAbort(void * /*user*/)
+{
+}
+
+taz_frame_header_t MakeFileChunkHeader(uint32_t stream_id, uint32_t length,
+                                       uint8_t flags = 0U)
+{
+    taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK),
+                   0U, stream_id, length);
+    h.flags = flags;
+    return h;
+}
+
+} // namespace
+
+TEST(Dispatch, FileChunkRoutesToRegisteredSink)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.active_streams[0] = 5U;
+    d.active_count = 1U;
+
+    ChunkSink sink;
+    taz_stream_ops_t ops{};
+    ops.on_chunk = RecordChunk;
+    ops.cancel = RefuseCancel;
+    ops.abort = NoopAbort;
+    taz_dispatch_set_stream_ops(&d, 5U, &ops, &sink);
+
+    const std::vector<uint8_t> bytes = {1U, 2U, 3U, 4U};
+    const auto h = MakeFileChunkHeader(
+        5U, static_cast<uint32_t>(bytes.size()),
+        static_cast<uint8_t>(taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION));
+    WriteCtx wctx;
+    taz_dispatch_frame(&d, &h, bytes.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    EXPECT_TRUE(sink.called);
+    EXPECT_FALSE(sink.payload_was_null);
+    EXPECT_EQ(sink.payload, bytes);
+    EXPECT_EQ(sink.header.flags, h.flags);
+    EXPECT_EQ(sink.header.length, h.length);
+    EXPECT_EQ(sink.header.stream_id, 5U);
+    EXPECT_TRUE(wctx.frames.empty());
+    EXPECT_EQ(d.active_count, 1U);
+}
+
+TEST(Dispatch, FileChunkWithZeroLengthPassesNullPayload)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.active_streams[0] = 5U;
+    d.active_count = 1U;
+
+    ChunkSink sink;
+    taz_stream_ops_t ops{};
+    ops.on_chunk = RecordChunk;
+    ops.cancel = RefuseCancel;
+    ops.abort = NoopAbort;
+    taz_dispatch_set_stream_ops(&d, 5U, &ops, &sink);
+
+    // Non-null payload pointer with length == 0: dispatch itself must null
+    // it out, not merely forward whatever the caller passed.
+    const uint8_t bogus = 0xAAU;
+    const auto h = MakeFileChunkHeader(5U, 0U);
+    WriteCtx wctx;
+    taz_dispatch_frame(&d, &h, &bogus, TAZ_FRAME_OK, capture_write, &wctx);
+
+    EXPECT_TRUE(sink.called);
+    EXPECT_TRUE(sink.payload_was_null);
+}
+
+TEST(Dispatch, FileChunkForUnknownStreamIsDroppedSilently)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    WriteCtx wctx;
+
+    const auto h = MakeFileChunkHeader(99U, 4U);
+    const std::vector<uint8_t> bytes = {1U, 2U, 3U, 4U};
+    taz_dispatch_frame(&d, &h, bytes.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    EXPECT_TRUE(wctx.frames.empty());
+    EXPECT_EQ(d.active_count, 0U);
+}
+
+TEST(Dispatch, FileChunkForActiveStreamWithoutOpsIsDroppedSilently)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.active_streams[0] = 5U;
+    d.active_count = 1U;
+    WriteCtx wctx;
+
+    const auto h = MakeFileChunkHeader(5U, 4U);
+    const std::vector<uint8_t> bytes = {1U, 2U, 3U, 4U};
+    taz_dispatch_frame(&d, &h, bytes.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    EXPECT_TRUE(wctx.frames.empty());
+    EXPECT_EQ(d.active_count, 1U);
+}
+
+TEST(Dispatch, SetStreamOpsIsNoOpWhenStreamNotActive)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+
+    ChunkSink sink;
+    taz_stream_ops_t ops{};
+    ops.on_chunk = RecordChunk;
+    ops.cancel = RefuseCancel;
+    ops.abort = NoopAbort;
+    // No stream is active: must not create one or crash.
+    taz_dispatch_set_stream_ops(&d, 42U, &ops, &sink);
+    EXPECT_EQ(d.active_count, 0U);
+
+    WriteCtx wctx;
+    const auto h = MakeFileChunkHeader(42U, 1U);
+    const uint8_t byte = 1U;
+    taz_dispatch_frame(&d, &h, &byte, TAZ_FRAME_OK, capture_write, &wctx);
+    EXPECT_FALSE(sink.called);
+}
+
+TEST(Dispatch, SwapRemoveKeepsStreamOpsAligned)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.active_streams[0] = 10U;
+    d.active_streams[1] = 11U;
+    d.active_streams[2] = 12U;
+    d.active_count = 3U;
+
+    ChunkSink sink10;
+    ChunkSink sink11;
+    ChunkSink sink12;
+    taz_stream_ops_t ops10{};
+    ops10.on_chunk = RecordChunk;
+    ops10.cancel = RefuseCancel;
+    ops10.abort = NoopAbort;
+    const taz_stream_ops_t ops11 = ops10;
+    const taz_stream_ops_t ops12 = ops10;
+    taz_dispatch_set_stream_ops(&d, 10U, &ops10, &sink10);
+    taz_dispatch_set_stream_ops(&d, 11U, &ops11, &sink11);
+    taz_dispatch_set_stream_ops(&d, 12U, &ops12, &sink12);
+
+    // Swap-remove moves the last active entry (12) into slot 0.
+    taz_dispatch_stream_done(&d, 10U);
+    ASSERT_EQ(d.active_count, 2U);
+
+    WriteCtx wctx;
+    const uint8_t byte = 7U;
+    auto h11 = MakeFileChunkHeader(11U, 1U);
+    taz_dispatch_frame(&d, &h11, &byte, TAZ_FRAME_OK, capture_write, &wctx);
+    auto h12 = MakeFileChunkHeader(12U, 1U);
+    taz_dispatch_frame(&d, &h12, &byte, TAZ_FRAME_OK, capture_write, &wctx);
+
+    EXPECT_TRUE(sink11.called);
+    EXPECT_TRUE(sink12.called);
+    EXPECT_FALSE(sink10.called);
+}
+
+void MarkDone(void *arg)
+{
+    *static_cast<bool *>(arg) = true;
+}
+
+TEST(Dispatch, CancelStreamInactiveReturnsZeroAndDoesNotCallDone)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+
+    bool done_called = false;
+    EXPECT_EQ(taz_dispatch_cancel_stream(&d, 123U, MarkDone, &done_called), 0);
+    EXPECT_FALSE(done_called);
+}
+
+TEST(Dispatch, CancelStreamOnActiveStreamWithoutOpsReturnsZero)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.active_streams[0] = 5U;
+    d.active_count = 1U;
+
+    bool done_called = false;
+    EXPECT_EQ(taz_dispatch_cancel_stream(&d, 5U, MarkDone, &done_called), 0);
+    EXPECT_FALSE(done_called);
+}
+
+struct CancelSpy
+{
+    int calls = 0;
+    int accept_result = 1;
+};
+
+int SpyCancelAccept(void *user, taz_stream_done_fn_t done, void *done_arg)
+{
+    auto *spy = static_cast<CancelSpy *>(user);
+    spy->calls++;
+    done(done_arg);
+    return 1;
+}
+
+int SpyCancelRefuse(void *user, taz_stream_done_fn_t /*done*/,
+                    void * /*done_arg*/)
+{
+    auto *spy = static_cast<CancelSpy *>(user);
+    spy->calls++;
+    return 0;
+}
+
+TEST(Dispatch, CancelStreamRefusedReturnsZeroAndDoneNeverCalled)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.active_streams[0] = 5U;
+    d.active_count = 1U;
+
+    CancelSpy spy;
+    taz_stream_ops_t ops{};
+    ops.on_chunk = RecordChunk;
+    ops.cancel = SpyCancelRefuse;
+    ops.abort = NoopAbort;
+    taz_dispatch_set_stream_ops(&d, 5U, &ops, &spy);
+
+    bool done_called = false;
+    EXPECT_EQ(taz_dispatch_cancel_stream(&d, 5U, MarkDone, &done_called), 0);
+    EXPECT_EQ(spy.calls, 1);
+    EXPECT_FALSE(done_called);
+}
+
+TEST(Dispatch, CancelStreamAcceptedReturnsOneAndCallsDoneExactlyOnce)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.active_streams[0] = 5U;
+    d.active_count = 1U;
+
+    CancelSpy spy;
+    taz_stream_ops_t ops{};
+    ops.on_chunk = RecordChunk;
+    ops.cancel = SpyCancelAccept;
+    ops.abort = NoopAbort;
+    taz_dispatch_set_stream_ops(&d, 5U, &ops, &spy);
+
+    bool done_called = false;
+    EXPECT_EQ(taz_dispatch_cancel_stream(&d, 5U, MarkDone, &done_called), 1);
+    EXPECT_EQ(spy.calls, 1);
+    EXPECT_TRUE(done_called);
+}
+
+struct AbortSpy
+{
+    int calls = 0;
+};
+
+void SpyAbort(void *user)
+{
+    static_cast<AbortSpy *>(user)->calls++;
+}
+
+TEST(Dispatch, CancelAllAbortsEveryOpsStreamAndStillCancelsExecs)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+
+    bool cancelled = false;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(&loop, &spec, RecordCancelled, &cancelled, &x), 0);
+
+    d.active_streams[0] = 7U;
+    d.active_count = 1U;
+    taz_dispatch_set_stream_exec(&d, 7U, x);
+
+    d.active_streams[1] = 8U;
+    d.active_count = 2U;
+    AbortSpy abort_spy;
+    taz_stream_ops_t ops{};
+    ops.on_chunk = RecordChunk;
+    ops.cancel = RefuseCancel;
+    ops.abort = SpyAbort;
+    taz_dispatch_set_stream_ops(&d, 8U, &ops, &abort_spy);
+
+    taz_dispatch_cancel_all(&d);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    EXPECT_TRUE(cancelled);
+    EXPECT_EQ(abort_spy.calls, 1);
+}
+
+struct WritableSpy
+{
+    int calls = 0;
+};
+
+void SpyOnWritable(void *user)
+{
+    static_cast<WritableSpy *>(user)->calls++;
+}
+
+TEST(Dispatch, NotifyWritableCallsOnlyStreamsWithOnWritableSet)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.active_streams[0] = 1U;
+    d.active_streams[1] = 2U;
+    d.active_streams[2] = 3U;
+    d.active_count = 3U;
+
+    WritableSpy with_hook;
+    taz_stream_ops_t ops_with_hook{};
+    ops_with_hook.on_chunk = RecordChunk;
+    ops_with_hook.cancel = RefuseCancel;
+    ops_with_hook.abort = NoopAbort;
+    ops_with_hook.on_writable = SpyOnWritable;
+    taz_dispatch_set_stream_ops(&d, 1U, &ops_with_hook, &with_hook);
+
+    taz_stream_ops_t ops_without_hook{};
+    ops_without_hook.on_chunk = RecordChunk;
+    ops_without_hook.cancel = RefuseCancel;
+    ops_without_hook.abort = NoopAbort;
+    ops_without_hook.on_writable = nullptr;
+    taz_dispatch_set_stream_ops(&d, 2U, &ops_without_hook, nullptr);
+
+    // Stream 3 has no ops at all.
+
+    taz_dispatch_notify_writable(&d);
+
+    EXPECT_EQ(with_hook.calls, 1);
+}
+
+TEST(Dispatch, ConnWriteQueueSizePauseResumeNoOpWhenHooksUnset)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d); // hooks NULL: a pure unit-test dispatch.
+
+    EXPECT_EQ(taz_dispatch_conn_write_queue_size(&d), 0U);
+    taz_dispatch_conn_pause_reads(&d);
+    taz_dispatch_conn_resume_reads(&d);
+}
+
+size_t FakeQueueSize(void *ctx)
+{
+    return *static_cast<size_t *>(ctx);
+}
+
+TEST(Dispatch, ConnWriteQueueSizeIsForwardedWithConnCtx)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    size_t fake_value = 777U;
+    d.conn_write_queue_size = FakeQueueSize;
+    d.conn_ctx = &fake_value;
+
+    EXPECT_EQ(taz_dispatch_conn_write_queue_size(&d), 777U);
+}
+
+void CountingPause(void *ctx)
+{
+    *static_cast<int *>(ctx) += 1;
+}
+
+void CountingResume(void *ctx)
+{
+    *static_cast<int *>(ctx) += 10;
+}
+
+TEST(Dispatch, ConnPauseResumeForwardWithConnCtx)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    int counter = 0;
+    d.conn_pause_reads = CountingPause;
+    d.conn_resume_reads = CountingResume;
+    d.conn_ctx = &counter;
+
+    taz_dispatch_conn_pause_reads(&d);
+    EXPECT_EQ(counter, 1);
+    taz_dispatch_conn_resume_reads(&d);
+    EXPECT_EQ(counter, 11);
+}
+
+// ---------------------------------------------------------------------------
 // CONFIGURATION_GET / CONFIGURATION_UPDATE through the dispatch table
 // ---------------------------------------------------------------------------
 

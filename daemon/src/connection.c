@@ -21,6 +21,8 @@ typedef struct
 
 static void on_write_done(uv_write_t *req, int status);
 static void on_close_cb(uv_handle_t *handle);
+static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf);
+static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
 
 /* -------------------------------------------------------------------------
  * Reference counting
@@ -59,12 +61,43 @@ static int dispatch_conn_closing_cb(void *ctx)
     return ((taz_conn_t *)ctx)->closing;
 }
 
+static size_t dispatch_conn_write_queue_size_cb(void *ctx)
+{
+    taz_conn_t *conn = (taz_conn_t *)ctx;
+    return uv_stream_get_write_queue_size((uv_stream_t *)&conn->handle);
+}
+
+static void dispatch_conn_pause_reads_cb(void *ctx)
+{
+    taz_conn_t *conn = (taz_conn_t *)ctx;
+    if (conn->closing)
+    {
+        return;
+    }
+    uv_read_stop((uv_stream_t *)&conn->handle);
+}
+
+static void dispatch_conn_resume_reads_cb(void *ctx)
+{
+    taz_conn_t *conn = (taz_conn_t *)ctx;
+    if (conn->closing)
+    {
+        return;
+    }
+    (void)uv_read_start((uv_stream_t *)&conn->handle, alloc_cb, on_read);
+}
+
 static void on_write_done(uv_write_t *req, int status)
 {
     write_req_t *wr = (write_req_t *)req;
     taz_conn_t *conn = wr->conn;
     (void)status; /* UV_ECANCELED is expected on a closing connection */
     free(wr);
+    /* Notify before unref: conn_unref may free conn. */
+    if (!conn->closing)
+    {
+        taz_dispatch_notify_writable(&conn->dispatch);
+    }
     conn_unref(conn);
 }
 
@@ -292,6 +325,9 @@ void taz_conn_on_new_connection(uv_stream_t *server, int status)
     conn->dispatch.conn_unref = dispatch_conn_unref_cb;
     conn->dispatch.conn_ctx = conn;
     conn->dispatch.conn_closing = dispatch_conn_closing_cb;
+    conn->dispatch.conn_write_queue_size = dispatch_conn_write_queue_size_cb;
+    conn->dispatch.conn_pause_reads = dispatch_conn_pause_reads_cb;
+    conn->dispatch.conn_resume_reads = dispatch_conn_resume_reads_cb;
 
     rc = uv_tcp_init(loop, &conn->handle);
     if (rc != 0)

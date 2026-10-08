@@ -19,17 +19,24 @@
  * Active-stream set (unsorted array; max TAZ_DISPATCH_MAX_STREAMS entries)
  * -------------------------------------------------------------------------- */
 
-static int stream_is_active(const taz_dispatch_t *d, uint32_t id)
+/* Index of id in the active set, or d->active_count (one past the last
+ * valid index) when it is not active. */
+static size_t stream_find(const taz_dispatch_t *d, uint32_t id)
 {
     size_t i;
     for (i = 0U; i < d->active_count; ++i)
     {
         if (d->active_streams[i] == id)
         {
-            return 1;
+            return i;
         }
     }
-    return 0;
+    return d->active_count;
+}
+
+static int stream_is_active(const taz_dispatch_t *d, uint32_t id)
+{
+    return stream_find(d, id) < d->active_count;
 }
 
 static int stream_add(taz_dispatch_t *d, uint32_t id)
@@ -40,6 +47,8 @@ static int stream_add(taz_dispatch_t *d, uint32_t id)
     }
     d->active_streams[d->active_count] = id;
     d->stream_execs[d->active_count] = NULL;
+    d->stream_ops[d->active_count] = NULL;
+    d->stream_user[d->active_count] = NULL;
     d->active_count++;
     return 1;
 }
@@ -54,6 +63,8 @@ void taz_dispatch_stream_done(taz_dispatch_t *d, uint32_t stream_id)
             d->active_count--;
             d->active_streams[i] = d->active_streams[d->active_count];
             d->stream_execs[i] = d->stream_execs[d->active_count];
+            d->stream_ops[i] = d->stream_ops[d->active_count];
+            d->stream_user[i] = d->stream_user[d->active_count];
             return;
         }
     }
@@ -82,6 +93,70 @@ void taz_dispatch_cancel_all(taz_dispatch_t *d)
         {
             taz_exec_cancel(d->stream_execs[i]);
         }
+        if (d->stream_ops[i] != NULL)
+        {
+            d->stream_ops[i]->abort(d->stream_user[i]);
+        }
+    }
+}
+
+void taz_dispatch_set_stream_ops(taz_dispatch_t *d, uint32_t stream_id,
+                                 const taz_stream_ops_t *ops, void *user)
+{
+    const size_t idx = stream_find(d, stream_id);
+    if (idx >= d->active_count)
+    {
+        return;
+    }
+    d->stream_ops[idx] = ops;
+    d->stream_user[idx] = (ops != NULL) ? user : NULL;
+}
+
+int taz_dispatch_cancel_stream(taz_dispatch_t *d, uint32_t target,
+                               taz_stream_done_fn_t done, void *arg)
+{
+    const size_t idx = stream_find(d, target);
+    if (idx >= d->active_count || d->stream_ops[idx] == NULL)
+    {
+        return 0;
+    }
+    return d->stream_ops[idx]->cancel(d->stream_user[idx], done, arg);
+}
+
+void taz_dispatch_notify_writable(taz_dispatch_t *d)
+{
+    size_t i;
+    for (i = 0U; i < d->active_count; ++i)
+    {
+        if (d->stream_ops[i] != NULL && d->stream_ops[i]->on_writable != NULL)
+        {
+            d->stream_ops[i]->on_writable(d->stream_user[i]);
+        }
+    }
+}
+
+size_t taz_dispatch_conn_write_queue_size(const taz_dispatch_t *d)
+{
+    if (d->conn_write_queue_size == NULL)
+    {
+        return 0U;
+    }
+    return d->conn_write_queue_size(d->conn_ctx);
+}
+
+void taz_dispatch_conn_pause_reads(taz_dispatch_t *d)
+{
+    if (d->conn_pause_reads != NULL)
+    {
+        d->conn_pause_reads(d->conn_ctx);
+    }
+}
+
+void taz_dispatch_conn_resume_reads(taz_dispatch_t *d)
+{
+    if (d->conn_resume_reads != NULL)
+    {
+        d->conn_resume_reads(d->conn_ctx);
     }
 }
 
@@ -273,6 +348,23 @@ void taz_dispatch_frame(taz_dispatch_t *d, const taz_frame_header_t *header,
     if (header->type == (uint8_t)taz_v1_FrameType_FRAME_TYPE_PING)
     {
         handle_ping(header, write_fn, ctx);
+        return;
+    }
+
+    /* FILE_CHUNK is routed by stream_id alone (opcode ignored) to the
+     * sink registered on that stream; with no sink (unknown stream,
+     * finished, or a plain REQUEST stream such as COMMAND_EXEC) it is
+     * dropped silently: no ERROR, no close. */
+    if (header->type == (uint8_t)taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK)
+    {
+        const size_t idx = stream_find(d, header->stream_id);
+        if (idx < d->active_count && d->stream_ops[idx] != NULL)
+        {
+            const uint8_t *chunk_payload =
+                (header->length > 0U) ? payload : NULL;
+            d->stream_ops[idx]->on_chunk(d->stream_user[idx], header,
+                                         chunk_payload);
+        }
         return;
     }
 
