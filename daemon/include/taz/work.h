@@ -32,6 +32,22 @@ extern "C"
                         taz_work_fn_t work, taz_work_done_fn_t done,
                         void *user);
 
+    /* Like taz_work_submit, but the stream is NOT released afterwards: one
+     * step of a multi-step stream whose owner calls taz_dispatch_stream_done
+     * itself. Still pins the connection, still counted by
+     * taz_work_request_shutdown. */
+    int taz_work_submit_step(taz_dispatch_t *d, taz_work_fn_t work,
+                             taz_work_done_fn_t done, void *user);
+
+    /* 1 once taz_work_request_shutdown has been called (whether or not
+     * uv_stop has fired). */
+    int taz_work_shutdown_requested(void);
+
+    /* Reset the shutdown_requested flag to 0. Unit tests only: allows tests
+     * to run in sequence without the sticky flag from a prior shutdown test
+     * breaking subsequent tests. */
+    void taz_work_reset_for_tests(void);
+
     /* Call from a signal/console-ctrl handler running on loop's own thread
      * instead of uv_stop(loop) directly. uv_stop() halts the loop on the
      * next iteration regardless of outstanding uv_queue_work items; since

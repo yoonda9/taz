@@ -266,6 +266,8 @@ TEST(Work, RequestShutdownWaitsForOutstandingWorkBeforeStopping)
 
     uv_sem_destroy(&w.started);
     uv_sem_destroy(&w.release);
+
+    taz_work_reset_for_tests();
 }
 
 TEST(Work, TwoSubmissionsOnDifferentStreamsCompleteIndependently)
@@ -300,4 +302,150 @@ TEST(Work, TwoSubmissionsOnDifferentStreamsCompleteIndependently)
     EXPECT_EQ(d.active_count, 0U);
     EXPECT_EQ(conn.ref_count, 2);
     EXPECT_EQ(conn.unref_count, 2);
+}
+
+TEST(Work, SubmitStepDoesNotReleaseStream)
+{
+    taz_work_reset_for_tests();
+
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    FakeConn conn;
+    taz_dispatch_t d;
+    InitFakeDispatch(&d, &loop, &conn);
+    d.active_streams[0] = 42U;
+    d.active_count = 1U;
+
+    WorkCtx w;
+    w.d = &d;
+    w.conn = &conn;
+
+    ASSERT_EQ(taz_work_submit_step(&d, CaptureWork, CaptureDone, &w), 0);
+    EXPECT_EQ(conn.ref_count, 1);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    EXPECT_EQ(w.done_calls, 1);
+    EXPECT_EQ(w.done_closing, 0);
+    // Stream should still be active after a step, not released.
+    EXPECT_EQ(d.active_count, 1U);
+    EXPECT_EQ(conn.ref_count, 1);
+    EXPECT_EQ(conn.unref_count, 1);
+}
+
+TEST(Work, PlainSubmitStillReleasesStream)
+{
+    taz_work_reset_for_tests();
+
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    FakeConn conn;
+    taz_dispatch_t d;
+    InitFakeDispatch(&d, &loop, &conn);
+    d.active_streams[0] = 42U;
+    d.active_count = 1U;
+
+    WorkCtx w;
+    w.d = &d;
+    w.conn = &conn;
+
+    ASSERT_EQ(taz_work_submit(&d, 42U, CaptureWork, CaptureDone, &w), 0);
+    EXPECT_EQ(conn.ref_count, 1);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    EXPECT_EQ(w.done_calls, 1);
+    EXPECT_EQ(w.done_closing, 0);
+    // Plain submit should release the stream.
+    EXPECT_EQ(d.active_count, 0U);
+    EXPECT_EQ(conn.ref_count, 1);
+    EXPECT_EQ(conn.unref_count, 1);
+}
+
+namespace
+{
+
+struct ShutdownStepCtx
+{
+    uv_sem_t started{};
+    uv_sem_t release{};
+    int done_calls = 0;
+    int done_closing = -1;
+    const taz_dispatch_t *d = nullptr;
+    const FakeConn *conn = nullptr;
+    size_t active_count_at_done = 0U;
+    int unref_count_at_done = -1;
+};
+
+void BlockingStepWork(void *user)
+{
+    auto *w = static_cast<ShutdownStepCtx *>(user);
+    uv_sem_post(&w->started);
+    uv_sem_wait(&w->release);
+}
+
+void ShutdownStepDone(void *user, int closing)
+{
+    auto *w = static_cast<ShutdownStepCtx *>(user);
+    w->done_calls++;
+    w->done_closing = closing;
+    w->active_count_at_done = w->d->active_count;
+    w->unref_count_at_done = w->conn->unref_count;
+}
+
+} // namespace
+
+TEST(Work, RequestShutdownOnStepWaitsAndReportsClosing)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    uv_timer_t never_fires;
+    ASSERT_EQ(uv_timer_init(&loop, &never_fires), 0);
+    ASSERT_EQ(uv_timer_start(&never_fires, [](uv_timer_t *) {}, 2000U, 0U), 0);
+
+    FakeConn conn;
+    taz_dispatch_t d;
+    InitFakeDispatch(&d, &loop, &conn);
+    d.active_streams[0] = 9U;
+    d.active_count = 1U;
+
+    ShutdownStepCtx w;
+    w.d = &d;
+    w.conn = &conn;
+    ASSERT_EQ(uv_sem_init(&w.started, 0U), 0);
+    ASSERT_EQ(uv_sem_init(&w.release, 0U), 0);
+
+    ASSERT_EQ(taz_work_shutdown_requested(), 0);
+    ASSERT_EQ(taz_work_submit_step(&d, BlockingStepWork, ShutdownStepDone, &w),
+              0);
+    ASSERT_NE(uv_run(&loop, UV_RUN_NOWAIT), 0);
+    uv_sem_wait(&w.started);
+
+    taz_work_request_shutdown(&loop);
+    EXPECT_EQ(taz_work_shutdown_requested(), 1);
+    // Still running on the pool thread: must not have stopped yet.
+    EXPECT_EQ(w.done_calls, 0);
+
+    uv_sem_post(&w.release);
+    // Returns promptly despite the still-active timer: the deferred stop
+    // fired as soon as the work's done callback ran.
+    EXPECT_NE(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    EXPECT_EQ(w.done_calls, 1);
+    // The step's done should see closing=1 due to shutdown.
+    EXPECT_EQ(w.done_closing, 1);
+    // Stream should still be active: steps don't release.
+    EXPECT_EQ(w.active_count_at_done, 1U);
+    EXPECT_EQ(w.unref_count_at_done, 0);
+
+    uv_close(reinterpret_cast<uv_handle_t *>(&never_fires), nullptr);
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    uv_sem_destroy(&w.started);
+    uv_sem_destroy(&w.release);
 }
