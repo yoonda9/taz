@@ -872,8 +872,7 @@ typedef struct
     /* Set when a read step is deferred past TAZ_FILE_GET_HIGH_WATER,
      * waiting for on_writable to retry. */
     int waiting_writable;
-    /* Set by get_cancel once CANCEL accepts cancelling this stream (always
-     * refused for now; a later task upgrades get_cancel to set this). */
+    /* Set by get_cancel once CANCEL accepts cancelling this stream. */
     int cancelled;
     /* Set when the connection itself is closing (taz_dispatch_cancel_all's
      * abort). Distinct from closing, which work.c reports via the done
@@ -886,8 +885,8 @@ typedef struct
     const char *error_message;
     const char *error_detail;
 
-    /* Set by a later task's get_cancel once accepted; fired exactly once,
-     * once the fd is actually closed. */
+    /* Set by get_cancel once accepted; fired exactly once, once the fd is
+     * actually closed (or, if it was never opened, immediately). */
     taz_stream_done_fn_t cancel_done;
     void *cancel_done_arg;
 
@@ -906,8 +905,26 @@ static void get_release(get_ctx_t *gctx)
     free(gctx);
 }
 
+/* Fires a pending CANCEL's done callback exactly once. Safe to call
+ * unconditionally: a no-op once already fired (or if no cancel is
+ * pending). Must be called once the fd is actually gone - either after
+ * get_close_work ran, or when it was never opened in the first place. */
+static void get_fire_cancel_done(get_ctx_t *gctx)
+{
+    if (gctx->cancel_done != NULL)
+    {
+        const taz_stream_done_fn_t done = gctx->cancel_done;
+        void *const arg = gctx->cancel_done_arg;
+        gctx->cancel_done = NULL;
+        gctx->cancel_done_arg = NULL;
+        done(arg);
+    }
+}
+
 /* Closes the fd if it is still open, otherwise releases immediately (there
- * is nothing left to wait for). */
+ * is nothing left to wait for) - but a pending CANCEL's done callback must
+ * still fire in that case; otherwise its own stream (handlers/cancel.c)
+ * would wait forever for a cancellation that already trivially happened. */
 static void get_close_or_release(get_ctx_t *gctx)
 {
     if (gctx->fd_open)
@@ -916,6 +933,7 @@ static void get_close_or_release(get_ctx_t *gctx)
     }
     else
     {
+        get_fire_cancel_done(gctx);
         get_release(gctx);
     }
 }
@@ -955,14 +973,7 @@ static void get_close_done(void *user, int closing)
 
     gctx->work_in_flight = 0;
 
-    if (gctx->cancel_done != NULL)
-    {
-        const taz_stream_done_fn_t done = gctx->cancel_done;
-        void *const arg = gctx->cancel_done_arg;
-        gctx->cancel_done = NULL;
-        gctx->cancel_done_arg = NULL;
-        done(arg);
-    }
+    get_fire_cancel_done(gctx);
 
     get_release(gctx);
 }
@@ -985,14 +996,37 @@ static void get_submit_close(get_ctx_t *gctx)
  * taz_stream_ops_t
  * ------------------------------------------------------------------------- */
 
-/* CANCEL targeting a FILE_GET stream always refuses for now; a later task
- * upgrades this to accept in SCANNING/SENDING. */
+/* CANCEL targeting a FILE_GET stream: accepted while SCANNING (pass 1) or
+ * SENDING (pass 2), refused once the stream is already CLOSING (a prior
+ * CANCEL already accepted, or the transfer already finished/failed and is
+ * tearing itself down). A step already in flight on the pool (get_scan_work
+ * or get_read_work) runs to completion, but its done callback checks
+ * cancelled before sending anything, so at most one FILE_CHUNK already
+ * queued on the connection is ever delivered - never one built after this
+ * call. When no step is in flight (get_next_chunk is waiting on
+ * backpressure), the fd is closed right away instead. Either way done
+ * fires exactly once, once the fd is actually gone. */
 static int get_cancel(void *user, taz_stream_done_fn_t done, void *done_arg)
 {
-    (void)user;
-    (void)done;
-    (void)done_arg;
-    return 0;
+    get_ctx_t *gctx = (get_ctx_t *)user;
+
+    if (gctx->state != GET_STATE_SCANNING && gctx->state != GET_STATE_SENDING)
+    {
+        return 0;
+    }
+
+    gctx->state = GET_STATE_CLOSING;
+    gctx->cancelled = 1;
+    gctx->waiting_writable = 0;
+    gctx->cancel_done = done;
+    gctx->cancel_done_arg = done_arg;
+
+    if (!gctx->work_in_flight)
+    {
+        get_close_or_release(gctx);
+    }
+
+    return 1;
 }
 
 static void get_abort(void *user)

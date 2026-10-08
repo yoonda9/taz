@@ -1242,3 +1242,146 @@ TEST_F(FileHandlerTest, CloseConnectionDuringDownloadClosesFdAndReleasesStream)
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());
 }
+
+// ---------------------------------------------------------------------------
+// CANCEL (handlers/cancel.c) targeting a FILE_GET stream.
+// ---------------------------------------------------------------------------
+
+TEST_F(FileHandlerTest, CancelDuringScanningReleasesBeforeResponseSent)
+{
+    const std::string src = JoinDir("cancelscan.bin");
+    WriteFile(src, std::string(static_cast<size_t>(200U) * 1024U, 's'));
+
+    // Pass 1's single work item hasn't run yet (the loop hasn't run), so the
+    // stream is still SCANNING when the CANCEL arrives.
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                         60U);
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_CANCEL,
+                         encode_cancel_request(60U), 61U);
+    ASSERT_EQ(Frames().size(), 0U); // Accepted, but not resolved yet.
+    ASSERT_EQ(ActiveStreamCount(), 2U);
+
+    RunLoop();
+
+    // No FileGetResponse, no chunk - only the CANCEL's own response.
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectCancelled(Frames()[0], true);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CancelDuringScanningOfMissingFileReleasesWithoutError)
+{
+    const std::string src = JoinDir("cancelscanmissing.bin");
+
+    // get_scan_work fails before ever opening an fd (NOT_FOUND); cancelling
+    // it exercises the release path with no fd to close.
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                         62U);
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_CANCEL,
+                         encode_cancel_request(62U), 63U);
+    ASSERT_EQ(ActiveStreamCount(), 2U);
+
+    RunLoop();
+
+    // cancelled wins over the pool error: no ERROR frame, just the CANCEL's
+    // own response, and both streams are gone (the CANCEL stream especially
+    // - it must not be left waiting on a done callback that never fires).
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectCancelled(Frames()[0], true);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CancelDuringSendingClosesFdWithoutSendingMoreChunks)
+{
+    const std::string src = JoinDir("cancelsending.bin");
+    const std::string content(static_cast<size_t>(200U) * 1024U, 'g');
+    WriteFile(src, content);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                         64U);
+
+    while (Frames().size() < 2U) // RESPONSE + first chunk.
+    {
+        RunLoopOnce();
+    }
+    ASSERT_EQ(Frames().size(), 2U);
+
+    // The second chunk's read step is already in flight at this point; the
+    // CANCEL is accepted but not resolved until that step's done callback
+    // sees cancelled and discards the result instead of sending it.
+    DispatchRequest(taz_v1_Opcode_OPCODE_CANCEL, encode_cancel_request(64U),
+                    65U);
+
+    ASSERT_EQ(Frames().size(), 3U); // No third chunk, just the CANCEL reply.
+    ExpectCancelled(Frames()[2], true);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CancelWhileWaitingOnBackpressureClosesImmediately)
+{
+    const std::string src = JoinDir("cancelbackpressure.bin");
+    const std::string content(static_cast<size_t>(200U) * 1024U, 'w');
+    WriteFile(src, content);
+
+    SetQueueSize(static_cast<size_t>(300U) *
+                 1024U); // Above TAZ_FILE_GET_HIGH_WATER (256 KiB).
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                    66U);
+    ASSERT_EQ(Frames().size(),
+              1U); // RESPONSE only; pass 2 waits on on_writable.
+
+    // No read step is in flight, so get_cancel closes the fd right away
+    // instead of waiting on a done callback to notice cancelled.
+    DispatchRequest(taz_v1_Opcode_OPCODE_CANCEL, encode_cancel_request(66U),
+                    67U);
+
+    ASSERT_EQ(Frames().size(), 2U);
+    ExpectCancelled(Frames()[1], true);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+
+    // on_writable firing afterwards must not touch the already-released
+    // stream.
+    NotifyWritable();
+    EXPECT_EQ(Frames().size(), 2U);
+}
+
+TEST_F(FileHandlerTest, CancelSameGetTargetTwiceInARowReturnsTrueThenFalse)
+{
+    const std::string src = JoinDir("cancelgettwice.bin");
+    const std::string content(static_cast<size_t>(200U) * 1024U, 'x');
+    WriteFile(src, content);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                         68U);
+    while (Frames().size() < 2U) // RESPONSE + first chunk.
+    {
+        RunLoopOnce();
+    }
+    ASSERT_EQ(Frames().size(), 2U);
+
+    // Accepted (get_cancel runs synchronously here) but not yet resolved:
+    // the second chunk's read step is still in flight.
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_CANCEL,
+                         encode_cancel_request(68U), 69U);
+    ASSERT_EQ(Frames().size(), 2U);     // No response yet for either stream.
+    ASSERT_EQ(ActiveStreamCount(), 2U); // GET (CLOSING) + CANCEL (69).
+
+    // Same target again, now CLOSING: refused synchronously, before the
+    // loop even runs.
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_CANCEL,
+                         encode_cancel_request(68U), 70U);
+    ASSERT_EQ(Frames().size(), 3U);
+    ExpectCancelled(Frames()[2], false);
+
+    RunLoop();
+    ASSERT_EQ(Frames().size(), 4U);
+    ExpectCancelled(Frames()[3], true); // The first CANCEL resolves once the
+                                        // close step completes.
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
