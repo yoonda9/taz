@@ -4,16 +4,22 @@
 
 # Test Agent Zero, the Tasmanian daemonfish
 
-TAZ is a remote test daemon whose primary purpose is to facilitate tests running on remote hosts.
+> [!WARNING]
+> **Work in progress.** TAZ is under active development and not ready for
+> use.
+
+TAZ is a test daemon that runs on the host under test and is driven over the
+network by a client.
 
 It can be used for all three stages of a test run on a host:
 
-- Before the test : Prepare the host for the test
-- During the test : Monitor the host and processes on the host
-- After the test : Validate the state of the host
+- Before the test: Prepare the host for the test
+- During the test: Monitor the host and processes on the host
+- After the test: Validate the state of the host
 
 TAZ is defined as a protocol and API first; this repository holds the
-specification and the reference implementations.
+specification and the reference implementations. The build produces the
+daemon binary `tazd`; the Python package installs the `taz` client CLI.
 
 | Directory | Contents                                                              |
 | --------- | --------------------------------------------------------------------- |
@@ -24,13 +30,30 @@ specification and the reference implementations.
 | `tests/`  | Integration tests that launch the daemon and drive it with the client |
 | `tools/`  | Cross-platform helpers behind the `just` recipes                      |
 
+The specification starts at [`docs/index.md`](docs/index.md):
+[requirements](docs/requirements.md), [wire protocol](docs/protocol.md), and
+[API](docs/api.md).
+
 ## Getting started
+
+### Requirements not managed by mise
+
+- A C compiler: GCC or Clang on Linux; on Windows, Visual Studio Build Tools
+  with the C++ workload and the "C++ Clang tools for Windows" component
+  (provides `clang-format`/`clang-tidy` alongside the PyPI wheels used on
+  other platforms).
+- On Windows, `cppcheck` at the version pinned in `mise.toml`, from the
+  official installer. mise provides it on Linux and macOS, but conda-forge's
+  Windows build cannot find its configuration files. `just doctor` checks
+  the version.
+
+### Setup
 
 Tool versions are pinned with [mise](https://mise.jdx.dev) and every task is a
 [`just`](https://just.systems) recipe. On a fresh clone:
 
 ```sh
-mise install     # pinned tools: uv, just, cmake, ninja, buf, prettier, prek, cppcheck
+mise install     # pinned tools: uv, just, cmake, ninja, buf, node, prettier, prek, cppcheck
 just setup       # Python env (incl. conan), git submodules, Conan profiles, pre-push hook
 just doctor      # reports anything mise cannot install (C compiler; cppcheck on Windows)
 ```
@@ -46,30 +69,16 @@ just proto       # regenerate protobuf code after editing rpc/
 just --list      # everything else
 ```
 
-`just lint` is exactly what CI and the pre-push hook run, so a red CI job
-reproduces locally with the command shown in its log.
-
-The build produces the daemon binary `tazd`; the Python package installs the
-`taz` client CLI.
-
-### Requirements not managed by mise
-
-- A C compiler: GCC or Clang on Linux; on Windows, Visual Studio Build Tools
-  with the C++ workload and the "C++ Clang tools for Windows" component
-  (provides `clang-format`/`clang-tidy` alongside the PyPI wheels used on
-  other platforms).
-- On Windows, `cppcheck` at the version pinned in `mise.toml`, from the
-  official installer. mise provides it on Linux and macOS, but conda-forge's
-  Windows build cannot find its configuration files. `just doctor` checks
-  the version.
+Every CI step is a `just` recipe, and the pre-push hook runs `just lint`, so a
+red CI job reproduces locally with the command shown in its log.
 
 ## Hooks
 
 This repo uses [`prek`](https://github.com/j178/prek) (a pre-commit compatible
 runner) as a pre-push gate. `just setup` installs it; the hook runs
-`just proto-check` and `just lint`, plus basic file-hygiene checks, on every
-`git push`. If any check fails the push is aborted; fix the reported issues
-and push again.
+`just lint` (which includes `just proto-check`), plus basic file-hygiene
+checks, on every `git push`. If any check fails the push is aborted; fix the
+reported issues and push again.
 
 ## Layout of the generated code
 
