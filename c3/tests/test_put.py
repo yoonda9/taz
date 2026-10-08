@@ -111,6 +111,18 @@ def _confirm_bytes(bytes_written: int, checksum: bytes, stream_id: int = 1) -> b
     )
 
 
+def _pong_bytes() -> bytes:
+    return pack_header(
+        Frame(
+            type=common_pb2.FRAME_TYPE_PONG,
+            flags=0,
+            opcode=0,
+            length=0,
+            stream_id=0,
+        )
+    )
+
+
 def _cancel_response_bytes(cancelled: bool, stream_id: int) -> bytes:
     from taz.v1 import advanced_pb2
 
@@ -292,13 +304,17 @@ class TestPut:
         local = tmp_path / "src.bin"
         local.write_bytes(b"data")
         client, mock_sock = _connected_client_with_sock(
-            max_payload_sizes={common_pb2.FRAME_TYPE_FILE_CHUNK: 0}
+            _pong_bytes(),
+            max_payload_sizes={common_pb2.FRAME_TYPE_FILE_CHUNK: 0},
         )
         with pytest.raises(TazError) as exc_info:
             client.file.put(str(local), "/remote/dest")
         assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
         mock_sock.sendmsg.assert_not_called()
         mock_sock.sendall.assert_not_called()
+
+        # The connection is still usable after the pre-send rejection.
+        client.ping()
 
     def test_ack_error_response_raises_and_sends_no_chunks(
         self, tmp_path: Path
