@@ -978,6 +978,15 @@ class TestFileTransfer:
             assert time.monotonic() - start < 2.0
 
         assert not dest.exists()
+        # The daemon closes and unlinks the temp on its thread pool after it
+        # sees the socket close, and nothing answers for that, so the
+        # version() round trip above does not order it: wait for the unlink.
+        deadline = time.monotonic() + 10
+        while (
+            any(".taz-" in p.name for p in remote_dir.iterdir())
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
         self._no_temps(remote_dir)
 
     def test_sigterm_mid_upload_raises_connection_lost_and_leaves_no_dest(
