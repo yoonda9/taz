@@ -27,6 +27,7 @@ add_executable(
     test_fsutil.cpp
     test_crc32c.cpp
     test_file.cpp
+    test_file_transfer.cpp
     test_dir.cpp)
 # taz::proto comes in transitively via taz_core; taz_cxx_warnings carries C++
 # warning flags without the C-only -Wstrict-prototypes/-Wmissing-prototypes.

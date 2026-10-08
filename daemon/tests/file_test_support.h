@@ -39,6 +39,8 @@ struct FakeConn
     int ref_count = 0;
     int unref_count = 0;
     int closing = 0;
+    int pause_calls = 0;
+    int resume_calls = 0;
 };
 
 static void CountRef(void *ctx)
@@ -54,6 +56,16 @@ static void CountUnref(void *ctx)
 static int IsClosing(void *ctx)
 {
     return static_cast<FakeConn *>(ctx)->closing;
+}
+
+static void CountPauseReads(void *ctx)
+{
+    static_cast<FakeConn *>(ctx)->pause_calls++;
+}
+
+static void CountResumeReads(void *ctx)
+{
+    static_cast<FakeConn *>(ctx)->resume_calls++;
 }
 
 struct WriteCtx
@@ -290,14 +302,13 @@ class FileHandlerTest : public ::testing::Test
         uv_fs_req_cleanup(&chmod_req);
     }
 
-    // Drives one REQUEST of the given opcode through taz_dispatch_frame. If
-    // check_in_flight is set, it runs right after dispatch returns but
-    // before the loop runs, to observe state while the work is still
-    // (ostensibly) in flight.
-    void DispatchRequest(taz_v1_Opcode opcode,
-                         const std::vector<uint8_t> &payload,
-                         uint32_t stream_id,
-                         const std::function<void()> &check_in_flight = nullptr)
+    // Drives one REQUEST of the given opcode through taz_dispatch_frame
+    // without running the loop afterwards - for tests that need a REQUEST
+    // registered (and its stream_ops set, for FILE_PUT) before any FILE_CHUNK
+    // frames are dispatched.
+    void DispatchRequestNoRun(taz_v1_Opcode opcode,
+                              const std::vector<uint8_t> &payload,
+                              uint32_t stream_id)
     {
         taz_frame_header_t header{};
         header.type = static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST);
@@ -309,6 +320,18 @@ class FileHandlerTest : public ::testing::Test
         taz_dispatch_frame(&d_, &header,
                            payload.empty() ? nullptr : payload.data(),
                            TAZ_FRAME_OK, capture_write, &wctx_);
+    }
+
+    // Drives one REQUEST of the given opcode through taz_dispatch_frame. If
+    // check_in_flight is set, it runs right after dispatch returns but
+    // before the loop runs, to observe state while the work is still
+    // (ostensibly) in flight.
+    void DispatchRequest(taz_v1_Opcode opcode,
+                         const std::vector<uint8_t> &payload,
+                         uint32_t stream_id,
+                         const std::function<void()> &check_in_flight = nullptr)
+    {
+        DispatchRequestNoRun(opcode, payload, stream_id);
         if (check_in_flight)
         {
             check_in_flight();
@@ -324,6 +347,60 @@ class FileHandlerTest : public ::testing::Test
     {
         DispatchRequest(taz_v1_Opcode_OPCODE_FILE_STAT, payload, stream_id,
                         check_in_flight);
+    }
+
+    // Drives one FILE_CHUNK frame for stream_id through taz_dispatch_frame
+    // without running the loop afterwards - for tests that need several
+    // chunks queued before anything is processed (e.g. ingress backpressure).
+    void DispatchChunkNoRun(uint32_t stream_id,
+                            const std::vector<uint8_t> &bytes, bool last)
+    {
+        taz_frame_header_t header{};
+        header.type =
+            static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK);
+        header.flags = last ? 0U
+                            : static_cast<uint8_t>(
+                                  taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION);
+        header.opcode = 0U;
+        header.length = static_cast<uint32_t>(bytes.size());
+        header.stream_id = stream_id;
+
+        taz_dispatch_frame(&d_, &header, bytes.empty() ? nullptr : bytes.data(),
+                           TAZ_FRAME_OK, capture_write, &wctx_);
+    }
+
+    // Drives one FILE_CHUNK frame then runs the loop to idle - the usual
+    // case, where each chunk's write step (if any) is expected to complete
+    // before the next chunk is dispatched.
+    void DispatchChunk(uint32_t stream_id, const std::vector<uint8_t> &bytes,
+                       bool last)
+    {
+        DispatchChunkNoRun(stream_id, bytes, last);
+        RunLoop();
+    }
+
+    void RunLoop()
+    {
+        ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
+    }
+
+    // Installs counting fake pause/resume hooks (conn_write_queue_size stays
+    // unset: PUT's ingress backpressure never reads it). Counts are exposed
+    // via PauseCalls()/ResumeCalls().
+    void EnablePauseResumeCounting()
+    {
+        d_.conn_pause_reads = CountPauseReads;
+        d_.conn_resume_reads = CountResumeReads;
+    }
+
+    int PauseCalls() const
+    {
+        return conn_.pause_calls;
+    }
+
+    int ResumeCalls() const
+    {
+        return conn_.resume_calls;
     }
 
     static bool PathExists(const std::string &path)
