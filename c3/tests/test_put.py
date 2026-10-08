@@ -424,6 +424,54 @@ class TestPut:
         assert frames[1].type == common_pb2.FRAME_TYPE_FILE_CHUNK
         assert frames[2].opcode == common_pb2.OPCODE_CANCEL
 
+    def test_local_file_shrinks_mid_upload_raises_and_sends_cancel(
+        self, tmp_path: Path
+    ) -> None:
+        local = tmp_path / "src.bin"
+        local.write_bytes(b"x" * 20)
+        client, mock_sock = _connected_client_with_sock(
+            _ack_bytes(),
+            _cancel_response_bytes(True, stream_id=2),
+            max_payload_sizes={common_pb2.FRAME_TYPE_FILE_CHUNK: 4},
+        )
+        real_open = open
+
+        class _ShrinkingFile:
+            def __init__(self, path: str) -> None:
+                self._f = real_open(path, "rb")
+                self._reads = 0
+
+            def read(self, n: int) -> bytes:
+                self._reads += 1
+                if self._reads >= 3:
+                    # Simulate another process truncating the file: a real
+                    # EOF arrives well before the pre-transfer os.stat()
+                    # size (20) is reached.
+                    return b""
+                return self._f.read(n)
+
+            def __enter__(self) -> _ShrinkingFile:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                self._f.close()
+
+        with (
+            patch("taz.c3.file.open", lambda path, mode: _ShrinkingFile(path)),
+            pytest.raises(OSError, match="shrank"),
+        ):
+            client.file.put(str(local), "/remote/dest")
+
+        # one FILE_PUT REQUEST, two FILE_CHUNKs from the reads before the
+        # shrink was detected, then a CANCEL REQUEST - no infinite loop of
+        # empty chunks.
+        frames = _sent_frames(mock_sock)
+        assert frames[0].opcode == common_pb2.OPCODE_FILE_PUT
+        assert frames[1].type == common_pb2.FRAME_TYPE_FILE_CHUNK
+        assert frames[2].type == common_pb2.FRAME_TYPE_FILE_CHUNK
+        assert frames[3].opcode == common_pb2.OPCODE_CANCEL
+        assert len(frames) == 4
+
     def test_local_read_failure_without_cancel_advertised_just_reraises(
         self, tmp_path: Path
     ) -> None:

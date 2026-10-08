@@ -201,6 +201,18 @@ class FileNamespace:
                     data = f.read(chunk_limit)
                     sent += len(data)
                     last = sent >= size
+                    if len(data) < chunk_limit and not last:
+                        # A short read below the requested chunk size is
+                        # real EOF, not a scheduling artifact - regular
+                        # files only return less than requested at EOF. If
+                        # that happens before our pre-transfer os.stat()
+                        # size is reached, the file shrank underneath us;
+                        # looping again would just resend empty chunks
+                        # forever since `sent` can never reach `size`.
+                        raise OSError(
+                            f"local file shrank during upload: read {sent}"
+                            f" of {size} declared bytes"
+                        )
                     crc = crc32c.crc32c(data, crc)
                     client._conn.send_file_chunk(stream_id, data, last=last)
                     if last:
