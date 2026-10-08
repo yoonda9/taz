@@ -52,3 +52,15 @@ class TazProtocolError(TazConnectionError):
             f"protocol violation: {message}",
             detail,
         )
+
+
+class TazChecksumError(TazError):
+    """A file transfer's CRC32C checksum did not match."""
+
+    def __init__(self, expected: bytes, actual: bytes) -> None:
+        super().__init__(
+            common_pb2.ERROR_CODE_INTERNAL,
+            f"checksum mismatch: expected {expected.hex()} got {actual.hex()}",
+        )
+        self.expected = expected
+        self.actual = actual

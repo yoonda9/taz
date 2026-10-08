@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 from taz.c3.errors import (
+    TazChecksumError,
     TazConnectionError,
     TazConnectionLost,
     TazError,
@@ -95,3 +96,43 @@ def test_protocol_error_subclass_repr_uses_its_own_name() -> None:
         "TazFramingError(ERROR_CODE_PROTOCOL_ERROR, 'protocol violation: bad')"
     )
     assert TazFramingError("bad").code == common_pb2.ERROR_CODE_PROTOCOL_ERROR
+
+
+# ---------------------------------------------------------------------------
+# TazChecksumError
+# ---------------------------------------------------------------------------
+
+
+class TestTazChecksumError:
+    def test_is_a_taz_error(self) -> None:
+        err = TazChecksumError(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08")
+        assert isinstance(err, TazError)
+
+    def test_code_is_internal(self) -> None:
+        err = TazChecksumError(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08")
+        assert err.code == common_pb2.ERROR_CODE_INTERNAL
+
+    def test_message_names_both_checksums_in_hex(self) -> None:
+        err = TazChecksumError(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08")
+        assert str(err) == "checksum mismatch: expected 01020304 got 05060708"
+
+    def test_attributes_store_the_raw_bytes(self) -> None:
+        err = TazChecksumError(b"\xaa\xbb\xcc\xdd", b"\x00\x00\x00\x00")
+        assert err.expected == b"\xaa\xbb\xcc\xdd"
+        assert err.actual == b"\x00\x00\x00\x00"
+
+    def test_repr_shows_internal(self) -> None:
+        err = TazChecksumError(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08")
+        assert repr(err) == (
+            "TazChecksumError(ERROR_CODE_INTERNAL, "
+            "'checksum mismatch: expected 01020304 got 05060708')"
+        )
+
+    def test_survives_pickle_and_copy(self) -> None:
+        err = TazChecksumError(b"\x01\x02\x03\x04", b"\x05\x06\x07\x08")
+        pickled = pickle.loads(pickle.dumps(err))  # noqa: S301 - our own bytes
+        for clone in (pickled, copy.copy(err)):
+            assert type(clone) is TazChecksumError
+            assert clone.expected == err.expected
+            assert clone.actual == err.actual
+            assert str(clone) == str(err)

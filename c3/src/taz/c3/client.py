@@ -14,7 +14,7 @@ from taz.c3.file import FileNamespace
 from taz.c3.protocol.dispatch import Dispatcher
 from taz.c3.protocol.frame import Frame
 from taz.c3.settings import Backlog, Keepalive
-from taz.v1 import common_pb2, daemon_control_pb2
+from taz.v1 import advanced_pb2, common_pb2, daemon_control_pb2
 
 
 def _parse_error(frame: Frame) -> None:
@@ -184,3 +184,21 @@ class TazClient:
             daemon_control_pb2.ConfigurationUpdateResponse,
             keepalive,
         )
+
+    def cancel(self, stream_id: int, keepalive: Keepalive | None = None) -> bool:
+        """Cancel the transfer on ``stream_id``.
+
+        Returns the daemon's ``cancelled`` verdict. Afterwards, the dispatcher
+        discards any further frame for ``stream_id`` (late or already
+        buffered). Raises ``TazError(NOT_SUPPORTED)`` without sending anything
+        if the daemon does not advertise CANCEL.
+        """
+        req = advanced_pb2.CancelRequest(target_stream_id=stream_id)
+        resp = self._call(
+            common_pb2.OPCODE_CANCEL,
+            req.SerializeToString(),
+            advanced_pb2.CancelResponse,
+            keepalive,
+        )
+        self._dispatcher.close_stream(stream_id)
+        return resp.cancelled

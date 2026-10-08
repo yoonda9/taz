@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from taz.c3.client import TazClient
 from taz.c3.errors import TazError
-from taz.c3.file import _REQUEST_LIMIT, FileStat, Kind
+from taz.c3.file import _REQUEST_LIMIT, FileStat, FileTransfer, Kind
 from taz.c3.protocol.frame import HEADER_SIZE, Frame, pack_header
 from taz.c3.settings import Keepalive
 from taz.v1 import common_pb2, file_pb2
@@ -511,6 +511,15 @@ class TestFileUnadvertised:
         assert mock_sock.sendall.call_count == 0
 
 
+class TestFileTransfer:
+    def test_is_a_frozen_slotted_dataclass(self) -> None:
+        transfer = FileTransfer(size=5, checksum=b"\x01\x02\x03\x04")
+        assert transfer.size == 5
+        assert transfer.checksum == b"\x01\x02\x03\x04"
+        with pytest.raises(AttributeError):
+            transfer.size = 6  # type: ignore[misc]
+
+
 class TestFileExports:
     def test_file_stat_exported_from_taz_c3(self) -> None:
         import taz.c3
@@ -522,8 +531,14 @@ class TestFileExports:
 
         assert taz.c3.Kind is Kind
 
+    def test_file_transfer_exported_from_taz_c3(self) -> None:
+        import taz.c3
+
+        assert taz.c3.FileTransfer is FileTransfer
+
     def test_both_in_all(self) -> None:
         import taz.c3
 
         assert "FileStat" in taz.c3.__all__
+        assert "FileTransfer" in taz.c3.__all__
         assert "Kind" in taz.c3.__all__

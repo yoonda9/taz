@@ -36,6 +36,14 @@ class Kind(enum.IntEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class FileTransfer:
+    """Result of a ``file.put``/``file.get`` chunked transfer."""
+
+    size: int
+    checksum: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class FileStat:
     """Result of a ``FILE_STAT`` call."""
 

@@ -8,7 +8,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 from taz.c3.connection import Connection
 from taz.c3.errors import TazConnectionLost, TazError, TazProtocolError
-from taz.c3.protocol.frame import DEFAULT_MAX_PAYLOAD, Frame, pack_header
+from taz.c3.protocol.frame import (
+    DEFAULT_MAX_PAYLOAD,
+    HEADER_SIZE,
+    Frame,
+    pack_header,
+    unpack_header,
+)
 from taz.v1 import common_pb2, daemon_control_pb2
 
 
@@ -670,3 +676,104 @@ class TestSendRequest:
         stream_id = conn.send_request(common_pb2.OPCODE_PING, b"")
         assert stream_id == 0xFFFFFFFF
         assert conn._next_stream_id == 1
+
+
+# ---------------------------------------------------------------------------
+# send_file_chunk()
+# ---------------------------------------------------------------------------
+
+
+def _recording_mock_sock(*chunks: bytes) -> MagicMock:
+    """Like ``_mock_sock``, but also records sent bytes on ``sock.sent``."""
+    pending = [bytearray(c) for c in chunks]
+    sent: list[bytes] = []
+
+    def recv(bufsize: int, flags: int = 0) -> bytes:
+        while pending:
+            chunk = pending[0]
+            if not chunk:
+                pending.pop(0)
+                continue
+            if flags & socket.MSG_PEEK:
+                return bytes(chunk[:1])
+            take = min(bufsize, len(chunk))
+            data = bytes(chunk[:take])
+            del chunk[:take]
+            if not chunk:
+                pending.pop(0)
+            return data
+        return b""
+
+    def sendmsg(views: list[memoryview]) -> int:
+        sent.append(b"".join(bytes(view) for view in views))
+        return sum(len(view) for view in views)
+
+    def sendall(data: bytes) -> None:
+        sent.append(data)
+
+    sock = MagicMock(spec=_SOCKET_SPEC)
+    sock.recv.side_effect = recv
+    sock.gettimeout.return_value = None
+    sock.sendmsg.side_effect = sendmsg
+    sock.sendall.side_effect = sendall
+    sock.sent = sent
+    return sock
+
+
+def _sent_frame(mock_sock: MagicMock) -> Frame:
+    """Decode the single frame recorded on ``mock_sock.sent``."""
+    sent = b"".join(mock_sock.sent)
+    frame = unpack_header(sent[:HEADER_SIZE])
+    frame.payload = sent[HEADER_SIZE : HEADER_SIZE + frame.length]
+    return frame
+
+
+def _connect_recording(conn: Connection, *chunks: bytes) -> MagicMock:
+    """Connect ``conn`` using a recording mock socket serving ``chunks``."""
+    mock_sock = _recording_mock_sock(*chunks)
+    with patch("taz.c3.connection.socket.create_connection", return_value=mock_sock):
+        conn.connect("127.0.0.1", 5555)
+    return mock_sock
+
+
+class TestSendFileChunk:
+    def test_continuation_flag_set_unless_last(self) -> None:
+        conn = Connection()
+        mock_sock = _connect_recording(conn, _capability_bytes())
+        conn.send_file_chunk(7, b"abc", last=False)
+        frame = _sent_frame(mock_sock)
+        assert frame.type == common_pb2.FRAME_TYPE_FILE_CHUNK
+        assert frame.type == 3
+        assert frame.opcode == 0
+        assert frame.flags == common_pb2.FRAME_FLAG_CONTINUATION
+        assert frame.flags == 1
+        assert frame.stream_id == 7
+        assert frame.payload == b"abc"
+
+    def test_flag_clear_when_last(self) -> None:
+        conn = Connection()
+        mock_sock = _connect_recording(conn, _capability_bytes())
+        conn.send_file_chunk(7, b"abc", last=True)
+        frame = _sent_frame(mock_sock)
+        assert frame.flags == 0
+        assert frame.payload == b"abc"
+
+    def test_empty_payload_allowed(self) -> None:
+        conn = Connection()
+        mock_sock = _connect_recording(conn, _capability_bytes())
+        conn.send_file_chunk(7, b"", last=True)
+        frame = _sent_frame(mock_sock)
+        assert frame.length == 0
+        assert frame.payload == b""
+
+    def test_over_limit_raises_invalid_request_nothing_sent(self) -> None:
+        conn = Connection()
+        mock_sock = _connect_recording(
+            conn,
+            _capability_bytes(max_payload_sizes={common_pb2.FRAME_TYPE_FILE_CHUNK: 4}),
+        )
+        with pytest.raises(TazError) as exc_info:
+            conn.send_file_chunk(7, b"x" * 5, last=True)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+        mock_sock.sendmsg.assert_not_called()
+        mock_sock.sendall.assert_not_called()

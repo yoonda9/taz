@@ -175,3 +175,35 @@ class Connection:
         with self._io():
             _send_frame(sock, frame)
         return stream_id
+
+    def send_file_chunk(self, stream_id: int, data: bytes, *, last: bool) -> None:
+        """Send one FILE_CHUNK frame for an active transfer's stream_id.
+
+        Callers (``FileNamespace.put``) already size each chunk to
+        ``limits[FRAME_TYPE_FILE_CHUNK]``; this only asserts that invariant
+        before touching the socket.
+        """
+        chunk_limit = self._limits.get(
+            common_pb2.FRAME_TYPE_FILE_CHUNK,
+            DEFAULT_MAX_PAYLOAD[common_pb2.FRAME_TYPE_FILE_CHUNK],
+        )
+        if len(data) > chunk_limit:
+            raise TazError(
+                common_pb2.ERROR_CODE_INVALID_REQUEST,
+                f"FILE_CHUNK payload {len(data)} bytes exceeds daemon limit"
+                f" {chunk_limit}; not sent",
+            )
+        self._check_failure()
+        sock = self._sock
+        if sock is None:
+            raise RuntimeError("not connected")
+        frame = Frame(
+            type=common_pb2.FRAME_TYPE_FILE_CHUNK,
+            flags=0 if last else common_pb2.FRAME_FLAG_CONTINUATION,
+            opcode=0,
+            length=len(data),
+            stream_id=stream_id,
+            payload=data,
+        )
+        with self._io():
+            _send_frame(sock, frame)
