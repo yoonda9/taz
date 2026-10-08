@@ -22,6 +22,7 @@
 #include "handlers/file_transfer.h"
 #include "taz/crc32c.h"
 #include "taz/fsutil.h"
+#include "taz/v1/advanced.pb.h"
 #include "taz/v1/common.pb.h"
 #include "taz/v1/file.pb.h"
 
@@ -99,6 +100,31 @@ void ExpectConfirm(const std::vector<uint8_t> &frame, uint64_t bytes_written,
 std::vector<uint8_t> ToBytes(const std::string &s)
 {
     return std::vector<uint8_t>(s.begin(), s.end());
+}
+
+std::vector<uint8_t> encode_cancel_request(uint32_t target_stream_id)
+{
+    taz_v1_CancelRequest req = taz_v1_CancelRequest_init_zero;
+    req.target_stream_id = target_stream_id;
+    std::vector<uint8_t> buf(taz_v1_CancelRequest_size);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(pb_encode(&ostream, taz_v1_CancelRequest_fields, &req));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
+void ExpectCancelled(const std::vector<uint8_t> &frame, bool cancelled)
+{
+    const taz_frame_header_t h = unpack_header(frame);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(h.opcode, static_cast<uint16_t>(taz_v1_Opcode_OPCODE_CANCEL));
+
+    taz_v1_CancelResponse resp = taz_v1_CancelResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(frame);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    EXPECT_TRUE(pb_decode(&istream, taz_v1_CancelResponse_fields, &resp));
+    EXPECT_EQ(resp.cancelled, cancelled);
 }
 
 } // namespace
@@ -706,6 +732,158 @@ TEST_F(FileHandlerTest, PutShutdownRequestedMidUploadCleansUpAndStopsLoop)
     EXPECT_EQ(RefCount(), UnrefCount());
 
     taz_work_reset_for_tests();
+}
+
+// ---------------------------------------------------------------------------
+// CANCEL (handlers/cancel.c) targeting a FILE_PUT stream.
+// ---------------------------------------------------------------------------
+
+TEST_F(FileHandlerTest,
+       CancelAfterTwoOfFourChunksArrivesOnceTempGoneThenPutDrains)
+{
+    const std::string dest = JoinDir("cancelme.txt");
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 30U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, 16U, 0U, false), 30U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    DispatchChunk(30U, ToBytes("aaaa"), /*last=*/false);
+    DispatchChunk(30U, ToBytes("bbbb"), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_TRUE(PathExists(temp_path));
+
+    // The CANCEL is on its own fresh stream (31); the loop run inside
+    // DispatchRequest drives the PUT's cleanup step to completion (closing
+    // the fd and unlinking the temp) before on_cancelled fires, so by the
+    // time cancelled=true is observed the temp is already gone.
+    DispatchRequest(taz_v1_Opcode_OPCODE_CANCEL, encode_cancel_request(30U),
+                    31U);
+    ASSERT_EQ(Frames().size(), 2U);
+    ExpectCancelled(Frames()[1], true);
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_FALSE(PathExists(dest));
+    // The CANCEL stream closed; the PUT stream is still active (DRAINING)
+    // until its final chunk arrives.
+    EXPECT_EQ(ActiveStreamCount(), 1U);
+
+    // A further non-final chunk on the now-DRAINING PUT stream is dropped.
+    DispatchChunk(30U, ToBytes("cccc"), /*last=*/false);
+    EXPECT_EQ(Frames().size(), 2U);
+    EXPECT_EQ(ActiveStreamCount(), 1U);
+
+    // The final chunk releases the PUT stream.
+    DispatchChunk(30U, ToBytes("dddd"), /*last=*/true);
+    EXPECT_EQ(Frames().size(), 2U);
+    EXPECT_FALSE(PathExists(dest));
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CancelOnDrainingPutStreamReturnsFalse)
+{
+    const std::string dest = JoinDir("alreadydraining.txt");
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 32U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, 10U, 0U, false), 32U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    // Announce 10, send 16: put_trigger_fail drives this straight to
+    // DRAINING (no cancel involved) before any CANCEL is ever dispatched.
+    DispatchChunk(32U, std::vector<uint8_t>(16U, 'x'), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 2U);
+    EXPECT_FALSE(PathExists(temp_path));
+    ASSERT_EQ(ActiveStreamCount(), 1U);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_CANCEL, encode_cancel_request(32U),
+                    33U);
+    ASSERT_EQ(Frames().size(), 3U);
+    ExpectCancelled(Frames()[2], false);
+    ASSERT_EQ(ActiveStreamCount(), 1U); // The PUT stream is still DRAINING.
+
+    // The final chunk releases it.
+    DispatchChunk(32U, {}, /*last=*/true);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CancelSameTargetTwiceInARowReturnsTrueThenFalse)
+{
+    const std::string dest = JoinDir("twice.txt");
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 34U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, 4U, 0U, false), 34U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_CANCEL, encode_cancel_request(34U),
+                    35U);
+    ASSERT_EQ(Frames().size(), 2U);
+    ExpectCancelled(Frames()[1], true);
+    EXPECT_FALSE(PathExists(temp_path));
+    ASSERT_EQ(ActiveStreamCount(), 1U); // PUT: DRAINING.
+
+    // Same target again, now DRAINING: refused synchronously.
+    DispatchRequest(taz_v1_Opcode_OPCODE_CANCEL, encode_cancel_request(34U),
+                    36U);
+    ASSERT_EQ(Frames().size(), 3U);
+    ExpectCancelled(Frames()[2], false);
+    ASSERT_EQ(ActiveStreamCount(), 1U);
+
+    // Drain the PUT stream so nothing is left dangling at TearDown.
+    DispatchChunk(34U, {}, /*last=*/true);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest,
+       CancelWhileConnectionClosingWritesNothingAndReleasesBothStreams)
+{
+    const std::string dest = JoinDir("cancelclose.txt");
+    const size_t chunk_size = static_cast<size_t>(64U) * 1024U;
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 37U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, chunk_size * 2U, 0U, false), 37U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    DispatchChunk(37U, std::vector<uint8_t>(chunk_size, 'a'), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_TRUE(PathExists(temp_path));
+
+    // The CANCEL is accepted synchronously (put_cancel runs on this call,
+    // submitting a cleanup step to the pool) but the loop never runs before
+    // the connection starts closing, so neither the CANCEL's own response
+    // nor the cleanup's completion has happened yet.
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_CANCEL,
+                         encode_cancel_request(37U), 38U);
+    ASSERT_EQ(ActiveStreamCount(), 2U);
+
+    CloseConnectionAndCancelAll();
+    RunLoop();
+
+    EXPECT_EQ(Frames().size(), 1U); // No CancelResponse, no PUT frame.
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_FALSE(PathExists(dest));
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
 }
 
 #ifdef _WIN32

@@ -83,6 +83,12 @@ typedef struct
     int aborted;
     int paused;
 
+    /* Set by put_cancel when a CANCEL targeting this stream was accepted;
+     * called exactly once, as soon as the temp file is gone (inside
+     * put_cleanup_done, or directly if the open work never created one). */
+    taz_stream_done_fn_t cancel_done;
+    void *cancel_done_arg;
+
     /* Filled in by a work callback; read only by its done callback.
      * error_message overrides the generic "file.put failed" message when
      * set (e.g. a protocol-level wording the spec pins exactly); detail is
@@ -114,6 +120,22 @@ static void put_release(put_ctx_t *pctx)
     free(pctx->writing);
     free(pctx->temp);
     free(pctx);
+}
+
+/* Fires a pending CANCEL's done callback exactly once. Safe to call
+ * unconditionally: a no-op once already fired (or if no cancel is
+ * pending). Must be called once the temp file is actually gone - either
+ * after put_cleanup_work ran, or when the open work never created one. */
+static void put_fire_cancel_done(put_ctx_t *pctx)
+{
+    if (pctx->cancel_done != NULL)
+    {
+        const taz_stream_done_fn_t done = pctx->cancel_done;
+        void *const arg = pctx->cancel_done_arg;
+        pctx->cancel_done = NULL;
+        pctx->cancel_done_arg = NULL;
+        done(arg);
+    }
 }
 
 /* Pool thread: closes the fd if still open and unlinks the temp file, but
@@ -151,6 +173,8 @@ static void put_cleanup_done(void *user, int closing)
 {
     put_ctx_t *pctx = (put_ctx_t *)user;
     pctx->work_in_flight = 0;
+
+    put_fire_cancel_done(pctx);
 
     if (closing || pctx->final_seen)
     {
@@ -366,12 +390,29 @@ static void put_on_chunk(void *user, const taz_frame_header_t *header,
 
 static int put_cancel(void *user, taz_stream_done_fn_t done, void *done_arg)
 {
-    /* Accepting a cancel mid-transfer is handlers/cancel.c's job; until it
-     * lands every CANCEL against a FILE_PUT stream is refused. */
-    (void)user;
-    (void)done;
-    (void)done_arg;
-    return 0;
+    put_ctx_t *pctx = (put_ctx_t *)user;
+
+    if (pctx->state != PUT_STATE_OPENING && pctx->state != PUT_STATE_RECEIVING)
+    {
+        return 0;
+    }
+
+    pctx->state = PUT_STATE_ABORTING;
+    free(pctx->pending);
+    pctx->pending = NULL;
+    pctx->pending_len = 0U;
+    pctx->cancel_done = done;
+    pctx->cancel_done_arg = done_arg;
+
+    if (pctx->work_in_flight)
+    {
+        pctx->aborted = 1;
+    }
+    else
+    {
+        put_submit_cleanup(pctx);
+    }
+    return 1;
 }
 
 static void put_abort(void *user)
@@ -525,6 +566,10 @@ static void put_open_done(void *user, int closing)
         }
         else
         {
+            /* The open work never created a temp file, so there is nothing
+             * for put_cleanup_work to undo - the cancel's "temp is gone"
+             * condition is already (trivially) satisfied. */
+            put_fire_cancel_done(pctx);
             put_release(pctx);
         }
         return;

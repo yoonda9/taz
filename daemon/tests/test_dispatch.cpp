@@ -15,6 +15,7 @@
 #include "taz/dispatch.h"
 #include "taz/exec.h"
 #include "taz/frame.h"
+#include "taz/v1/advanced.pb.h"
 #include "taz/v1/command.pb.h"
 #include "taz/v1/common.pb.h"
 #include "taz/v1/daemon_control.pb.h"
@@ -132,6 +133,30 @@ bool DecodeExecResponse(const std::vector<uint8_t> &frame,
         frame.data() + TAZ_FRAME_HEADER_SIZE,
         frame.size() - static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
     return pb_decode(&stream, taz_v1_CommandExecResponse_fields, out);
+}
+
+std::vector<uint8_t> CancelRequestBytes(uint32_t target_stream_id)
+{
+    taz_v1_CancelRequest req = taz_v1_CancelRequest_init_zero;
+    req.target_stream_id = target_stream_id;
+    std::vector<uint8_t> buf(taz_v1_CancelRequest_size);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(pb_encode(&ostream, taz_v1_CancelRequest_fields, &req));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
+bool DecodeCancelResponse(const std::vector<uint8_t> &frame,
+                          taz_v1_CancelResponse *out)
+{
+    if (frame.size() < static_cast<size_t>(TAZ_FRAME_HEADER_SIZE))
+    {
+        return false;
+    }
+    pb_istream_t stream = pb_istream_from_buffer(
+        frame.data() + TAZ_FRAME_HEADER_SIZE,
+        frame.size() - static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+    return pb_decode(&stream, taz_v1_CancelResponse_fields, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,6 +1130,179 @@ TEST(Dispatch, CancelAllAbortsEveryOpsStreamAndStillCancelsExecs)
 
     EXPECT_TRUE(cancelled);
     EXPECT_EQ(abort_spy.calls, 1);
+}
+
+// ---------------------------------------------------------------------------
+// CANCEL opcode (handlers/cancel.c): decode, target_stream_id == 0 / own
+// stream, and dispatch-level refusal reasons (unknown target, a stream with
+// no ops such as COMMAND_EXEC). The "accept" path (target with ops that
+// agrees to cancel) is exercised end to end against handlers/file_transfer.c
+// in test_file_transfer.cpp, where a real FILE_PUT transfer is available to
+// target.
+// ---------------------------------------------------------------------------
+
+TEST(Dispatch, CancelOpcodeIsMarkedAsync)
+{
+    EXPECT_TRUE(taz_dispatch_opcode_is_async(
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_CANCEL)));
+}
+
+TEST(Dispatch, CancelUndecodablePayloadIsInvalidRequest)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    const std::vector<uint8_t> garbage = {0xFFU, 0xFFU, 0xFFU};
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_CANCEL), 60U,
+                   static_cast<uint32_t>(garbage.size()));
+    taz_dispatch_frame(&d, &h, garbage.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    const auto resp = UnpackHeader(wctx.frames[0]);
+    EXPECT_EQ(resp.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    ASSERT_TRUE(DecodeErrorInfo(wctx.frames[0], &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_EQ(d.active_count, 0U);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(Dispatch, CancelTargetZeroReturnsCancelledFalseSynchronously)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    const auto payload = CancelRequestBytes(0U);
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_CANCEL), 61U,
+                   static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    taz_v1_CancelResponse resp = taz_v1_CancelResponse_init_zero;
+    ASSERT_TRUE(DecodeCancelResponse(wctx.frames[0], &resp));
+    EXPECT_FALSE(resp.cancelled);
+    EXPECT_EQ(d.active_count, 0U);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(Dispatch, CancelOwnStreamReturnsCancelledFalseSynchronously)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    const auto payload = CancelRequestBytes(62U);
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_CANCEL), 62U,
+                   static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    taz_v1_CancelResponse resp = taz_v1_CancelResponse_init_zero;
+    ASSERT_TRUE(DecodeCancelResponse(wctx.frames[0], &resp));
+    EXPECT_FALSE(resp.cancelled);
+    EXPECT_EQ(d.active_count, 0U);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(Dispatch, CancelUnknownTargetReturnsCancelledFalseSynchronously)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    const auto payload = CancelRequestBytes(999U);
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_CANCEL), 63U,
+                   static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    taz_v1_CancelResponse resp = taz_v1_CancelResponse_init_zero;
+    ASSERT_TRUE(DecodeCancelResponse(wctx.frames[0], &resp));
+    EXPECT_FALSE(resp.cancelled);
+    EXPECT_EQ(d.active_count, 0U);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+}
+
+TEST(Dispatch, CancelCommandExecStreamReturnsFalseAndExecIsUnaffected)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    // A real COMMAND_EXEC request for the long-lived sleeper helper: it has
+    // no stream_ops registered (only handlers/file_transfer.c's transfers
+    // do), so taz_dispatch_cancel_stream must refuse it regardless of the
+    // exec itself.
+    const auto exec_payload =
+        CommandExecRequestBytes(TAZ_TEST_SLEEPER_PATH, {});
+    const taz_frame_header_t exec_h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   64U, static_cast<uint32_t>(exec_payload.size()));
+    taz_dispatch_frame(&d, &exec_h, exec_payload.data(), TAZ_FRAME_OK,
+                       capture_write, &wctx);
+    ASSERT_EQ(d.active_count, 1U);
+
+    const auto cancel_payload = CancelRequestBytes(64U);
+    const taz_frame_header_t cancel_h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_CANCEL), 65U,
+                   static_cast<uint32_t>(cancel_payload.size()));
+    taz_dispatch_frame(&d, &cancel_h, cancel_payload.data(), TAZ_FRAME_OK,
+                       capture_write, &wctx);
+
+    ASSERT_EQ(wctx.frames.size(), 1U);
+    taz_v1_CancelResponse resp = taz_v1_CancelResponse_init_zero;
+    ASSERT_TRUE(DecodeCancelResponse(wctx.frames[0], &resp));
+    EXPECT_FALSE(resp.cancelled);
+    // Only the CANCEL stream closed synchronously; the exec's stream is
+    // still active and the sleeper has not been touched.
+    EXPECT_EQ(d.active_count, 1U);
+
+    // Clean up the still-sleeping exec the same way connection close would.
+    taz_dispatch_cancel_all(&d);
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+    EXPECT_EQ(d.active_count, 0U);
 }
 
 struct WritableSpy

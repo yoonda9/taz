@@ -255,6 +255,7 @@ add_library(
     src/handlers/command.c
     src/handlers/file.c
     src/handlers/file_transfer.c
+    src/handlers/cancel.c
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
 # Stop <windows.h> from including the old <winsock.h>, which clashes with the

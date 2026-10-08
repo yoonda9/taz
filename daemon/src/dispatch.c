@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "handlers/cancel.h"
 #include "handlers/command.h"
 #include "handlers/config.h"
 #include "handlers/file.h"
@@ -315,6 +316,7 @@ static const opcode_entry_t OPCODE_TABLE[] = {
     {NULL, handle_dir_list, (uint16_t)taz_v1_Opcode_OPCODE_DIR_LIST, true},
     {NULL, handle_dir_remove, (uint16_t)taz_v1_Opcode_OPCODE_DIR_REMOVE, true},
     {NULL, handle_file_put, (uint16_t)taz_v1_Opcode_OPCODE_FILE_PUT, true},
+    {NULL, handle_cancel, (uint16_t)taz_v1_Opcode_OPCODE_CANCEL, true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))
