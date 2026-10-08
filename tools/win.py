@@ -203,6 +203,12 @@ def ssh_options(cfg: Config) -> list[str]:
         "-o", f"UserKnownHostsFile={cfg.known_hosts}",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "HashKnownHosts=no",
+        # `run` goes silent for minutes at a time (e.g. linking taz_tests.exe
+        # while Defender real-time-scans the fresh .exe/.pdb); without this,
+        # an idle network device between here and the VM drops the
+        # connection and the build is orphaned with no error.
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=4",
     ]  # fmt: skip
 
 
