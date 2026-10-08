@@ -127,6 +127,71 @@ void ExpectCancelled(const std::vector<uint8_t> &frame, bool cancelled)
     EXPECT_EQ(resp.cancelled, cancelled);
 }
 
+std::vector<uint8_t> encode_get_request(const std::string &src)
+{
+    taz_v1_FileGetRequest req = taz_v1_FileGetRequest_init_zero;
+    if (!src.empty())
+    {
+        (void)strncpy(req.src, src.c_str(), sizeof(req.src) - 1U);
+    }
+    std::vector<uint8_t> buf(taz_v1_FileGetRequest_size);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(pb_encode(&ostream, taz_v1_FileGetRequest_fields, &req));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
+taz_v1_FileGetResponse decode_get_response(const std::vector<uint8_t> &frame)
+{
+    taz_v1_FileGetResponse resp = taz_v1_FileGetResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(frame);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    EXPECT_TRUE(pb_decode(&istream, taz_v1_FileGetResponse_fields, &resp));
+    return resp;
+}
+
+void ExpectGetResponse(const std::vector<uint8_t> &frame, uint64_t size,
+                       const std::string &content)
+{
+    const taz_frame_header_t h = unpack_header(frame);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(h.opcode, static_cast<uint16_t>(taz_v1_Opcode_OPCODE_FILE_GET));
+
+    const taz_v1_FileGetResponse resp = decode_get_response(frame);
+    EXPECT_EQ(resp.size, size);
+
+    const uint32_t crc = taz_crc32c(
+        reinterpret_cast<const uint8_t *>(content.data()), content.size());
+    uint8_t expected[4];
+    taz_crc32c_to_le(crc, expected);
+    ASSERT_EQ(resp.checksum.size, 4U);
+    EXPECT_EQ(std::memcmp(resp.checksum.bytes, expected, 4U), 0);
+}
+
+// Verifies a raw FILE_CHUNK frame: type FILE_CHUNK, opcode 0, the given
+// stream_id and CONTINUATION flag, and exact payload bytes.
+void ExpectChunk(const std::vector<uint8_t> &frame, uint32_t stream_id,
+                 const std::string &bytes, bool last)
+{
+    const taz_frame_header_t h = unpack_header(frame);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK));
+    EXPECT_EQ(h.opcode, 0U);
+    EXPECT_EQ(h.stream_id, stream_id);
+    const uint8_t expected_flags =
+        last ? 0U
+             : static_cast<uint8_t>(taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION);
+    EXPECT_EQ(h.flags, expected_flags);
+
+    const std::vector<uint8_t> body = frame_payload(frame);
+    ASSERT_EQ(body.size(), bytes.size());
+    if (!bytes.empty())
+    {
+        EXPECT_EQ(std::memcmp(body.data(), bytes.data(), bytes.size()), 0);
+    }
+}
+
 } // namespace
 
 TEST_F(FileHandlerTest, PutFourByteFileInOneFinalChunk)
@@ -907,3 +972,273 @@ TEST_F(FileHandlerTest, PutWithReadOnlyPermissionsSetsReadOnlyAttribute)
     EXPECT_EQ(mode & 0200U, 0U);
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// FILE_GET
+// ---------------------------------------------------------------------------
+
+TEST_F(FileHandlerTest, GetFiveByteFileSendsResponseThenOneFinalChunk)
+{
+    const std::string src = JoinDir("five.txt");
+    const std::string content = "abcde";
+    WriteFile(src, content);
+    const uint64_t mode = FileMode(src);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                    40U);
+
+    ASSERT_EQ(Frames().size(), 2U);
+    ExpectGetResponse(Frames()[0], content.size(), content);
+    EXPECT_EQ(decode_get_response(Frames()[0]).permissions, mode);
+    ExpectChunk(Frames()[1], 40U, content, /*last=*/true);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, Get200KiBFileSendsFourChunks)
+{
+    const std::string src = JoinDir("200k.bin");
+    std::string content(static_cast<size_t>(200U) * 1024U, '\0');
+    for (size_t i = 0U; i < content.size(); ++i)
+    {
+        content[i] = static_cast<char>(i % 251U);
+    }
+    WriteFile(src, content);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                    41U);
+
+    ASSERT_EQ(Frames().size(), 5U); // RESPONSE + 4 chunks.
+    ExpectGetResponse(Frames()[0], content.size(), content);
+
+    const size_t chunk = static_cast<size_t>(64U) * 1024U;
+    ExpectChunk(Frames()[1], 41U, content.substr(0U, chunk), /*last=*/false);
+    ExpectChunk(Frames()[2], 41U, content.substr(chunk, chunk),
+                /*last=*/false);
+    ExpectChunk(Frames()[3], 41U, content.substr(chunk * 2U, chunk),
+                /*last=*/false);
+    ExpectChunk(Frames()[4], 41U, content.substr(chunk * 3U), /*last=*/true);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, GetEmptyFileSendsResponseThenOneEmptyChunk)
+{
+    const std::string src = JoinDir("empty.bin");
+    WriteFile(src, "");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                    42U);
+
+    ASSERT_EQ(Frames().size(), 2U);
+    ExpectGetResponse(Frames()[0], 0U, "");
+    ExpectChunk(Frames()[1], 42U, "", /*last=*/true);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, GetMissingFileReturnsNotFoundAndNoChunk)
+{
+    const std::string src = JoinDir("nope.bin");
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                    43U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_v1_ErrorInfo err = decode_error(Frames()[0]);
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, GetDirectoryReturnsInvalidRequest)
+{
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(Dir()),
+                    44U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_v1_ErrorInfo err = decode_error(Frames()[0]);
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "source is a directory");
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, GetEmptySrcReturnsInvalidRequestSynchronously)
+{
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(""),
+                         45U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_v1_ErrorInfo err = decode_error(Frames()[0]);
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "src is required");
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(UnrefCount(), 0);
+}
+
+TEST_F(FileHandlerTest, GetUndecodablePayloadReturnsInvalidRequest)
+{
+    const std::vector<uint8_t> garbage = {0xFFU, 0xFFU, 0xFFU};
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, garbage, 46U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    const taz_v1_ErrorInfo err = decode_error(Frames()[0]);
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(UnrefCount(), 0);
+}
+
+TEST_F(FileHandlerTest, GetExactly64KiBFileSendsOneChunk)
+{
+    const std::string src = JoinDir("exact64k.bin");
+    const std::string content(static_cast<size_t>(64U) * 1024U, 'z');
+    WriteFile(src, content);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                    47U);
+
+    ASSERT_EQ(Frames().size(), 2U);
+    ExpectGetResponse(Frames()[0], content.size(), content);
+    ExpectChunk(Frames()[1], 47U, content, /*last=*/true);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, Get64KiBPlusOneFileSendsTwoChunks)
+{
+    const std::string src = JoinDir("64kplus1.bin");
+    const std::string content((static_cast<size_t>(64U) * 1024U) + 1U, 'q');
+    WriteFile(src, content);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                    48U);
+
+    ASSERT_EQ(Frames().size(), 3U);
+    ExpectGetResponse(Frames()[0], content.size(), content);
+    const size_t chunk = static_cast<size_t>(64U) * 1024U;
+    ExpectChunk(Frames()[1], 48U, content.substr(0U, chunk), /*last=*/false);
+    ExpectChunk(Frames()[2], 48U, content.substr(chunk), /*last=*/true);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, GetFileShrunkBetweenPassesEndsWithInternalError)
+{
+    const std::string src = JoinDir("shrink.bin");
+    const std::string content(static_cast<size_t>(200U) * 1024U, 's');
+    WriteFile(src, content);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                         49U);
+
+    // Step until the RESPONSE and the first two chunks have been sent
+    // (128 KiB already read, two chunks left). truncate() below runs on
+    // this thread strictly before the next RunLoop(), so even if the one
+    // read already in flight at that point wins its race against it, a
+    // later read cannot: it is only ever submitted from a done callback
+    // that RunLoop() itself drives, which happens after truncate() returns.
+    while (Frames().size() < 3U)
+    {
+        RunLoopOnce();
+    }
+    ExpectGetResponse(Frames()[0], content.size(), content);
+
+    {
+        uv_fs_t open_req;
+        const uv_file fd = uv_fs_open(nullptr, &open_req, src.c_str(),
+                                      UV_FS_O_WRONLY, 0, nullptr);
+        uv_fs_req_cleanup(&open_req);
+        ASSERT_GE(fd, 0);
+        uv_fs_t trunc_req;
+        ASSERT_EQ(uv_fs_ftruncate(nullptr, &trunc_req, fd,
+                                  static_cast<int64_t>(32U * 1024U), nullptr),
+                  0);
+        uv_fs_req_cleanup(&trunc_req);
+        uv_fs_t close_req;
+        (void)uv_fs_close(nullptr, &close_req, fd, nullptr);
+        uv_fs_req_cleanup(&close_req);
+    }
+
+    RunLoop();
+
+    ASSERT_GE(Frames().size(), 4U);
+    const taz_v1_ErrorInfo err = decode_error(Frames().back());
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INTERNAL);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, GetBackpressureStallsThenResumesOnNotifyWritable)
+{
+    const std::string src = JoinDir("backpressure.bin");
+    const std::string content(static_cast<size_t>(200U) * 1024U, 'b');
+    WriteFile(src, content);
+
+    SetQueueSize(static_cast<size_t>(300U) *
+                 1024U); // Above TAZ_FILE_GET_HIGH_WATER (256 KiB).
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                    50U);
+
+    ASSERT_EQ(Frames().size(), 1U); // RESPONSE only, no chunk yet.
+    ExpectGetResponse(Frames()[0], content.size(), content);
+
+    // Still above the mark: notify_writable changes nothing.
+    NotifyWritable();
+    RunLoop();
+    ASSERT_EQ(Frames().size(), 1U);
+
+    // Below the mark: every chunk now arrives.
+    SetQueueSize(0U);
+    NotifyWritable();
+    RunLoop();
+
+    ASSERT_EQ(Frames().size(), 5U); // RESPONSE + 4 chunks.
+    const size_t chunk = static_cast<size_t>(64U) * 1024U;
+    ExpectChunk(Frames()[1], 50U, content.substr(0U, chunk), /*last=*/false);
+    ExpectChunk(Frames()[2], 50U, content.substr(chunk, chunk),
+                /*last=*/false);
+    ExpectChunk(Frames()[3], 50U, content.substr(chunk * 2U, chunk),
+                /*last=*/false);
+    ExpectChunk(Frames()[4], 50U, content.substr(chunk * 3U), /*last=*/true);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CloseConnectionDuringDownloadClosesFdAndReleasesStream)
+{
+    const std::string src = JoinDir("closemid.bin");
+    const std::string content(static_cast<size_t>(200U) * 1024U, 'c');
+    WriteFile(src, content);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                         51U);
+
+    while (Frames().size() < 2U) // RESPONSE + first chunk.
+    {
+        RunLoopOnce();
+    }
+    ASSERT_EQ(Frames().size(), 2U);
+
+    CloseConnectionAndCancelAll();
+    RunLoop();
+
+    EXPECT_EQ(Frames().size(), 2U); // No further frames written.
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}

@@ -45,6 +45,7 @@ struct FakeConn
     int closing = 0;
     int pause_calls = 0;
     int resume_calls = 0;
+    size_t queue_size = 0;
 };
 
 static void CountRef(void *ctx)
@@ -70,6 +71,11 @@ static void CountPauseReads(void *ctx)
 static void CountResumeReads(void *ctx)
 {
     static_cast<FakeConn *>(ctx)->resume_calls++;
+}
+
+static size_t FakeQueueSize(void *ctx)
+{
+    return static_cast<FakeConn *>(ctx)->queue_size;
 }
 
 struct WriteCtx
@@ -224,6 +230,7 @@ class FileHandlerTest : public ::testing::Test
         d_.conn_unref = CountUnref;
         d_.conn_ctx = &conn_;
         d_.conn_closing = IsClosing;
+        d_.conn_write_queue_size = FakeQueueSize;
 
         char tmpdir[1024];
         size_t tmpdir_len = sizeof(tmpdir) - 1U;
@@ -433,6 +440,15 @@ class FileHandlerTest : public ::testing::Test
         ASSERT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
     }
 
+    // Runs a single loop iteration (one pool completion's worth of
+    // callbacks) - for tests that need to observe a multi-step transfer one
+    // step at a time, e.g. stopping after exactly N chunks. Returns
+    // uv_run's result (non-zero while handles/requests remain).
+    int RunLoopOnce()
+    {
+        return uv_run(&loop_, UV_RUN_ONCE);
+    }
+
     // Installs counting fake pause/resume hooks (conn_write_queue_size stays
     // unset: PUT's ingress backpressure never reads it). Counts are exposed
     // via PauseCalls()/ResumeCalls().
@@ -450,6 +466,13 @@ class FileHandlerTest : public ::testing::Test
     int ResumeCalls() const
     {
         return conn_.resume_calls;
+    }
+
+    // Settable fake for the connection's outbound write-queue depth, read by
+    // FILE_GET's egress backpressure (taz_dispatch_conn_write_queue_size).
+    void SetQueueSize(size_t n)
+    {
+        conn_.queue_size = n;
     }
 
     static bool PathExists(const std::string &path)
@@ -567,6 +590,13 @@ class FileHandlerTest : public ::testing::Test
     void RequestShutdown()
     {
         taz_work_request_shutdown(&loop_);
+    }
+
+    // Notifies every stream registered with on_writable that a write just
+    // completed - FILE_GET's egress backpressure resumes here.
+    void NotifyWritable()
+    {
+        taz_dispatch_notify_writable(&d_);
     }
 
   private:

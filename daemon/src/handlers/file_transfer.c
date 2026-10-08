@@ -817,3 +817,515 @@ void handle_file_put(taz_dispatch_t *d, const taz_frame_header_t *header,
     }
     pctx->work_in_flight = 1;
 }
+
+/* -------------------------------------------------------------------------
+ * FILE_GET
+ * ------------------------------------------------------------------------- */
+
+/* Egress backpressure: the next read is deferred while this many bytes are
+ * still queued on the connection for writing, resumed once a write drains
+ * the queue back under the mark. */
+#define TAZ_FILE_GET_HIGH_WATER ((size_t)256U * 1024U)
+
+typedef enum
+{
+    GET_STATE_SCANNING,
+    GET_STATE_SENDING,
+    GET_STATE_CLOSING
+} get_state_t;
+
+/* Carries everything a FILE_GET transfer needs across its lifetime: the
+ * write sink/stream/opcode, the request snapshot, the open fd, running
+ * progress (offset + CRC learned in pass 1), a frame buffer
+ * (TAZ_FRAME_HEADER_SIZE + TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK) allocated once
+ * and reused for every pool read (pass 1's scan and every pass 2 chunk), and
+ * the taz_stream_ops_t instance registered on the stream. Heap-allocated per
+ * transfer, freed exactly once by get_release. */
+typedef struct
+{
+    taz_dispatch_t *d;
+    taz_dispatch_write_fn_t write_fn;
+    void *write_ctx;
+    uint32_t stream_id;
+    uint16_t opcode;
+
+    taz_v1_FileGetRequest req;
+
+    uv_file fd;
+    int fd_open;
+
+    get_state_t state;
+
+    uint64_t size;
+    uint32_t permissions;
+    uint32_t crc;
+    uint64_t offset;
+
+    /* Header area [0, TAZ_FRAME_HEADER_SIZE) + payload area of up to
+     * TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK bytes, allocated once and reused for
+     * every read so pass 2 never mallocs per chunk. */
+    uint8_t *frame_buf;
+    /* Bytes a read step actually placed in the payload area. */
+    size_t read_n;
+
+    int work_in_flight;
+    /* Set when a read step is deferred past TAZ_FILE_GET_HIGH_WATER,
+     * waiting for on_writable to retry. */
+    int waiting_writable;
+    /* Set by get_cancel once CANCEL accepts cancelling this stream (always
+     * refused for now; a later task upgrades get_cancel to set this). */
+    int cancelled;
+    /* Set when the connection itself is closing (taz_dispatch_cancel_all's
+     * abort). Distinct from closing, which work.c reports via the done
+     * callback's own argument. */
+    int aborted;
+
+    /* Filled in by a work callback; read only by its done callback. */
+    int ok;
+    taz_v1_ErrorCode error_code;
+    const char *error_message;
+    const char *error_detail;
+
+    /* Set by a later task's get_cancel once accepted; fired exactly once,
+     * once the fd is actually closed. */
+    taz_stream_done_fn_t cancel_done;
+    void *cancel_done_arg;
+
+    taz_stream_ops_t ops;
+} get_ctx_t;
+
+static void get_release(get_ctx_t *gctx);
+static void get_submit_close(get_ctx_t *gctx);
+static void get_next_chunk(get_ctx_t *gctx);
+
+static void get_release(get_ctx_t *gctx)
+{
+    taz_dispatch_set_stream_ops(gctx->d, gctx->stream_id, NULL, NULL);
+    taz_dispatch_stream_done(gctx->d, gctx->stream_id);
+    free(gctx->frame_buf);
+    free(gctx);
+}
+
+/* Closes the fd if it is still open, otherwise releases immediately (there
+ * is nothing left to wait for). */
+static void get_close_or_release(get_ctx_t *gctx)
+{
+    if (gctx->fd_open)
+    {
+        get_submit_close(gctx);
+    }
+    else
+    {
+        get_release(gctx);
+    }
+}
+
+/* Sends the error_code/error_message/error_detail a work callback left,
+ * falling back to a generic message when it did not pin an exact one. */
+static void get_send_pool_error(const get_ctx_t *gctx)
+{
+    taz_error_send(gctx->write_fn, gctx->write_ctx, gctx->stream_id,
+                   gctx->opcode, gctx->error_code,
+                   (gctx->error_message != NULL) ? gctx->error_message
+                                                 : "file.get failed",
+                   gctx->error_detail);
+}
+
+/* -------------------------------------------------------------------------
+ * Close step: closes the fd on the pool thread, then releases the stream.
+ * ------------------------------------------------------------------------- */
+
+static void get_close_work(void *user)
+{
+    get_ctx_t *gctx = (get_ctx_t *)user;
+
+    if (gctx->fd_open)
+    {
+        uv_fs_t req;
+        (void)uv_fs_close(NULL, &req, gctx->fd, NULL);
+        uv_fs_req_cleanup(&req);
+        gctx->fd_open = 0;
+    }
+}
+
+static void get_close_done(void *user, int closing)
+{
+    get_ctx_t *gctx = (get_ctx_t *)user;
+    (void)closing;
+
+    gctx->work_in_flight = 0;
+
+    if (gctx->cancel_done != NULL)
+    {
+        const taz_stream_done_fn_t done = gctx->cancel_done;
+        void *const arg = gctx->cancel_done_arg;
+        gctx->cancel_done = NULL;
+        gctx->cancel_done_arg = NULL;
+        done(arg);
+    }
+
+    get_release(gctx);
+}
+
+static void get_submit_close(get_ctx_t *gctx)
+{
+    gctx->state = GET_STATE_CLOSING;
+    if (taz_work_submit_step(gctx->d, get_close_work, get_close_done, gctx) !=
+        0)
+    {
+        /* Nothing more we can safely do on the pool; release now rather
+         * than touch gctx again (best effort: the fd may leak). */
+        get_release(gctx);
+        return;
+    }
+    gctx->work_in_flight = 1;
+}
+
+/* -------------------------------------------------------------------------
+ * taz_stream_ops_t
+ * ------------------------------------------------------------------------- */
+
+/* CANCEL targeting a FILE_GET stream always refuses for now; a later task
+ * upgrades this to accept in SCANNING/SENDING. */
+static int get_cancel(void *user, taz_stream_done_fn_t done, void *done_arg)
+{
+    (void)user;
+    (void)done;
+    (void)done_arg;
+    return 0;
+}
+
+static void get_abort(void *user)
+{
+    get_ctx_t *gctx = (get_ctx_t *)user;
+
+    gctx->aborted = 1;
+
+    if (gctx->work_in_flight)
+    {
+        return;
+    }
+
+    get_close_or_release(gctx);
+}
+
+static void get_on_writable(void *user)
+{
+    get_ctx_t *gctx = (get_ctx_t *)user;
+
+    if (gctx->waiting_writable)
+    {
+        gctx->waiting_writable = 0;
+        get_next_chunk(gctx);
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Pass 1: stat + stream the whole file through CRC32C to learn size.
+ * ------------------------------------------------------------------------- */
+
+static void get_scan_work(void *user)
+{
+    get_ctx_t *gctx = (get_ctx_t *)user;
+    uv_fs_t req;
+    uv_file fd;
+
+    if (uv_fs_stat(NULL, &req, gctx->req.src, NULL) < 0)
+    {
+        gctx->error_code = taz_error_from_fs_req(&req);
+        gctx->error_detail = taz_error_fs_detail(&req);
+        uv_fs_req_cleanup(&req);
+        return;
+    }
+    if (taz_fsutil_kind_from_mode(req.statbuf.st_mode) == taz_v1_Kind_KIND_DIR)
+    {
+        uv_fs_req_cleanup(&req);
+        gctx->error_code = taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST;
+        gctx->error_message = "source is a directory";
+        return;
+    }
+    gctx->permissions = (uint32_t)(req.statbuf.st_mode & TAZ_FS_MODE_BITS);
+    uv_fs_req_cleanup(&req);
+
+    fd = uv_fs_open(NULL, &req, gctx->req.src, UV_FS_O_RDONLY, 0, NULL);
+    if (fd < 0)
+    {
+        gctx->error_code = taz_error_from_fs_req(&req);
+        gctx->error_detail = taz_error_fs_detail(&req);
+        uv_fs_req_cleanup(&req);
+        return;
+    }
+    uv_fs_req_cleanup(&req);
+    gctx->fd = fd;
+    gctx->fd_open = 1;
+
+    for (;;)
+    {
+        uv_buf_t buf =
+            uv_buf_init((char *)gctx->frame_buf + TAZ_FRAME_HEADER_SIZE,
+                        (unsigned int)TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK);
+        uv_fs_t read_req;
+        const int n = uv_fs_read(NULL, &read_req, gctx->fd, &buf, 1,
+                                 (int64_t)gctx->size, NULL);
+        if (n < 0)
+        {
+            gctx->error_code = taz_error_from_fs_req(&read_req);
+            gctx->error_detail = taz_error_fs_detail(&read_req);
+            uv_fs_req_cleanup(&read_req);
+            return;
+        }
+        uv_fs_req_cleanup(&read_req);
+        if (n == 0)
+        {
+            break;
+        }
+
+        gctx->crc = taz_crc32c_update(
+            gctx->crc, gctx->frame_buf + TAZ_FRAME_HEADER_SIZE, (size_t)n);
+        gctx->size += (uint64_t)n;
+    }
+
+    gctx->ok = 1;
+}
+
+static void get_scan_done(void *user, int closing)
+{
+    get_ctx_t *gctx = (get_ctx_t *)user;
+    const int ok = gctx->ok;
+
+    gctx->work_in_flight = 0;
+    gctx->ok = 0;
+
+    if (closing || gctx->cancelled || gctx->aborted)
+    {
+        get_close_or_release(gctx);
+        return;
+    }
+
+    if (!ok)
+    {
+        get_send_pool_error(gctx);
+        get_close_or_release(gctx);
+        return;
+    }
+
+    {
+        taz_v1_FileGetResponse resp = taz_v1_FileGetResponse_init_zero;
+        resp.size = gctx->size;
+        resp.permissions = gctx->permissions;
+        resp.checksum.size = 4U;
+        taz_crc32c_to_le(gctx->crc, resp.checksum.bytes);
+        taz_response_send(gctx->write_fn, gctx->write_ctx, gctx->stream_id,
+                          gctx->opcode, taz_v1_FileGetResponse_fields, &resp);
+    }
+
+    gctx->state = GET_STATE_SENDING;
+    get_next_chunk(gctx);
+}
+
+/* -------------------------------------------------------------------------
+ * Pass 2: one work item per chunk, read then send, stalling on backpressure.
+ * ------------------------------------------------------------------------- */
+
+static void get_read_work(void *user)
+{
+    get_ctx_t *gctx = (get_ctx_t *)user;
+    const uint64_t remaining = gctx->size - gctx->offset;
+    const size_t want = (remaining < (uint64_t)TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK)
+                            ? (size_t)remaining
+                            : (size_t)TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK;
+
+    gctx->read_n = 0U;
+
+    if (want > 0U)
+    {
+        uv_buf_t buf =
+            uv_buf_init((char *)gctx->frame_buf + TAZ_FRAME_HEADER_SIZE,
+                        (unsigned int)want);
+        uv_fs_t req;
+        const int n = uv_fs_read(NULL, &req, gctx->fd, &buf, 1,
+                                 (int64_t)gctx->offset, NULL);
+        if (n < 0)
+        {
+            gctx->error_code = taz_error_from_fs_req(&req);
+            gctx->error_detail = taz_error_fs_detail(&req);
+            uv_fs_req_cleanup(&req);
+            return;
+        }
+        uv_fs_req_cleanup(&req);
+        gctx->read_n = (size_t)n;
+    }
+
+    gctx->ok = 1;
+}
+
+static void get_read_done(void *user, int closing)
+{
+    get_ctx_t *gctx = (get_ctx_t *)user;
+    const int ok = gctx->ok;
+    const size_t n = gctx->read_n;
+    int is_last;
+
+    gctx->work_in_flight = 0;
+    gctx->ok = 0;
+
+    if (closing || gctx->cancelled || gctx->aborted)
+    {
+        get_close_or_release(gctx);
+        return;
+    }
+
+    if (!ok)
+    {
+        get_send_pool_error(gctx);
+        get_close_or_release(gctx);
+        return;
+    }
+
+    if (n == 0U && gctx->offset < gctx->size)
+    {
+        taz_error_send(gctx->write_fn, gctx->write_ctx, gctx->stream_id,
+                       gctx->opcode, taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+                       "file changed during transfer", NULL);
+        get_close_or_release(gctx);
+        return;
+    }
+
+    is_last = (gctx->offset + (uint64_t)n) >= gctx->size;
+
+    {
+        taz_frame_header_t h;
+        h.type = (uint8_t)taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK;
+        h.flags = (uint8_t)(is_last
+                                ? 0
+                                : (int)taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION);
+        h.opcode = 0U;
+        h.length = (uint32_t)n;
+        h.stream_id = gctx->stream_id;
+        taz_frame_pack_header(&h, gctx->frame_buf);
+        gctx->write_fn(gctx->frame_buf, TAZ_FRAME_HEADER_SIZE + n,
+                       gctx->write_ctx);
+    }
+
+    gctx->offset += (uint64_t)n;
+
+    if (is_last)
+    {
+        get_submit_close(gctx);
+        return;
+    }
+
+    get_next_chunk(gctx);
+}
+
+/* Issues the next pass-2 read, unless the connection's write queue is above
+ * the high-water mark, in which case the read is deferred to on_writable. */
+static void get_next_chunk(get_ctx_t *gctx)
+{
+    if (taz_dispatch_conn_write_queue_size(gctx->d) > TAZ_FILE_GET_HIGH_WATER)
+    {
+        gctx->waiting_writable = 1;
+        return;
+    }
+
+    if (taz_work_submit_step(gctx->d, get_read_work, get_read_done, gctx) != 0)
+    {
+        if (!taz_dispatch_conn_closing(gctx->d))
+        {
+            taz_error_send(gctx->write_fn, gctx->write_ctx, gctx->stream_id,
+                           gctx->opcode, taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+                           "work submit failed", NULL);
+        }
+        get_close_or_release(gctx);
+        return;
+    }
+    gctx->work_in_flight = 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Entry point
+ * ------------------------------------------------------------------------- */
+
+void handle_file_get(taz_dispatch_t *d, const taz_frame_header_t *header,
+                     const uint8_t *payload, taz_dispatch_write_fn_t write_fn,
+                     void *ctx)
+{
+    taz_v1_FileGetRequest req = taz_v1_FileGetRequest_init_zero;
+    get_ctx_t *gctx;
+
+    /* An empty payload is a valid encoding of a request with an empty src;
+     * that is caught by the src check below, not here. */
+    if (payload != NULL && header->length > 0U)
+    {
+        pb_istream_t istream =
+            pb_istream_from_buffer(payload, (size_t)header->length);
+        if (!pb_decode(&istream, taz_v1_FileGetRequest_fields, &req))
+        {
+            taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                           taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                           "decode FileGetRequest failed", NULL);
+            taz_dispatch_stream_done(d, header->stream_id);
+            return;
+        }
+    }
+
+    if (req.src[0] == '\0')
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
+                       "src is required", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+
+    gctx = (get_ctx_t *)calloc(1U, sizeof(*gctx));
+    if (gctx == NULL)
+    {
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
+                       NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+
+    gctx->frame_buf =
+        (uint8_t *)malloc((size_t)TAZ_FRAME_HEADER_SIZE +
+                          (size_t)TAZ_FRAME_MAX_PAYLOAD_FILE_CHUNK);
+    if (gctx->frame_buf == NULL)
+    {
+        free(gctx);
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
+                       NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+
+    gctx->d = d;
+    gctx->write_fn = write_fn;
+    gctx->write_ctx = ctx;
+    gctx->stream_id = header->stream_id;
+    gctx->opcode = header->opcode;
+    gctx->req = req;
+    gctx->state = GET_STATE_SCANNING;
+
+    gctx->ops.on_chunk = NULL;
+    gctx->ops.cancel = get_cancel;
+    gctx->ops.abort = get_abort;
+    gctx->ops.on_writable = get_on_writable;
+
+    taz_dispatch_set_stream_ops(d, header->stream_id, &gctx->ops, gctx);
+
+    if (taz_work_submit_step(d, get_scan_work, get_scan_done, gctx) != 0)
+    {
+        taz_dispatch_set_stream_ops(d, header->stream_id, NULL, NULL);
+        free(gctx->frame_buf);
+        free(gctx);
+        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                       taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
+                       "work submit failed", NULL);
+        taz_dispatch_stream_done(d, header->stream_id);
+        return;
+    }
+    gctx->work_in_flight = 1;
+}

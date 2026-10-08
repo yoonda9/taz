@@ -34,6 +34,26 @@ extern "C"
                          const uint8_t *payload,
                          taz_dispatch_write_fn_t write_fn, void *ctx);
 
+    /* Async FILE_GET handler: decode FileGetRequest, reject an empty src
+     * with INVALID_REQUEST, then register stream_ops (abort/on_writable;
+     * cancel always refuses for now) and run pass 1 on the pool: uv_fs_stat
+     * (missing -> NOT_FOUND, a directory -> INVALID_REQUEST), open
+     * read-only, and stream the whole file through CRC32C in 64 KiB pieces
+     * to learn its size (not st_size) and permissions. On success replies
+     * with FileGetResponse{size, permissions, checksum} and starts pass 2:
+     * one work item per <=64 KiB chunk, read at the running offset into a
+     * heap frame buffer allocated once and sent as a FILE_CHUNK frame
+     * (opcode 0, CONTINUATION unless it is the last), stalling before the
+     * next read while the connection's write-queue size exceeds a 256 KiB
+     * high-water mark and resuming via on_writable. A short read before the
+     * expected size (the file shrank mid-transfer) ends the stream with
+     * ERROR INTERNAL. Every blocking call runs via taz_work_submit_step, so
+     * taz_work_request_shutdown waits for an in-flight download. Closes the
+     * stream itself. */
+    void handle_file_get(taz_dispatch_t *d, const taz_frame_header_t *header,
+                         const uint8_t *payload,
+                         taz_dispatch_write_fn_t write_fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif
