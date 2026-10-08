@@ -452,6 +452,206 @@ TEST_F(FileHandlerTest, PutIngressPauseAndResumeAroundHighWaterMark)
     EXPECT_EQ(RefCount(), UnrefCount());
 }
 
+TEST_F(FileHandlerTest, PutMoreBytesThanAnnouncedErrorsImmediatelyThenDrains)
+{
+    const std::string dest = JoinDir("overflow.txt");
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 20U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, 10U, 0U, false), 20U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    // Announce 10, send 16 in one chunk with CONTINUATION set.
+    DispatchChunk(20U, std::vector<uint8_t>(16U, 'x'), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 2U);
+    {
+        const taz_v1_ErrorInfo err = decode_error(Frames()[1]);
+        EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+        EXPECT_STREQ(err.message, "more bytes than announced size");
+    }
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_FALSE(PathExists(dest));
+    EXPECT_EQ(ActiveStreamCount(), 1U);
+
+    // A further non-final chunk is dropped: no new frame, temp still gone.
+    DispatchChunk(20U, ToBytes("more"), /*last=*/false);
+    EXPECT_EQ(Frames().size(), 2U);
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_EQ(ActiveStreamCount(), 1U);
+
+    // The final chunk releases the stream.
+    DispatchChunk(20U, {}, /*last=*/true);
+    EXPECT_EQ(Frames().size(), 2U);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, PutFewerBytesThanAnnouncedErrorsOnFinalChunkAndReleases)
+{
+    const std::string dest = JoinDir("short.txt");
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 21U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, 10U, 0U, false), 21U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    // Announce 10, final chunk carries only 4.
+    DispatchChunk(21U, ToBytes("abcd"), /*last=*/true);
+    ASSERT_EQ(Frames().size(), 2U);
+    const taz_v1_ErrorInfo err = decode_error(Frames()[1]);
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST);
+    EXPECT_STREQ(err.message, "received 4 bytes, announced 10");
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_FALSE(PathExists(dest));
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+#ifndef _WIN32
+TEST_F(FileHandlerTest, PutWriteFailureUnderFsizeLimitErrorsInternalAndDrains)
+{
+    const ScopedSignalIgnore ignore_sigxfsz(SIGXFSZ);
+    const ScopedFsizeLimit fsize_limit(static_cast<rlim_t>(64U) * 1024U);
+
+    const std::string dest = JoinDir("toolarge.txt");
+    const size_t chunk_size = static_cast<size_t>(64U) * 1024U;
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 22U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(
+                        dest, static_cast<uint64_t>(256U) * 1024U, 0U, false),
+                    22U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    // First write lands exactly at the fsize limit and succeeds.
+    DispatchChunk(22U, std::vector<uint8_t>(chunk_size, 'a'), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_TRUE(PathExists(temp_path));
+
+    // Second write starts at the limit: EFBIG.
+    DispatchChunk(22U, std::vector<uint8_t>(chunk_size, 'b'), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 2U);
+    {
+        const taz_v1_ErrorInfo err = decode_error(Frames()[1]);
+        EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_INTERNAL);
+        EXPECT_STREQ(err.detail, uv_strerror(UV_EFBIG));
+    }
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_FALSE(PathExists(dest));
+    EXPECT_EQ(ActiveStreamCount(), 1U);
+
+    // Later chunks are dropped while DRAINING.
+    DispatchChunk(22U, std::vector<uint8_t>(chunk_size, 'c'), /*last=*/false);
+    EXPECT_EQ(Frames().size(), 2U);
+    EXPECT_EQ(ActiveStreamCount(), 1U);
+
+    DispatchChunk(22U, {}, /*last=*/true);
+    EXPECT_EQ(Frames().size(), 2U);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+    EXPECT_FALSE(PathExists(dest));
+}
+#endif
+
+TEST_F(FileHandlerTest,
+       PutConnectionClosingMidUploadAbortsLeavesNoFileAndReleases)
+{
+    const std::string dest = JoinDir("closemid.txt");
+    const size_t chunk_size = static_cast<size_t>(64U) * 1024U;
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 23U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, chunk_size * 4U, 0U, false), 23U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    DispatchChunk(23U, std::vector<uint8_t>(chunk_size, 'a'), /*last=*/false);
+    DispatchChunk(23U, std::vector<uint8_t>(chunk_size, 'b'), /*last=*/false);
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_TRUE(PathExists(temp_path));
+
+    CloseConnectionAndCancelAll();
+    RunLoop();
+
+    EXPECT_EQ(Frames().size(), 1U);
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_FALSE(PathExists(dest));
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, PutConnectionClosingWhileWriteInFlightAbortsAndReleases)
+{
+    const std::string dest = JoinDir("closeinflight.txt");
+    const size_t chunk_size = static_cast<size_t>(64U) * 1024U;
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 24U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, chunk_size * 2U, 0U, false), 24U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    // Dispatch without running the loop: the write step is submitted to
+    // the pool but has not completed, so the close below lands while
+    // work_in_flight is still true.
+    DispatchChunkNoRun(24U, std::vector<uint8_t>(chunk_size, 'a'),
+                       /*last=*/false);
+    CloseConnectionAndCancelAll();
+    RunLoop();
+
+    EXPECT_EQ(Frames().size(), 1U);
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_FALSE(PathExists(dest));
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, PutShutdownRequestedMidUploadCleansUpAndStopsLoop)
+{
+    const std::string dest = JoinDir("shutdownmid.txt");
+    const size_t chunk_size = static_cast<size_t>(64U) * 1024U;
+    char *temp = taz_fsutil_temp_name(dest.c_str(), 25U);
+    ASSERT_NE(temp, nullptr);
+    const std::string temp_path(temp);
+    free(temp);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_PUT,
+                    encode_put_request(dest, chunk_size * 2U, 0U, false), 25U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ExpectAck(Frames()[0]);
+
+    DispatchChunkNoRun(25U, std::vector<uint8_t>(chunk_size, 'a'),
+                       /*last=*/false);
+    RequestShutdown();
+    RunLoop();
+
+    EXPECT_EQ(Frames().size(), 1U);
+    EXPECT_FALSE(PathExists(temp_path));
+    EXPECT_FALSE(PathExists(dest));
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+
+    taz_work_reset_for_tests();
+}
+
 #ifdef _WIN32
 TEST_F(FileHandlerTest, PutWithReadOnlyPermissionsSetsReadOnlyAttribute)
 {

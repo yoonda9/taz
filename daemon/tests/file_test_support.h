@@ -20,6 +20,9 @@
 #include <uv.h>
 
 #ifndef _WIN32
+#include <csignal>
+
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #endif
@@ -28,6 +31,7 @@
 #include "taz/frame.h"
 #include "taz/fsutil.h"
 #include "taz/v1/common.pb.h"
+#include "taz/work.h"
 
 // ---------------------------------------------------------------------------
 // Fake dispatch (mirrors test_work.cpp's FakeConn): counts conn_ref/
@@ -154,6 +158,51 @@ class ScopedChmod
   private:
     std::string path_;
     int prev_mode_ = 0;
+};
+
+// Pins RLIMIT_FSIZE for the duration of the test (e.g. to force EFBIG on a
+// write past a small cap), restoring the previous limit on scope exit.
+class ScopedFsizeLimit
+{
+  public:
+    explicit ScopedFsizeLimit(rlim_t bytes)
+    {
+        EXPECT_EQ(getrlimit(RLIMIT_FSIZE, &prev_), 0);
+        const struct rlimit lim{bytes, prev_.rlim_max};
+        EXPECT_EQ(setrlimit(RLIMIT_FSIZE, &lim), 0);
+    }
+    ~ScopedFsizeLimit()
+    {
+        (void)setrlimit(RLIMIT_FSIZE, &prev_);
+    }
+    ScopedFsizeLimit(const ScopedFsizeLimit &) = delete;
+    ScopedFsizeLimit &operator=(const ScopedFsizeLimit &) = delete;
+
+  private:
+    struct rlimit prev_{};
+};
+
+// Ignores a signal for the duration of the test (RLIMIT_FSIZE's default
+// SIGXFSZ would otherwise kill the process on the first over-limit write),
+// restoring the previous disposition on scope exit.
+class ScopedSignalIgnore
+{
+  public:
+    explicit ScopedSignalIgnore(int sig)
+        : sig_(sig), prev_(signal(sig, SIG_IGN))
+    {
+        EXPECT_NE(prev_, SIG_ERR);
+    }
+    ~ScopedSignalIgnore()
+    {
+        (void)signal(sig_, prev_);
+    }
+    ScopedSignalIgnore(const ScopedSignalIgnore &) = delete;
+    ScopedSignalIgnore &operator=(const ScopedSignalIgnore &) = delete;
+
+  private:
+    int sig_;
+    void (*prev_)(int);
 };
 #endif
 
@@ -495,6 +544,27 @@ class FileHandlerTest : public ::testing::Test
     void SetConnClosing(int closing)
     {
         conn_.closing = closing;
+    }
+
+    // Mirrors conn_close(): mark the connection closing, then abort every
+    // active stream (handlers/file_transfer.c's abort op never calls
+    // taz_dispatch_stream_done synchronously, so a RunLoop() afterwards is
+    // still needed to observe the cleanup complete).
+    void CloseConnectionAndCancelAll()
+    {
+        conn_.closing = 1;
+        taz_dispatch_cancel_all(&d_);
+    }
+
+    // Mirrors a SIGTERM/SIGINT handler: requests the deferred shutdown that
+    // makes outstanding taz_work_submit_step work finish (closing == 1 in
+    // its done callback) before the loop is allowed to stop. Sticky across
+    // the whole test binary process - callers must pair this with
+    // taz_work_reset_for_tests() before returning (mem: a forgotten reset
+    // broke 49/288 later FileHandlerTest cases under just test-valgrind).
+    void RequestShutdown()
+    {
+        taz_work_request_shutdown(&loop_);
     }
 
   private:

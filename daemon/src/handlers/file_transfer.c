@@ -139,12 +139,26 @@ static void put_cleanup_work(void *user)
     }
 }
 
+/* Nothing is ever written from the cleanup path itself. Once the temp is
+ * gone, either the final chunk has already arrived (recorded by on_chunk
+ * even while ABORTING) or the connection/process is going away (closing) -
+ * either way there is nothing left to wait for, so release now. Otherwise
+ * the client may still send more of the stream it does not yet know
+ * failed: stay registered as DRAINING so those chunks are swallowed
+ * instead of landing on a freed ctx, and release only once the final one
+ * (or a close) arrives. */
 static void put_cleanup_done(void *user, int closing)
 {
     put_ctx_t *pctx = (put_ctx_t *)user;
-    (void)closing; /* nothing is ever written from the cleanup path. */
     pctx->work_in_flight = 0;
-    put_release(pctx);
+
+    if (closing || pctx->final_seen)
+    {
+        put_release(pctx);
+        return;
+    }
+
+    pctx->state = PUT_STATE_DRAINING;
 }
 
 static void put_submit_cleanup(put_ctx_t *pctx)
@@ -299,6 +313,14 @@ static void put_on_chunk(void *user, const taz_frame_header_t *header,
 
     if (pctx->state != PUT_STATE_OPENING && pctx->state != PUT_STATE_RECEIVING)
     {
+        /* ABORTING (cleanup still in flight) or FINISHING: the payload is
+         * dropped either way, but the final flag must still be recorded -
+         * put_cleanup_done needs it to know whether DRAINING has anything
+         * left to wait for. */
+        if (is_final)
+        {
+            pctx->final_seen = 1;
+        }
         return;
     }
 
@@ -356,6 +378,14 @@ static void put_abort(void *user)
 {
     put_ctx_t *pctx = (put_ctx_t *)user;
 
+    if (pctx->state == PUT_STATE_DRAINING)
+    {
+        /* Nothing is in flight in DRAINING (the temp is already gone, the
+         * fd already closed) - free synchronously instead of submitting a
+         * pointless cleanup step. */
+        put_release(pctx);
+        return;
+    }
     if (pctx->state == PUT_STATE_ABORTING)
     {
         return;

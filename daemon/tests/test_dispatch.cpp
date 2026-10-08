@@ -631,6 +631,50 @@ TEST(Dispatch, CommandExecRefsConnWhileInFlightAndUnrefsOnDone)
     ASSERT_EQ(wctx.frames.size(), 1U);
 }
 
+TEST(Dispatch, FileChunkOnCommandExecStreamIsDroppedAndExecStillCompletes)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    const std::string exe = SelfExePath();
+    ASSERT_FALSE(exe.empty());
+    const auto payload =
+        CommandExecRequestBytes(exe, {"--gtest_filter=NoSuchSuite.*"});
+
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   54U, static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+    ASSERT_EQ(d.active_count, 1U);
+
+    // handlers/command.c never calls taz_dispatch_set_stream_ops, so a
+    // FILE_CHUNK for its stream has no sink: dropped silently per
+    // taz_dispatch_frame's routing rule, not routed anywhere, and the
+    // in-flight exec is unaffected.
+    const taz_frame_header_t chunk_h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK),
+                   0U, 54U, 3U);
+    const std::vector<uint8_t> chunk_payload{'a', 'b', 'c'};
+    taz_dispatch_frame(&d, &chunk_h, chunk_payload.data(), TAZ_FRAME_OK,
+                       capture_write, &wctx);
+
+    EXPECT_TRUE(wctx.frames.empty());
+    EXPECT_EQ(d.active_count, 1U);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    EXPECT_EQ(d.active_count, 0U);
+    ASSERT_EQ(wctx.frames.size(), 1U);
+}
+
 TEST(Dispatch, CommandExecSpawnFailureDoesNotRefConn)
 {
     uv_loop_t loop;
