@@ -192,6 +192,23 @@ void ExpectChunk(const std::vector<uint8_t> &frame, uint32_t stream_id,
     }
 }
 
+// Minimal FILE_STAT request encoder, used only to prove the connection/
+// dispatch stays usable after a GET cancel sequence - handlers/file.c owns
+// the real FILE_STAT tests.
+std::vector<uint8_t> encode_stat_request(const std::string &path)
+{
+    taz_v1_FileStatRequest req = taz_v1_FileStatRequest_init_zero;
+    if (!path.empty())
+    {
+        (void)strncpy(req.path, path.c_str(), sizeof(req.path) - 1U);
+    }
+    std::vector<uint8_t> buf(taz_v1_FileStatRequest_size);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(pb_encode(&ostream, taz_v1_FileStatRequest_fields, &req));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
 } // namespace
 
 TEST_F(FileHandlerTest, PutFourByteFileInOneFinalChunk)
@@ -1382,6 +1399,69 @@ TEST_F(FileHandlerTest, CancelSameGetTargetTwiceInARowReturnsTrueThenFalse)
     ASSERT_EQ(Frames().size(), 4U);
     ExpectCancelled(Frames()[3], true); // The first CANCEL resolves once the
                                         // close step completes.
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, CancelAfterGetStreamFinishesReturnsFalse)
+{
+    const std::string src = JoinDir("cancelafterfinish.bin");
+    const std::string content = "abcde";
+    WriteFile(src, content);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                    71U);
+    ASSERT_EQ(Frames().size(), 2U);     // RESPONSE + one final chunk.
+    EXPECT_EQ(ActiveStreamCount(), 0U); // Already released - nothing CLOSING.
+
+    // By the time this CANCEL is dispatched, stream 71 is gone from
+    // active_streams entirely (not merely CLOSING), so taz_dispatch_cancel_
+    // stream takes the same "not found" path as cancelling an unknown id.
+    DispatchRequest(taz_v1_Opcode_OPCODE_CANCEL, encode_cancel_request(71U),
+                    72U);
+    ASSERT_EQ(Frames().size(), 3U);
+    ExpectCancelled(Frames()[2], false);
+
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, ConnectionUsableAfterGetCancelSequence)
+{
+    const std::string src = JoinDir("cancelthenstat.bin");
+    const std::string content(static_cast<size_t>(200U) * 1024U, 'z');
+    WriteFile(src, content);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_FILE_GET, encode_get_request(src),
+                         73U);
+    while (Frames().size() < 2U) // RESPONSE + first chunk.
+    {
+        RunLoopOnce();
+    }
+    ASSERT_EQ(Frames().size(), 2U);
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_CANCEL, encode_cancel_request(73U),
+                    74U);
+    ASSERT_EQ(Frames().size(), 3U);
+    ExpectCancelled(Frames()[2], true);
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+
+    // Same dispatch, a brand-new stream: the GET cancel sequence above left
+    // no residue that would stop an unrelated request from being answered.
+    DispatchStatRequest(encode_stat_request(src), 75U);
+    ASSERT_EQ(Frames().size(), 4U);
+    const taz_frame_header_t h = unpack_header(Frames()[3]);
+    EXPECT_EQ(h.type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+    EXPECT_EQ(h.opcode, static_cast<uint16_t>(taz_v1_Opcode_OPCODE_FILE_STAT));
+    EXPECT_EQ(h.stream_id, 75U);
+
+    taz_v1_FileStatResponse resp = taz_v1_FileStatResponse_init_zero;
+    const std::vector<uint8_t> body = frame_payload(Frames()[3]);
+    pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_FileStatResponse_fields, &resp));
+    EXPECT_EQ(resp.size, content.size());
+
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());
 }
