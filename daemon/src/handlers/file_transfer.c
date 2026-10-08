@@ -1196,9 +1196,8 @@ static void get_read_done(void *user, int closing)
     {
         taz_frame_header_t h;
         h.type = (uint8_t)taz_v1_FrameType_FRAME_TYPE_FILE_CHUNK;
-        h.flags = (uint8_t)(is_last
-                                ? 0
-                                : (int)taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION);
+        h.flags =
+            (uint8_t)(is_last ? 0 : taz_v1_FrameFlag_FRAME_FLAG_CONTINUATION);
         h.opcode = 0U;
         h.length = (uint32_t)n;
         h.stream_id = gctx->stream_id;
