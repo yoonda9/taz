@@ -28,14 +28,8 @@ CMakeUserPresets.json
 .env
 .envrc
 
-# Agent planning: only .agents/planning/ is versioned (the negations also
-# override a global ignore of .agents/)
-!.agents/
-.agents/*
-!.agents/planning/
-
-# ralph orchestrator runtime state; its long-term memories.md is versioned
-.ralph/*
-!.ralph/agent/
-.ralph/agent/*
-!.ralph/agent/memories.md
+# Local agent and code-index state: planning notes, orchestrator runs and
+# memories stay on each developer's machine
+.agents/
+.ralph/
+.cgcignore

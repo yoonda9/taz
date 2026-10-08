@@ -16,8 +16,9 @@ Usage: win.py COMMAND | RECIPE [ARGS...]
 
 Settings come from the environment, falling back to the repo's .env:
     PVE_URL, PVE_TOKEN_ID, PVE_TOKEN   Proxmox API host and token (required)
+    TAZ_WIN_NODE       Proxmox node that holds the templates (required)
     TAZ_WIN_TEMPLATE   template VMID (9101)       TAZ_WIN_VMID     clone VMID (9200)
-    TAZ_WIN_NODE       Proxmox node (pve)        TAZ_WIN_POOL     pool (taz)
+    TAZ_WIN_POOL       pool (taz)
     TAZ_WIN_MEMORY     clone RAM in MB (8192)     TAZ_WIN_KEY      SSH private key
     WIN_USER           Windows user (user)
 """
@@ -98,7 +99,7 @@ def load_config() -> Config:
     return Config(
         api=f"https://{get('PVE_URL')}:8006/api2/json",
         auth=f"PVEAPIToken={get('PVE_TOKEN_ID')}={get('PVE_TOKEN')}",
-        node=get("TAZ_WIN_NODE", "pve"),
+        node=get("TAZ_WIN_NODE"),
         pool=get("TAZ_WIN_POOL", "taz"),
         template=int(get("TAZ_WIN_TEMPLATE", "9101")),
         vmid=int(get("TAZ_WIN_VMID", "9200")),

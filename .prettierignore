@@ -5,6 +5,6 @@ daemon/build/
 c3/src/taz/v1/
 .venv/
 .ruff_cache/
-.agents/scratchpad/
+.agents/
 .ralph/
 uv.lock

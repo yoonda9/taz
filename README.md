@@ -86,12 +86,6 @@ Both protobuf outputs are checked in and regenerated with `just proto`:
 Python to `c3/src/taz/v1/`, C (nanopb) to `daemon/generated/`. CI fails if
 regeneration would produce a diff. See [`rpc/README.md`](rpc/README.md).
 
-## Planning artifacts
-
-The implementation roadmap lives under `.agents/planning/`: requirements
-clarification, research notes, the detailed design, and the step-by-step
-implementation plan.
-
 ## License
 
 TAZ is licensed under the [Mozilla Public License 2.0](LICENSE) (MPL-2.0).

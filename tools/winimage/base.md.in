@@ -26,7 +26,7 @@ q35, SeaBIOS, 4 vCPU (host), 8 GB RAM (balloon min 4 GB), SATA 120 GB (SATA on p
 ## Credentials
 - User **`@@USER@@`** (local admin). Password for `@@USER@@` and the built-in `Administrator`: **`<not filled in: copy WIN_PASSWORD from the TAZ repo .env>`**. sshd accepts password login.
 - SSH sessions are elevated; the default shell is Windows PowerShell 5.1.
-- Authorized key (in `C:\ProgramData\ssh\administrators_authorized_keys`; private key on the Fedora dev VM at `~/.ssh/taz_win_ed25519`):
+- Authorized key (in `C:\ProgramData\ssh\administrators_authorized_keys`; private key on the dev machine at `~/.ssh/taz_win_ed25519`):
   `@@PUBKEY@@`
   fingerprint `@@PUBKEY_FP@@`
 - SSH host keys (identical on every clone and layer):

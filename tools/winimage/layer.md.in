@@ -9,7 +9,7 @@ Disposable Windows build VMs for the TAZ repo, with a warm checkout. **From a TA
 
 ## Credentials
 - User **`@@USER@@`** (local admin). Password for `@@USER@@` and the built-in `Administrator`: **`<not filled in: copy WIN_PASSWORD from the TAZ repo .env>`**. sshd accepts password login.
-- Key: `@@PUBKEY@@` (`@@PUBKEY_FP@@`); private key on the Fedora dev VM at `~/.ssh/taz_win_ed25519`.
+- Key: `@@PUBKEY@@` (`@@PUBKEY_FP@@`); private key on the dev machine at `~/.ssh/taz_win_ed25519`.
 - Host key (identical on every clone; pin it under an alias): `@@HOSTKEY_LINE@@`
 
 ## Manual use

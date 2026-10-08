@@ -371,9 +371,8 @@ TEST_F(ExecSpawnTest, ExtraVarOverridesSameNameEntry)
 
 #ifndef _WIN32
 // POSIX env names are case-sensitive (unlike Windows, where this same
-// request would be an override — see .ralph/specs/step-5-command-exec/
-// plan.md:91-92), so a differently-cased extra entry must be added
-// alongside the original rather than replacing it.
+// request would be an override), so a differently-cased extra entry
+// must be added alongside the original rather than replacing it.
 TEST_F(ExecSpawnTest, DifferentlyCasedNameIsNotTreatedAsOverrideOnPosix)
 {
     set_parent_env("TAZ_TEST_CASE_VAR", "original_value");

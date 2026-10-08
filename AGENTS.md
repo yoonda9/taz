@@ -36,7 +36,7 @@ just win test       # push HEAD to a Windows VM clone, run `just test` there
 just --list         # everything else
 ```
 
-`just win*` needs the Proxmox token in `.env` (see `tools/win.py`). `just
+`just win*` needs the Proxmox token and node in `.env` (see `tools/win.py`). `just
 win-up` clones the TAZ Windows template (a warm `C:\taz`) into VM 9200;
 `just win-reset` and `just win-down` destroy only a clone tagged `win-clone`.
 `just win-rebuild` reinstalls both templates from ISO, e.g. before the
@@ -112,4 +112,4 @@ when mise installs it), and each developer's mise.
 
 - Add dependency-license CI checks (declined by project owner).
 - Write "step #" or roadmap commentary in source code comments; those belong
-  in `docs/` or `.agents/planning/`.
+  in `docs/` or in local, untracked planning notes.
