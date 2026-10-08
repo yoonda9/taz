@@ -1,12 +1,16 @@
-"""FileNamespace: the FILE_CREATE/DELETE/STAT/CHMOD client API (``client.file``)."""
+"""FileNamespace: the FILE_CREATE/DELETE/STAT/CHMOD/PUT client API (``client.file``)."""
 
 from __future__ import annotations
 
 import enum
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from taz.c3.protocol.frame import DEFAULT_MAX_PAYLOAD
+import crc32c
+
+from taz.c3.errors import TazChecksumError, TazError, TazProtocolError
+from taz.c3.protocol.frame import DEFAULT_MAX_PAYLOAD, Frame
 from taz.c3.settings import Keepalive
 from taz.v1 import common_pb2, file_pb2
 
@@ -17,6 +21,14 @@ if TYPE_CHECKING:
     from taz.c3.client import TazClient
 
 _REQUEST_LIMIT = DEFAULT_MAX_PAYLOAD[common_pb2.FRAME_TYPE_REQUEST]
+
+
+def _raise_if_error(frame: Frame) -> None:
+    if frame.type != common_pb2.FRAME_TYPE_ERROR:
+        return
+    info = common_pb2.ErrorInfo()
+    info.ParseFromString(frame.payload)
+    raise TazError(info.code, info.message, info.detail)
 
 
 class Kind(enum.IntEnum):
@@ -135,3 +147,83 @@ class FileNamespace:
             file_pb2.FileChmodResponse,
             keepalive,
         )
+
+    def put(
+        self,
+        local_path: str,
+        remote_path: str,
+        overwrite: bool = False,
+        permissions: int = 0o644,
+        keepalive: Keepalive | None = None,
+    ) -> FileTransfer:
+        """Upload ``local_path`` to ``remote_path`` in FILE_CHUNK-sized pieces.
+
+        Chunk size is the daemon's advertised FILE_CHUNK limit, read once for
+        this call (not a hard-coded size); if the daemon advertises 0, raises
+        ``TazError(NOT_SUPPORTED)`` before sending anything. Raises
+        ``TazChecksumError`` if the daemon's reported checksum does not match
+        the data as sent.
+        """
+        client = self._client
+        kv = keepalive if keepalive is not None else client._keepalive
+        chunk_limit = client._conn.limits[common_pb2.FRAME_TYPE_FILE_CHUNK]
+        if chunk_limit == 0:
+            raise TazError(
+                common_pb2.ERROR_CODE_NOT_SUPPORTED,
+                "daemon accepts no FILE_CHUNK payload",
+            )
+        size = os.stat(local_path).st_size
+
+        req = file_pb2.FilePutRequest(
+            dest=remote_path,
+            size=size,
+            permissions=permissions,
+            overwrite=overwrite,
+        )
+        stream_id = client._conn.send_request(
+            common_pb2.OPCODE_FILE_PUT, req.SerializeToString()
+        )
+
+        frame = client._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+        )
+        _raise_if_error(frame)
+        ack_resp = file_pb2.FilePutResponse()
+        ack_resp.ParseFromString(frame.payload)
+        if ack_resp.WhichOneof("phase") != "ack" or not ack_resp.ack.ready:
+            raise TazProtocolError("FILE_PUT: expected Ack{ready=true}")
+
+        crc = 0
+        sent = 0
+        try:
+            with open(local_path, "rb") as f:
+                while True:
+                    data = f.read(chunk_limit)
+                    sent += len(data)
+                    last = sent >= size
+                    crc = crc32c.crc32c(data, crc)
+                    client._conn.send_file_chunk(stream_id, data, last=last)
+                    if last:
+                        break
+        except OSError:
+            if client._dispatcher._cancel_advertised():
+                client.cancel(stream_id, keepalive=kv)
+            raise
+
+        frame = client._dispatcher.recv_response(
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+        )
+        _raise_if_error(frame)
+        confirm_resp = file_pb2.FilePutResponse()
+        confirm_resp.ParseFromString(frame.payload)
+        if confirm_resp.WhichOneof("phase") != "confirm":
+            raise TazProtocolError("FILE_PUT: expected Confirmation")
+        if confirm_resp.confirm.bytes_written != size:
+            raise TazProtocolError(
+                f"FILE_PUT: daemon wrote {confirm_resp.confirm.bytes_written}"
+                f" bytes, announced {size}"
+            )
+        checksum = crc.to_bytes(4, "little")
+        if confirm_resp.confirm.checksum != checksum:
+            raise TazChecksumError(checksum, confirm_resp.confirm.checksum)
+        return FileTransfer(size=size, checksum=checksum)
