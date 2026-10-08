@@ -196,6 +196,113 @@ size_t taz_fsutil_root_prefix_len(const char *path)
     return 0U;
 }
 
+char *taz_fsutil_dirname(const char *path)
+{
+    size_t root_len = taz_fsutil_root_prefix_len(path);
+    size_t end = strlen(path);
+    size_t out_len;
+    char *out;
+
+    while ((end > root_len) && taz_fsutil_is_sep(path[end - 1U]))
+    {
+        end--;
+    }
+
+    if (end > root_len)
+    {
+        size_t i = end;
+        size_t sep_pos = 0U;
+        int found_sep = 0;
+
+        while (i > 0U)
+        {
+            i--;
+            if (taz_fsutil_is_sep(path[i]))
+            {
+                sep_pos = i;
+                found_sep = 1;
+                break;
+            }
+        }
+
+        /* A separator that is itself part of the root prefix (POSIX "/",
+         * or a UNC root's trailing separator) means the whole path is
+         * under the root with no further component boundary: dirname is
+         * the root, kept with its own trailing separator. Any other
+         * separator is a real component boundary: drop it. */
+        if (!found_sep || ((sep_pos + 1U) <= root_len))
+        {
+            out_len = root_len;
+        }
+        else
+        {
+            out_len = sep_pos;
+        }
+    }
+    else
+    {
+        /* Nothing left beyond the root prefix (e.g. "/" or ""). */
+        out_len = root_len;
+    }
+
+    if (out_len == 0U)
+    {
+        out = (char *)malloc(2U);
+        if (out == NULL)
+        {
+            return NULL;
+        }
+        out[0] = '.';
+        out[1] = '\0';
+        return out;
+    }
+
+    out = (char *)malloc(out_len + 1U);
+    if (out == NULL)
+    {
+        return NULL;
+    }
+    (void)memcpy(out, path, out_len);
+    out[out_len] = '\0';
+    return out;
+}
+
+/* "<dest>.taz-<stream_id>.tmp": the FILE_PUT temp file name. */
+#define TEMP_NAME_PREFIX ".taz-"
+#define TEMP_NAME_SUFFIX ".tmp"
+
+char *taz_fsutil_temp_name(const char *dest, uint32_t stream_id)
+{
+    char id_buf[sizeof("4294967295")]; /* decimal digits of UINT32_MAX + NUL */
+    size_t dest_len = strlen(dest);
+    size_t prefix_len = sizeof(TEMP_NAME_PREFIX) - 1U;
+    size_t suffix_len = sizeof(TEMP_NAME_SUFFIX) - 1U;
+    size_t id_len;
+    size_t pos;
+    char *out;
+
+    (void)snprintf(id_buf, sizeof(id_buf), "%lu", (unsigned long)stream_id);
+    id_len = strlen(id_buf);
+
+    out = (char *)malloc(dest_len + prefix_len + id_len + suffix_len + 1U);
+    if (out == NULL)
+    {
+        return NULL;
+    }
+
+    pos = 0U;
+    (void)memcpy(out + pos, dest, dest_len);
+    pos += dest_len;
+    (void)memcpy(out + pos, TEMP_NAME_PREFIX, prefix_len);
+    pos += prefix_len;
+    (void)memcpy(out + pos, id_buf, id_len);
+    pos += id_len;
+    (void)memcpy(out + pos, TEMP_NAME_SUFFIX, suffix_len);
+    pos += suffix_len;
+    out[pos] = '\0';
+    return out;
+}
+
 void taz_fsutil_truncate_utf8(const char *name, char *buf, size_t bufsize)
 {
     size_t len;

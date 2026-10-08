@@ -41,6 +41,21 @@ extern "C"
      * separator). 0 when path has no such prefix. */
     size_t taz_fsutil_root_prefix_len(const char *path);
 
+    /* Heap-allocate the parent directory of path, the way POSIX dirname(3)
+     * would, but without ever mutating or returning a pointer into path.
+     * Trailing separators are ignored before splitting off the last
+     * component. A root (POSIX "/", a Windows drive root, or a UNC root)
+     * dirnames to itself, including its trailing separator. No separator at
+     * all (after stripping trailing ones) dirnames to the root prefix if
+     * there is one (e.g. "C:x" -> "C:"), otherwise to ".". Caller frees the
+     * result with free(). Returns NULL on OOM. */
+    char *taz_fsutil_dirname(const char *path);
+
+    /* Heap-allocate "<dest>.taz-<stream_id>.tmp" (stream_id in decimal), the
+     * FILE_PUT temp file name in dest's own directory. Caller frees the
+     * result with free(). Returns NULL on OOM. */
+    char *taz_fsutil_temp_name(const char *dest, uint32_t stream_id);
+
     /* Copies name into buf (NUL-terminated, at most bufsize - 1 bytes of
      * name). When name does not fit, the copy is trimmed at the last
      * complete UTF-8 codepoint boundary rather than mid-codepoint (DEC-009):

@@ -250,6 +250,132 @@ TEST(RootPrefixLen, UncRootIsThroughShareSeparator)
 #endif /* _WIN32 */
 
 // ---------------------------------------------------------------------------
+// taz_fsutil_dirname
+// ---------------------------------------------------------------------------
+
+TEST(Dirname, ThreeComponents)
+{
+    char *out = taz_fsutil_dirname("a/b/c");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "a/b");
+    free(out);
+}
+
+TEST(Dirname, TrailingSeparatorIsIgnored)
+{
+    char *out = taz_fsutil_dirname("a/b/");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "a");
+    free(out);
+}
+
+TEST(Dirname, SingleComponentUnderRootIsRoot)
+{
+    char *out = taz_fsutil_dirname("/x");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "/");
+    free(out);
+}
+
+TEST(Dirname, RootDirnamesToItself)
+{
+    char *out = taz_fsutil_dirname("/");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "/");
+    free(out);
+}
+
+TEST(Dirname, NoSeparatorIsDot)
+{
+    char *out = taz_fsutil_dirname("x");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, ".");
+    free(out);
+}
+
+TEST(Dirname, EmptyPathIsDot)
+{
+    char *out = taz_fsutil_dirname("");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, ".");
+    free(out);
+}
+
+#ifdef _WIN32
+
+TEST(Dirname, DriveWithBackslashRoot)
+{
+    char *out = taz_fsutil_dirname("C:\\x");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "C:\\");
+    free(out);
+}
+
+TEST(Dirname, DriveWithForwardSlashRoot)
+{
+    char *out = taz_fsutil_dirname("C:/x");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "C:/");
+    free(out);
+}
+
+TEST(Dirname, DriveWithTwoComponents)
+{
+    char *out = taz_fsutil_dirname("C:\\a\\b");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "C:\\a");
+    free(out);
+}
+
+TEST(Dirname, BareDriveNoSeparatorIsDrive)
+{
+    char *out = taz_fsutil_dirname("C:x");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "C:");
+    free(out);
+}
+
+TEST(Dirname, UncRootDirnamesToItself)
+{
+    char *out = taz_fsutil_dirname("\\\\server\\share\\f");
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "\\\\server\\share\\");
+    free(out);
+}
+
+#endif /* _WIN32 */
+
+// ---------------------------------------------------------------------------
+// taz_fsutil_temp_name
+// ---------------------------------------------------------------------------
+
+TEST(TempName, AppendsStreamIdSuffix)
+{
+    char *out = taz_fsutil_temp_name("/d/f", 7U);
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, "/d/f.taz-7.tmp");
+    free(out);
+}
+
+TEST(TempName, MaxStreamIdIsFormattedInDecimal)
+{
+    char *out = taz_fsutil_temp_name("", 0xFFFFFFFFU);
+    ASSERT_NE(out, nullptr);
+    EXPECT_STREQ(out, ".taz-4294967295.tmp");
+    free(out);
+}
+
+TEST(TempName, LongDestStillSucceeds)
+{
+    const std::string dest(1023, 'd');
+    char *out = taz_fsutil_temp_name(dest.c_str(), 1U);
+    ASSERT_NE(out, nullptr);
+    const std::string expected = dest + ".taz-1.tmp";
+    EXPECT_EQ(std::string(out), expected);
+    free(out);
+}
+
+// ---------------------------------------------------------------------------
 // taz_passwd_name_from_uid
 // ---------------------------------------------------------------------------
 
