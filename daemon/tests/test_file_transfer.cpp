@@ -179,7 +179,9 @@ TEST_F(FileHandlerTest, PutTwoHundredKiBInSixtyFourKiBChunks)
     size_t sent = 0U;
     while (sent < content.size())
     {
-        const size_t n = std::min(chunk_size, content.size() - sent);
+        const size_t n = (chunk_size < content.size() - sent)
+                             ? chunk_size
+                             : (content.size() - sent);
         const std::vector<uint8_t> bytes(
             content.begin() + static_cast<long>(sent),
             content.begin() + static_cast<long>(sent + n));
