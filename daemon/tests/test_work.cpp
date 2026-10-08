@@ -448,4 +448,6 @@ TEST(Work, RequestShutdownOnStepWaitsAndReportsClosing)
 
     uv_sem_destroy(&w.started);
     uv_sem_destroy(&w.release);
+
+    taz_work_reset_for_tests();
 }
