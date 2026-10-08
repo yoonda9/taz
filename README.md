@@ -91,3 +91,14 @@ regeneration would produce a diff. See [`rpc/README.md`](rpc/README.md).
 The implementation roadmap lives under `.agents/planning/`: requirements
 clarification, research notes, the detailed design, and the step-by-step
 implementation plan.
+
+## License
+
+TAZ is licensed under the [Mozilla Public License 2.0](LICENSE) (MPL-2.0).
+You can use it in any project, commercial or not. If you distribute modified
+TAZ files, you must make their source available under the MPL; your own code
+in separate files, such as test suites that import `taz`, can use any license.
+
+This Source Code Form is subject to the terms of the Mozilla Public License,
+v. 2.0. If a copy of the MPL was not distributed with this file, You can
+obtain one at https://mozilla.org/MPL/2.0/.

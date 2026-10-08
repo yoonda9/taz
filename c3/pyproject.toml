@@ -3,6 +3,8 @@ name = "test-agent-zero"
 dynamic = ["version"]
 description = "Python client (c3) for Test Agent Zero, the taz remote test daemon"
 readme = "README.md"
+license = "MPL-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "David Yoon", email = "" }
 ]
