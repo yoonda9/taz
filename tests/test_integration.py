@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import signal
+import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Generator
 from pathlib import Path
+from typing import Any
 
 import google_crc32c
 import psutil
@@ -22,9 +27,15 @@ from taz.c3 import (
     TazError,
 )
 from taz.c3.file import Kind
-from taz.v1 import command_pb2, common_pb2, daemon_control_pb2, file_pb2
+from taz.v1 import command_pb2, common_pb2, daemon_control_pb2, file_pb2, process_pb2
 
 from tests.conftest import Daemon
+
+_PROCESS_OPCODES = {
+    common_pb2.OPCODE_PROCESS_LIST,
+    common_pb2.OPCODE_PROCESS_KILL,
+    common_pb2.OPCODE_PROCESS_INFO,
+}
 
 _FILE_OPCODES = {
     common_pb2.OPCODE_FILE_CREATE,
@@ -82,6 +93,85 @@ def _process_gone(pid: int) -> bool:
         return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return True
+
+
+_SLEEP_SNIPPET = "import os, time; print(os.getpid(), flush=True); time.sleep(60)"
+
+_SIGUSR1_SNIPPET = (
+    "import os, signal, time\n"
+    "print(os.getpid(), flush=True)\n"
+    "signal.signal(signal.SIGUSR1, lambda *_: print('usr1', flush=True))\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+_INVALID_UTF8_COMM_SNIPPET = (
+    "import os, time\n"
+    "print(os.getpid(), flush=True)\n"
+    "with open('/proc/self/comm', 'wb') as f:\n"
+    "    f.write(b'ab\\xff\\xfecd')\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+def _spawn_helper(snippet: str, **popen_kw: Any) -> tuple[subprocess.Popen[bytes], int]:
+    """Spawn ``python -c <snippet>``; the snippet must start with
+    ``print(os.getpid(), flush=True)``. Returns the ``Popen`` and that
+    printed pid, which on Windows can differ from ``Popen.pid`` when the
+    venv's ``python.exe`` is a launcher for the real interpreter.
+    """
+    proc = subprocess.Popen([PY, "-c", snippet], stdout=subprocess.PIPE, **popen_kw)
+    assert proc.stdout is not None
+    line = proc.stdout.readline()
+    return proc, int(line)
+
+
+def _unused_pid() -> int:
+    """A pid guaranteed to name no process on this host."""
+    if sys.platform == "win32":
+        pids = set(psutil.pids())
+        candidate = 0x7FFFFFFC
+        while candidate in pids:
+            candidate -= 4
+        return candidate
+    pid_max = int(Path("/proc/sys/kernel/pid_max").read_text())
+    return pid_max + 1
+
+
+def _python_name_filter() -> str:
+    """The substring that matches the helper's reported process name: the
+    interpreter's basename, cut to the kernel's 15-byte ``comm`` limit on
+    Linux.
+    """
+    name = os.path.basename(sys.executable)
+    return name[:15] if sys.platform != "win32" else name
+
+
+@pytest.fixture
+def spawn_helper() -> Generator[
+    Callable[..., tuple[subprocess.Popen[bytes], int]], None, None
+]:
+    """Factory for ``_spawn_helper`` that kills, waits and confirms every
+    helper spawned during the test is gone (by its printed pid) on
+    teardown."""
+    spawned: list[tuple[subprocess.Popen[bytes], int]] = []
+
+    def _spawn(snippet: str, **popen_kw: Any) -> tuple[subprocess.Popen[bytes], int]:
+        proc, pid = _spawn_helper(snippet, **popen_kw)
+        spawned.append((proc, pid))
+        return proc, pid
+
+    yield _spawn
+
+    for proc, pid in spawned:
+        if proc.poll() is None:
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=10)
+        deadline = time.monotonic() + 5
+        while not _process_gone(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
 
 
 class TestPing:
@@ -1108,6 +1198,229 @@ class TestFileTransfer:
         result = taz_client.file.put(str(src), str(dest))
         assert result == FileTransfer(size=len(data), checksum=self._crc(data))
         assert dest.read_bytes() == data
+
+
+class TestProcessOps:
+    """``PROCESS_LIST``/``KILL``/``INFO`` through the typed client API."""
+
+    def test_list_includes_daemon_pid_with_psutil_cross_checks(
+        self, taz_client: TazClient, daemon: Daemon
+    ) -> None:
+        entries = {p.pid: p for p in taz_client.process.list()}
+        assert daemon.proc.pid in entries
+        entry = entries[daemon.proc.pid]
+        ref = psutil.Process(daemon.proc.pid)
+        assert entry.name == ref.name()
+        expected_users = {ref.username()}
+        if sys.platform != "win32":
+            expected_users.add(str(os.getuid()))
+        assert entry.user in expected_users
+        assert entry.state != ""
+        assert entry.memory_bytes > 0
+        assert entry.cpu_percent >= 0
+
+    def test_list_filter_includes_helper(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        pids = {p.pid for p in taz_client.process.list(filter=_python_name_filter())}
+        assert pid in pids
+
+    def test_list_nonsense_filter_returns_empty(self, taz_client: TazClient) -> None:
+        assert taz_client.process.list(filter="no-such-process-name-7f3a") == []
+
+    def test_info_cross_checks_with_psutil_and_open_files(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+        tmp_path: Path,
+    ) -> None:
+        scratch = tmp_path / "held-open.bin"
+        scratch.write_bytes(b"")
+        snippet = (
+            "import os, time\n"
+            "print(os.getpid(), flush=True)\n"
+            f"f = open({str(scratch)!r}, 'rb')\n"
+            "time.sleep(60)\n"
+        )
+        _, pid = spawn_helper(snippet)
+        ref = psutil.Process(pid)
+
+        info = taz_client.process.info(pid)
+        assert info.pid == pid
+        assert "time.sleep" in info.command_line
+        assert info.name == ref.name()
+        assert abs(info.start_time - int(ref.create_time())) <= 1
+        expected_users = {ref.username()}
+        if sys.platform != "win32":
+            expected_users.add(str(os.getuid()))
+        assert info.user in expected_users
+        if sys.platform != "win32":
+            assert str(scratch) in info.open_files
+        else:
+            assert info.open_files == []
+
+    def test_kill_then_info_and_kill_again_not_found(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        proc, pid = spawn_helper(_SLEEP_SNIPPET)
+        assert taz_client.process.kill(pid) is True
+        proc.wait(timeout=10)
+        deadline = time.monotonic() + 5
+        while not _process_gone(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _process_gone(pid)
+
+        with pytest.raises(TazError) as exc_info:
+            taz_client.process.info(pid)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+        # The pid is free now and could be reused. On POSIX, SIGCONT does
+        # nothing to a process that took it over. Windows has no harmless
+        # signal, so there the second kill runs only while proc's handle
+        # keeps the pid from being reused (no venv launcher in between).
+        if sys.platform != "win32":
+            with pytest.raises(TazError) as exc_info:
+                taz_client.process.kill(pid, signal=signal.SIGCONT)
+            assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+        elif pid == proc.pid:
+            with pytest.raises(TazError) as exc_info:
+                taz_client.process.kill(pid)
+            assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_unused_pid_not_found_for_kill_and_info(
+        self, taz_client: TazClient
+    ) -> None:
+        pid = _unused_pid()
+        with pytest.raises(TazError) as exc_info:
+            taz_client.process.kill(pid)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+        with pytest.raises(TazError) as exc_info:
+            taz_client.process.info(pid)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_kill_and_info_reject_pid_zero(self, taz_client: TazClient) -> None:
+        # SIGCONT, not the default SIGTERM: the daemon shares pytest's
+        # process group, which kill(0, ...) signals, so a regressed guard
+        # must not be able to stop the test run.
+        with pytest.raises(TazError) as exc_info:
+            if sys.platform != "win32":
+                taz_client.process.kill(0, signal=signal.SIGCONT)
+            else:
+                taz_client.process.kill(0)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+        with pytest.raises(TazError) as exc_info:
+            taz_client.process.info(0)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+
+    def test_kill_and_info_reject_pid_above_int32_max(
+        self, taz_client: TazClient
+    ) -> None:
+        pid = 2**31
+        with pytest.raises(TazError) as exc_info:
+            taz_client.process.kill(pid)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+        with pytest.raises(TazError) as exc_info:
+            taz_client.process.info(pid)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+
+    def test_kill_negative_signal_rejected_helper_stays_alive(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        proc, pid = spawn_helper(_SLEEP_SNIPPET)
+        with pytest.raises(TazError) as exc_info:
+            taz_client.process.kill(pid, signal=-1)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+        assert proc.poll() is None
+
+    def test_capabilities_advertise_process_opcodes_not_monitor(
+        self, taz_client: TazClient
+    ) -> None:
+        ops = set(taz_client.capabilities().operations)
+        assert ops >= _PROCESS_OPCODES
+        assert common_pb2.OPCODE_PROCESS_MONITOR not in ops
+
+    def test_demo_list_and_info(self, taz_client: TazClient, daemon: Daemon) -> None:
+        entries = taz_client.process.list()
+        lines = [f"PID {p.pid}: {p.name} ({p.state})" for p in entries]
+        for line in lines:
+            print(line)
+        assert len({p.pid for p in entries}) == len(entries)
+
+        command_line = taz_client.process.info(pid=daemon.proc.pid).command_line
+        print(command_line)
+        assert "tazd" in command_line
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="SIGUSR1 does not exist on Windows"
+    )
+    def test_kill_with_sigusr1_runs_helper_handler(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        proc, pid = spawn_helper(_SIGUSR1_SNIPPET)
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == b"ready"
+        if sys.platform != "win32":
+            assert taz_client.process.kill(pid, signal=signal.SIGUSR1) is True
+        assert proc.stdout.readline().strip() == b"usr1"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="process names are arbitrary bytes only on Linux (/proc/self/comm)",
+    )
+    def test_invalid_utf8_comm_sanitized_in_list_and_info(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        proc, pid = spawn_helper(_INVALID_UTF8_COMM_SNIPPET)
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == b"ready"
+
+        entries = {p.pid: p for p in taz_client.process.list()}
+        assert entries[pid].name == "ab��cd"
+        assert taz_client.process.info(pid).name == "ab��cd"
+
+    def test_closing_socket_mid_process_list_stays_usable(self, daemon: Daemon) -> None:
+        req = process_pb2.ProcessListRequest(filter="")
+
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        # 32 in-flight requests, never read: with the default libuv thread
+        # pool (4 workers) this guarantees some are queued and some running
+        # when the socket closes underneath them.
+        for _ in range(32):
+            victim._conn.send_request(
+                common_pb2.OPCODE_PROCESS_LIST, req.SerializeToString()
+            )
+        victim.close()
+
+        with TazClient("127.0.0.1", daemon.port) as other:
+            start = time.monotonic()
+            other.version()
+            assert time.monotonic() - start < 2.0
+            other.process.list()
+
+    def test_sigterm_mid_process_list_exit_audit_passes(
+        self, taz_client: TazClient, daemon: Daemon
+    ) -> None:
+        req = process_pb2.ProcessListRequest(filter="")
+        for _ in range(32):
+            taz_client._conn.send_request(
+                common_pb2.OPCODE_PROCESS_LIST, req.SerializeToString()
+            )
+        daemon.stop()
+        # Nothing further to assert here: the daemon fixture's teardown
+        # re-stops (idempotent) and audits the exit for sanitizer reports
+        # and a non-zero code.
 
 
 class TestConfigGet:
