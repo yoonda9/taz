@@ -235,6 +235,16 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/build_info.c.in
 # ---------------------------------------------------------------------------
 # Core logic library (frame pack/unpack/validate; shared by daemon and tests)
 # ---------------------------------------------------------------------------
+# Process enumeration/inspection/kill lives behind taz/process.h, split by
+# platform the same way TAZ_PLATFORM_SRC splits signal handling below, but
+# built into taz_core (not just tazd) so the unit tests can link it.
+set(TAZ_PROCESS_SRC "")
+if(WIN32)
+    set(TAZ_PROCESS_SRC src/platform/process_win32.c)
+else()
+    set(TAZ_PROCESS_SRC src/platform/process_linux.c)
+endif()
+
 add_library(
     taz_core STATIC
     src/frame.c
@@ -256,6 +266,7 @@ add_library(
     src/handlers/file.c
     src/handlers/file_transfer.c
     src/handlers/cancel.c
+    ${TAZ_PROCESS_SRC}
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
 # Stop <windows.h> from including the old <winsock.h>, which clashes with the
