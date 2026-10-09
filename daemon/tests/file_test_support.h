@@ -599,6 +599,14 @@ class FileHandlerTest : public ::testing::Test
         taz_dispatch_notify_writable(&d_);
     }
 
+    // The real uv_loop_t backing this fixture, for tests that need to
+    // uv_spawn a real child alongside a dispatched request (e.g.
+    // PROCESS_KILL against a live sleeper).
+    uv_loop_t *Loop()
+    {
+        return &loop_;
+    }
+
   private:
     uv_loop_t loop_{};
     taz_dispatch_t d_{};

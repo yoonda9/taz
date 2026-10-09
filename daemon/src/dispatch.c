@@ -7,6 +7,7 @@
 #include "handlers/config.h"
 #include "handlers/file.h"
 #include "handlers/file_transfer.h"
+#include "handlers/process.h"
 #include "handlers/version.h"
 #include "taz/error.h"
 #include "taz/v1/common.pb.h"
@@ -318,6 +319,12 @@ static const opcode_entry_t OPCODE_TABLE[] = {
     {NULL, handle_file_put, (uint16_t)taz_v1_Opcode_OPCODE_FILE_PUT, true},
     {NULL, handle_cancel, (uint16_t)taz_v1_Opcode_OPCODE_CANCEL, true},
     {NULL, handle_file_get, (uint16_t)taz_v1_Opcode_OPCODE_FILE_GET, true},
+    {NULL, handle_process_list, (uint16_t)taz_v1_Opcode_OPCODE_PROCESS_LIST,
+     true},
+    {handle_process_kill, NULL, (uint16_t)taz_v1_Opcode_OPCODE_PROCESS_KILL,
+     false},
+    {NULL, handle_process_info, (uint16_t)taz_v1_Opcode_OPCODE_PROCESS_INFO,
+     true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))
