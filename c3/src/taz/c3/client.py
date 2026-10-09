@@ -11,6 +11,7 @@ from taz.c3.connection import Connection
 from taz.c3.directory import DirectoryNamespace
 from taz.c3.errors import TazError
 from taz.c3.file import FileNamespace
+from taz.c3.process import ProcessNamespace
 from taz.c3.protocol.dispatch import Dispatcher
 from taz.c3.protocol.frame import Frame
 from taz.c3.settings import Backlog, Keepalive
@@ -52,6 +53,7 @@ class TazClient:
         self.command = CommandNamespace(self)
         self.file = FileNamespace(self)
         self.directory = DirectoryNamespace(self)
+        self.process = ProcessNamespace(self)
 
     # ------------------------------------------------------------------
     # Connection lifecycle

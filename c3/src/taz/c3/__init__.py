@@ -9,6 +9,7 @@ from taz.c3.errors import (
     TazProtocolError,
 )
 from taz.c3.file import FileStat, FileTransfer, Kind
+from taz.c3.process import ProcessDetail, ProcessInfo
 from taz.c3.settings import Backlog, Keepalive
 
 __all__ = [
@@ -19,6 +20,8 @@ __all__ = [
     "FileTransfer",
     "Keepalive",
     "Kind",
+    "ProcessDetail",
+    "ProcessInfo",
     "TazChecksumError",
     "TazClient",
     "TazConnectionError",
