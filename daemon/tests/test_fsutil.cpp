@@ -180,6 +180,179 @@ TEST(TruncateUtf8, ZeroBufsizeIsANoOp)
 }
 
 // ---------------------------------------------------------------------------
+// taz_fsutil_sanitize_utf8
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+// Sanitizes in (using in.size() as in_len) into a bufsize-byte buffer and
+// returns the result as a std::string. Not for inputs whose expected
+// output itself contains an embedded NUL byte: those tests must inspect
+// the raw buffer instead, since std::string's own constructor would stop
+// at the first NUL.
+std::string SanitizeUtf8(const std::string &in, size_t bufsize)
+{
+    std::vector<char> buf(bufsize == 0U ? 1U : bufsize);
+    taz_fsutil_sanitize_utf8(in.data(), in.size(), buf.data(), bufsize);
+    return (bufsize == 0U) ? std::string() : std::string(buf.data());
+}
+
+} // namespace
+
+TEST(SanitizeUtf8, AsciiIsCopiedVerbatim)
+{
+    EXPECT_EQ(SanitizeUtf8("abc", 16U), "abc");
+}
+
+TEST(SanitizeUtf8, ValidTwoByteCodepointIsCopiedVerbatim)
+{
+    EXPECT_EQ(SanitizeUtf8("h\xC3\xA9llo", 16U), "h\xC3\xA9llo");
+}
+
+TEST(SanitizeUtf8, ValidThreeByteCodepointIsCopiedVerbatim)
+{
+    EXPECT_EQ(SanitizeUtf8("\xE6\x97\xA5\xE6\x9C\xAC", 16U),
+              "\xE6\x97\xA5\xE6\x9C\xAC");
+}
+
+TEST(SanitizeUtf8, ValidFourByteCodepointIsCopiedVerbatim)
+{
+    EXPECT_EQ(SanitizeUtf8("\xF0\x9F\x98\x80", 16U), "\xF0\x9F\x98\x80");
+}
+
+TEST(SanitizeUtf8, TwoInvalidLeadBytesBecomeTwoReplacementChars)
+{
+    // FF and FE are never valid lead bytes; each is its own one-byte
+    // maximal subpart.
+    EXPECT_EQ(SanitizeUtf8("ab\xFF"
+                           "\xFE"
+                           "cd",
+                           32U),
+              "ab\xEF\xBF\xBD\xEF\xBF"
+              "\xBD"
+              "cd");
+}
+
+TEST(SanitizeUtf8, StrayContinuationByteBecomesOneReplacementChar)
+{
+    EXPECT_EQ(SanitizeUtf8("\x80", 16U), "\xEF\xBF\xBD");
+}
+
+TEST(SanitizeUtf8, TruncatedSequenceAtEndOfInputBecomesOneReplacementChar)
+{
+    // E2 82 is the first two bytes of a well-formed 3-byte sequence with
+    // no third byte: the maximal subpart is both bytes, replaced once.
+    EXPECT_EQ(SanitizeUtf8("\xE2\x82", 16U), "\xEF\xBF\xBD");
+}
+
+TEST(SanitizeUtf8, TruncatedSequenceFollowedByAsciiIsReplacedThenCopied)
+{
+    EXPECT_EQ(SanitizeUtf8("\xE2\x82"
+                           "A",
+                           16U),
+              "\xEF\xBF\xBD"
+              "A");
+}
+
+TEST(SanitizeUtf8, OverlongEncodingBecomesTwoReplacementChars)
+{
+    // C0 AF is an overlong 2-byte encoding of '/'. C0 is never a valid
+    // lead byte (maximal subpart length 1); the following AF is then a
+    // stray continuation byte (also length 1).
+    EXPECT_EQ(SanitizeUtf8("\xC0\xAF", 16U), "\xEF\xBF\xBD\xEF\xBF\xBD");
+}
+
+TEST(SanitizeUtf8, SurrogateBecomesThreeReplacementChars)
+{
+    // ED A0 80 would encode U+D800, a UTF-16 surrogate and never a valid
+    // scalar value. ED only accepts 80-9F as its second byte, so the
+    // maximal subpart is ED alone; A0 and 80 are then each a stray
+    // continuation byte.
+    EXPECT_EQ(SanitizeUtf8("\xED\xA0\x80", 16U),
+              "\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD");
+}
+
+TEST(SanitizeUtf8, OutOfRangeCodepointBecomesFourReplacementChars)
+{
+    // F4 90 80 80 would encode U+110000, past U+10FFFF. F4 only accepts
+    // 80-8F as its second byte, so the maximal subpart is F4 alone; 90, 80
+    // and 80 are then each a stray continuation byte.
+    EXPECT_EQ(SanitizeUtf8("\xF4\x90\x80\x80", 16U),
+              "\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD");
+}
+
+TEST(SanitizeUtf8, EmbeddedNulIsCopiedAsAByte)
+{
+    char buf[8];
+    std::memset(buf, '\x7f', sizeof(buf));
+    taz_fsutil_sanitize_utf8("a\0b", 3U, buf, sizeof(buf));
+    EXPECT_EQ(buf[0], 'a');
+    EXPECT_EQ(buf[1], '\0');
+    EXPECT_EQ(buf[2], 'b');
+    EXPECT_EQ(buf[3], '\0'); // the function's own terminator
+}
+
+TEST(SanitizeUtf8, EmptyInputProducesEmptyString)
+{
+    EXPECT_EQ(SanitizeUtf8("", 16U), "");
+}
+
+TEST(SanitizeUtf8, ZeroBufsizeIsANoOp)
+{
+    char buf[1] = {'x'};
+    taz_fsutil_sanitize_utf8("abc", 3U, buf, 0U);
+    EXPECT_EQ(buf[0], 'x');
+}
+
+TEST(SanitizeUtf8, FourByteCodepointThatDoesNotFitIsDropped)
+{
+    char buf[4];
+    taz_fsutil_sanitize_utf8("\xF0\x9F\x98\x80", 4U, buf, 4U);
+    EXPECT_STREQ(buf, "");
+}
+
+TEST(SanitizeUtf8, FourByteCodepointThatExactlyFitsIsKept)
+{
+    char buf[5];
+    taz_fsutil_sanitize_utf8("\xF0\x9F\x98\x80", 4U, buf, 5U);
+    EXPECT_STREQ(buf, "\xF0\x9F\x98\x80");
+}
+
+TEST(SanitizeUtf8, ReplacementCharThatDoesNotFitIsDropped)
+{
+    // A single invalid byte needs a 3-byte U+FFFD plus the NUL (4 bytes);
+    // bufsize 3 leaves room for only 2, so the replacement is dropped
+    // rather than split.
+    char buf[3];
+    taz_fsutil_sanitize_utf8("\xFF", 1U, buf, 3U);
+    EXPECT_STREQ(buf, "");
+}
+
+TEST(SanitizeUtf8, OverflowIsCutAtACodepointBoundaryNotSplitMidCodepoint)
+{
+    // Alternating 1-byte ASCII and 3-byte (EUR SIGN) codepoints, 4 bytes
+    // per pair, built past 300 bytes. Into a 256-byte buffer (capacity
+    // 255), the 64th pair's 3-byte codepoint would occupy capacity bytes
+    // 253-255 - one byte past the end - so it falls right across the cut
+    // and must be dropped whole, not split.
+    std::string in;
+    while (in.size() < 300U)
+    {
+        in += "a";
+        in += "\xE2\x82\xAC";
+    }
+
+    std::string out = SanitizeUtf8(in, 256U);
+
+    EXPECT_EQ(out.size(), 253U);
+    EXPECT_EQ(out.back(), 'a');
+    // Re-sanitizing the output must reproduce it unchanged: no partial
+    // codepoint was left at the end for the validator to catch.
+    EXPECT_EQ(SanitizeUtf8(out, out.size() + 1U), out);
+}
+
+// ---------------------------------------------------------------------------
 // taz_fsutil_is_sep
 // ---------------------------------------------------------------------------
 
@@ -544,5 +717,159 @@ TEST_F(PasswdNameFromUid, LongNameIsTruncated)
     EXPECT_EQ(strlen(buf), sizeof(buf) - 1U);
     EXPECT_EQ(std::string(buf), name.substr(0, sizeof(buf) - 1U));
 }
+
+// ---------------------------------------------------------------------------
+// taz_user_name_from_uid
+// ---------------------------------------------------------------------------
+
+#ifndef _WIN32
+class UserNameFromUid : public ::testing::Test
+{
+  protected:
+    void SetUp() override
+    {
+        char tmpdir[1024];
+        size_t tmpdir_len = sizeof(tmpdir) - 1;
+        ASSERT_EQ(uv_os_tmpdir(tmpdir, &tmpdir_len), 0);
+        const std::string tpl_str =
+            std::string(tmpdir, tmpdir_len) + "/taz_fsutil_test_XXXXXX";
+        std::vector<char> tpl(tpl_str.begin(), tpl_str.end());
+        tpl.push_back('\0');
+
+        uv_fs_t req;
+        const int rc = uv_fs_mkdtemp(NULL, &req, tpl.data(), NULL);
+        if (rc != 0)
+        {
+            uv_fs_req_cleanup(&req);
+        }
+        ASSERT_EQ(rc, 0);
+        dir_ = req.path;
+        uv_fs_req_cleanup(&req);
+        path_ = dir_ + "/passwd";
+    }
+
+    void TearDown() override
+    {
+        uv_fs_t req;
+        (void)uv_fs_unlink(NULL, &req, path_.c_str(), NULL);
+        uv_fs_req_cleanup(&req);
+        uv_fs_t rmdir_req;
+        (void)uv_fs_rmdir(NULL, &rmdir_req, dir_.c_str(), NULL);
+        uv_fs_req_cleanup(&rmdir_req);
+    }
+
+    void WriteFile(const std::string &contents) const
+    {
+        std::ofstream out(path_, std::ios::binary | std::ios::trunc);
+        out << contents;
+    }
+
+    const std::string &Path() const
+    {
+        return path_;
+    }
+
+  private:
+    std::string dir_;
+    std::string path_;
+};
+
+TEST_F(UserNameFromUid, FindsMatchingUid)
+{
+    WriteFile("root:x:0:0:root:/root:/bin/bash\n"
+              "alice:x:1000:1000:Alice:/home/alice:/bin/bash\n");
+    char buf[64];
+    taz_user_name_from_uid(Path().c_str(), 1000UL, buf, sizeof(buf));
+    EXPECT_STREQ(buf, "alice");
+}
+
+TEST_F(UserNameFromUid, FallsBackToDecimalWhenNotFound)
+{
+    WriteFile("root:x:0:0:root:/root:/bin/bash\n");
+    char buf[64];
+    taz_user_name_from_uid(Path().c_str(), 999UL, buf, sizeof(buf));
+    EXPECT_STREQ(buf, "999");
+}
+
+TEST_F(UserNameFromUid, FallsBackToDecimalWhenFileIsMissing)
+{
+    char buf[64];
+    taz_user_name_from_uid((Path() + "-missing").c_str(), 42UL, buf,
+                           sizeof(buf));
+    EXPECT_STREQ(buf, "42");
+}
+
+TEST_F(UserNameFromUid, TruncatesNameAtBufsize)
+{
+    WriteFile("alice:x:1000:1000:Alice:/home/alice:/bin/bash\n");
+    char buf[3];
+    taz_user_name_from_uid(Path().c_str(), 1000UL, buf, sizeof(buf));
+    EXPECT_STREQ(buf, "al");
+}
+
+TEST_F(UserNameFromUid, ZeroBufsizeIsSilent)
+{
+    WriteFile("alice:x:1000:1000:Alice:/home/alice:/bin/bash\n");
+    char buf[64] = "unchanged";
+    taz_user_name_from_uid(Path().c_str(), 1000UL, buf, 0U);
+    EXPECT_STREQ(buf, "unchanged");
+}
+#else
+TEST(Win32AccountFromSid, CurrentProcessTokenUserIsNonEmpty)
+{
+    HANDLE process_token;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &process_token) == 0)
+    {
+        GTEST_SKIP() << "OpenProcessToken failed";
+    }
+
+    PTOKEN_USER user = nullptr;
+    DWORD size = 0;
+    GetTokenInformation(process_token, TokenUser, NULL, 0, &size);
+    user = (PTOKEN_USER)malloc(size);
+    ASSERT_NE(user, nullptr);
+    ASSERT_TRUE(
+        GetTokenInformation(process_token, TokenUser, user, size, &size));
+
+    char buf[256];
+    taz_win32_account_from_sid(user->User.Sid, buf, sizeof(buf));
+    EXPECT_NE(strlen(buf), 0U);
+    EXPECT_NE(strchr(buf, '\\'), nullptr) << "Should contain backslash";
+
+    free(user);
+    CloseHandle(process_token);
+}
+
+TEST(Win32AccountFromSid, NullSidLeavesBufferUntouched)
+{
+    char buf[256] = "unchanged";
+    taz_win32_account_from_sid(NULL, buf, sizeof(buf));
+    EXPECT_STREQ(buf, "unchanged");
+}
+
+TEST(Win32AccountFromSid, ZeroBufsizeLeavesBufferUntouched)
+{
+    HANDLE process_token;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &process_token) == 0)
+    {
+        GTEST_SKIP() << "OpenProcessToken failed";
+    }
+
+    PTOKEN_USER user = nullptr;
+    DWORD size = 0;
+    GetTokenInformation(process_token, TokenUser, NULL, 0, &size);
+    user = (PTOKEN_USER)malloc(size);
+    ASSERT_NE(user, nullptr);
+    ASSERT_TRUE(
+        GetTokenInformation(process_token, TokenUser, user, size, &size));
+
+    char buf[256] = "unchanged";
+    taz_win32_account_from_sid(user->User.Sid, buf, 0U);
+    EXPECT_STREQ(buf, "unchanged");
+
+    free(user);
+    CloseHandle(process_token);
+}
+#endif
 
 } // namespace

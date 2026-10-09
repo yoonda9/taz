@@ -6,6 +6,11 @@
 
 #include <uv.h>
 
+#ifdef _WIN32
+#include <aclapi.h>
+#include <windows.h>
+#endif
+
 /* Mode bits a Windows READONLY attribute cannot represent (DEC-005). */
 #define MODE_READ_ALL          0444U  /* all three read bits */
 #define MODE_SPECIAL_BITS      07000U /* setuid, setgid, sticky */
@@ -331,6 +336,157 @@ void taz_fsutil_truncate_utf8(const char *name, char *buf, size_t bufsize)
     buf[len] = '\0';
 }
 
+/* UTF-8 well-formedness table (Unicode Table 3-7): generic continuation
+ * range, the three lead-byte lengths, and the two lead bytes (E0, ED, F0,
+ * F4) whose second byte is narrower than the generic range. */
+#define SANITIZE_ASCII_MAX     0x7FU
+#define SANITIZE_CONT_MIN      0x80U
+#define SANITIZE_CONT_MAX      0xBFU
+#define SANITIZE_LEAD_2_MIN    0xC2U
+#define SANITIZE_LEAD_2_MAX    0xDFU
+#define SANITIZE_LEAD_3_MIN    0xE0U
+#define SANITIZE_LEAD_3_MAX    0xEFU
+#define SANITIZE_LEAD_E0       0xE0U
+#define SANITIZE_LEAD_ED       0xEDU
+#define SANITIZE_E0_SECOND_MIN 0xA0U
+#define SANITIZE_ED_SECOND_MAX 0x9FU
+#define SANITIZE_LEAD_4_MIN    0xF0U
+#define SANITIZE_LEAD_4_MAX    0xF4U
+#define SANITIZE_LEAD_F0       0xF0U
+#define SANITIZE_LEAD_F4       0xF4U
+#define SANITIZE_F0_SECOND_MIN 0x90U
+#define SANITIZE_F4_SECOND_MAX 0x8FU
+#define SANITIZE_SEQ_LEN_2     2U
+#define SANITIZE_SEQ_LEN_3     3U
+#define SANITIZE_SEQ_LEN_4     4U
+
+/* U+FFFD REPLACEMENT CHARACTER, UTF-8 encoded. */
+#define UTF8_REPLACEMENT_B0  0xEFU
+#define UTF8_REPLACEMENT_B1  0xBFU
+#define UTF8_REPLACEMENT_B2  0xBDU
+#define UTF8_REPLACEMENT_LEN 3U
+
+/* Classifies the unit starting at in[i] (0 < i + 1 <= len). Returns the
+ * number of bytes it consumes and sets *valid. A well-formed codepoint
+ * consumes its full encoded length; an ill-formed one consumes only its
+ * "maximal subpart" per the Unicode standard: a lead byte together with
+ * whatever leading continuation bytes already matched the expected range,
+ * stopping at (and not consuming) the first byte that breaks the sequence
+ * or at the end of input. */
+static size_t sanitize_utf8_next(const unsigned char *in, size_t len, size_t i,
+                                 int *valid)
+{
+    unsigned char b0 = in[i];
+    size_t need;
+    unsigned char second_min = SANITIZE_CONT_MIN;
+    unsigned char second_max = SANITIZE_CONT_MAX;
+    size_t have;
+    unsigned char lo;
+    unsigned char hi;
+
+    if (b0 <= SANITIZE_ASCII_MAX)
+    {
+        *valid = 1;
+        return 1U;
+    }
+
+    if ((b0 >= SANITIZE_LEAD_2_MIN) && (b0 <= SANITIZE_LEAD_2_MAX))
+    {
+        need = SANITIZE_SEQ_LEN_2;
+    }
+    else if ((b0 >= SANITIZE_LEAD_3_MIN) && (b0 <= SANITIZE_LEAD_3_MAX))
+    {
+        need = SANITIZE_SEQ_LEN_3;
+        if (b0 == SANITIZE_LEAD_E0)
+        {
+            second_min = SANITIZE_E0_SECOND_MIN;
+        }
+        else if (b0 == SANITIZE_LEAD_ED)
+        {
+            second_max = SANITIZE_ED_SECOND_MAX;
+        }
+    }
+    else if ((b0 >= SANITIZE_LEAD_4_MIN) && (b0 <= SANITIZE_LEAD_4_MAX))
+    {
+        need = SANITIZE_SEQ_LEN_4;
+        if (b0 == SANITIZE_LEAD_F0)
+        {
+            second_min = SANITIZE_F0_SECOND_MIN;
+        }
+        else if (b0 == SANITIZE_LEAD_F4)
+        {
+            second_max = SANITIZE_F4_SECOND_MAX;
+        }
+    }
+    else
+    {
+        /* A stray continuation byte (80-BF) or a lead byte that is never
+         * valid (C0, C1, F5-FF). */
+        *valid = 0;
+        return 1U;
+    }
+
+    have = 1U;
+    lo = second_min;
+    hi = second_max;
+    while (have < need)
+    {
+        if (((i + have) >= len) || (in[i + have] < lo) || (in[i + have] > hi))
+        {
+            *valid = 0;
+            return have;
+        }
+        have++;
+        lo = SANITIZE_CONT_MIN;
+        hi = SANITIZE_CONT_MAX;
+    }
+
+    *valid = 1;
+    return need;
+}
+
+void taz_fsutil_sanitize_utf8(const char *in, size_t in_len, char *buf,
+                              size_t bufsize)
+{
+    const unsigned char *src = (const unsigned char *)in;
+    size_t capacity;
+    size_t i = 0U;
+    size_t out = 0U;
+
+    if (bufsize == 0U)
+    {
+        return;
+    }
+    capacity = bufsize - 1U;
+
+    while (i < in_len)
+    {
+        int valid;
+        size_t consumed = sanitize_utf8_next(src, in_len, i, &valid);
+        const unsigned char *unit = valid ? (src + i) : NULL;
+        unsigned char replacement[UTF8_REPLACEMENT_LEN];
+        size_t unit_len = valid ? consumed : UTF8_REPLACEMENT_LEN;
+
+        if (!valid)
+        {
+            replacement[0] = (unsigned char)UTF8_REPLACEMENT_B0;
+            replacement[1] = (unsigned char)UTF8_REPLACEMENT_B1;
+            replacement[2] = (unsigned char)UTF8_REPLACEMENT_B2;
+            unit = replacement;
+        }
+
+        if ((out + unit_len) > capacity)
+        {
+            break;
+        }
+        (void)memcpy(buf + out, unit, unit_len);
+        out += unit_len;
+        i += consumed;
+    }
+
+    buf[out] = '\0';
+}
+
 /* strtoul base for the decimal uid field. */
 #define PASSWD_UID_BASE 10U
 /* Generous line length for a passwd entry; longer lines are skipped (they
@@ -434,3 +590,57 @@ int taz_passwd_name_from_uid(const char *passwd_path, unsigned long uid,
     (void)fclose(f);
     return 0;
 }
+
+#ifndef _WIN32
+void taz_user_name_from_uid(const char *passwd_path, unsigned long uid,
+                            char *buf, size_t bufsize)
+{
+    if (bufsize == 0U)
+    {
+        return;
+    }
+
+    if (!taz_passwd_name_from_uid(passwd_path, uid, buf, bufsize))
+    {
+        (void)snprintf(buf, bufsize, "%lu", uid);
+    }
+}
+#else
+void taz_win32_account_from_sid(const void *sid, char *buf, size_t bufsize)
+{
+    PSID psid = (PSID)sid;
+    WCHAR name[256];
+    WCHAR domain[256];
+    DWORD name_len = (DWORD)(sizeof(name) / sizeof(name[0]));
+    DWORD domain_len = (DWORD)(sizeof(domain) / sizeof(domain[0]));
+    SID_NAME_USE use;
+    char name_utf8[256];
+    char domain_utf8[256];
+    int name_mbc;
+    int domain_mbc;
+
+    if ((bufsize == 0U) || (sid == NULL))
+    {
+        return;
+    }
+
+    if (!LookupAccountSidW(NULL, psid, name, &name_len, domain, &domain_len,
+                           &use))
+    {
+        return;
+    }
+
+    name_mbc = WideCharToMultiByte(CP_UTF8, 0, name, -1, name_utf8,
+                                   (int)sizeof(name_utf8), NULL, NULL);
+    domain_mbc = WideCharToMultiByte(CP_UTF8, 0, domain, -1, domain_utf8,
+                                     (int)sizeof(domain_utf8), NULL, NULL);
+
+    if ((name_mbc > 0) && (domain_mbc > 0))
+    {
+        char account[256 + 256 + 1]; /* domain\name + NUL */
+        (void)snprintf(account, sizeof(account), "%s\\%s", domain_utf8,
+                       name_utf8);
+        taz_fsutil_sanitize_utf8(account, strlen(account), buf, bufsize);
+    }
+}
+#endif /* _WIN32 */

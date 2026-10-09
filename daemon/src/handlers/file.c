@@ -34,10 +34,6 @@
  * entries[] array size (DEC-003). */
 #define TAZ_DIR_LIST_BATCH_MAX 64U
 
-#ifndef _WIN32
-#define TAZ_PASSWD_PATH "/etc/passwd"
-#endif
-
 /* Carries everything file_stat_work/file_stat_done need: the request
  * snapshot for the pool thread, and the write sink/stream/opcode plus the
  * result for the loop thread. Heap-allocated per in-flight stat, freed once
@@ -58,10 +54,11 @@ typedef struct
 } file_stat_ctx_t;
 
 #ifdef _WIN32
-/* Best-effort "DOMAIN\name" owner lookup (DEC-007): any failure along the
- * way (conversion, GetNamedSecurityInfoW, LookupAccountSidW) leaves owner
- * untouched (already "" from the caller's calloc) rather than failing the
- * stat. Runs on the pool thread; touches no shared state. */
+/* Best-effort "DOMAIN\name" owner lookup (DEC-007): gets the SID from
+ * GetNamedSecurityInfoW and delegates to taz_win32_account_from_sid.
+ * Any failure leaves owner untouched (already "" from the caller's calloc)
+ * rather than failing the stat. Runs on the pool thread; touches no shared
+ * state. */
 static void file_stat_owner_win32(const char *path, char *owner,
                                   size_t owner_size)
 {
@@ -86,27 +83,7 @@ static void file_stat_owner_win32(const char *path, char *owner,
                               &sd) == ERROR_SUCCESS &&
         owner_sid != NULL)
     {
-        WCHAR name[256];
-        WCHAR domain[256];
-        DWORD name_len = (DWORD)(sizeof(name) / sizeof(name[0]));
-        DWORD domain_len = (DWORD)(sizeof(domain) / sizeof(domain[0]));
-        SID_NAME_USE use;
-
-        if (LookupAccountSidW(NULL, owner_sid, name, &name_len, domain,
-                              &domain_len, &use))
-        {
-            char name_utf8[256];
-            char domain_utf8[256];
-
-            if (WideCharToMultiByte(CP_UTF8, 0, domain, -1, domain_utf8,
-                                    (int)sizeof(domain_utf8), NULL, NULL) > 0 &&
-                WideCharToMultiByte(CP_UTF8, 0, name, -1, name_utf8,
-                                    (int)sizeof(name_utf8), NULL, NULL) > 0)
-            {
-                (void)snprintf(owner, owner_size, "%s\\%s", domain_utf8,
-                               name_utf8);
-            }
-        }
+        taz_win32_account_from_sid(owner_sid, owner, owner_size);
     }
 
     if (sd != NULL)
@@ -161,13 +138,8 @@ static void file_stat_work(void *user)
     }
 
 #ifndef _WIN32
-    /* Owner lookup never fails the stat: fall back to the decimal uid. */
-    if (!taz_passwd_name_from_uid(TAZ_PASSWD_PATH, (unsigned long)st_uid,
-                                  fctx->resp.owner, sizeof(fctx->resp.owner)))
-    {
-        (void)snprintf(fctx->resp.owner, sizeof(fctx->resp.owner), "%lu",
-                       (unsigned long)st_uid);
-    }
+    taz_user_name_from_uid(TAZ_PASSWD_PATH, (unsigned long)st_uid,
+                           fctx->resp.owner, sizeof(fctx->resp.owner));
 #else
     file_stat_owner_win32(fctx->req.path, fctx->resp.owner,
                           sizeof(fctx->resp.owner));

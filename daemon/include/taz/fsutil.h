@@ -6,6 +6,10 @@
 
 #include "taz/v1/common.pb.h"
 
+#ifndef _WIN32
+#define TAZ_PASSWD_PATH "/etc/passwd"
+#endif
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -64,6 +68,17 @@ extern "C"
      * bufsize is 0. */
     void taz_fsutil_truncate_utf8(const char *name, char *buf, size_t bufsize);
 
+    /* Copy in[0..in_len) into buf as valid, NUL-terminated UTF-8 (at most
+     * bufsize - 1 bytes): every maximal invalid subsequence (stray
+     * continuation byte, invalid lead byte, truncated multi-byte sequence,
+     * overlong encoding, UTF-16 surrogate, codepoint > U+10FFFF) becomes one
+     * U+FFFD, following the Unicode "maximal subpart" practice. The copy is
+     * cut at a codepoint boundary: a unit (valid codepoint or replacement)
+     * that would not fit is dropped rather than split. No-op when
+     * bufsize == 0; empty input copies to "". Pure, no allocation. */
+    void taz_fsutil_sanitize_utf8(const char *in, size_t in_len, char *buf,
+                                  size_t bufsize);
+
     /* Parse passwd_path (an /etc/passwd-style "name:x:uid:..." file) for
      * the line whose third field equals uid. On a match, copies the name
      * into buf (truncated, NUL-terminated, to bufsize) and returns 1.
@@ -71,6 +86,18 @@ extern "C"
      * short lines are skipped. */
     int taz_passwd_name_from_uid(const char *passwd_path, unsigned long uid,
                                  char *buf, size_t bufsize);
+
+#ifndef _WIN32
+    /* Wrapper for taz_passwd_name_from_uid that looks up uid in passwd_path,
+     * falling back to decimal string representation of uid if not found or file
+     * is missing. Always NUL-terminates buf when bufsize > 0. */
+    void taz_user_name_from_uid(const char *passwd_path, unsigned long uid,
+                                char *buf, size_t bufsize);
+#else
+/* Convert a Windows SID to "DOMAIN\name" format (sanitized UTF-8, truncated
+ * at codepoint boundary). On any failure, leaves buf untouched. */
+void taz_win32_account_from_sid(const void *sid, char *buf, size_t bufsize);
+#endif
 
 #ifdef __cplusplus
 }
