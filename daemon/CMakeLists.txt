@@ -252,6 +252,7 @@ add_library(
     src/payload.c
     src/error.c
     src/config.c
+    src/log.c
     src/response.c
     src/exec.c
     src/server.c
@@ -268,6 +269,7 @@ add_library(
     src/handlers/cancel.c
     src/handlers/process.c
     src/handlers/process_monitor.c
+    src/handlers/log.c
     src/platform/process_common.c
     ${TAZ_PROCESS_SRC}
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)

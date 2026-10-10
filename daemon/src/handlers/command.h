@@ -13,7 +13,7 @@ extern "C"
 #endif
 
     /* Async COMMAND_EXEC handler: decode the request, reject a non-empty
-     * as_user with NOT_SUPPORTED (RUN_AS lands in Step 10), then start
+     * as_user with NOT_SUPPORTED (RUN_AS support comes later), then start
      * taz_exec_start on d->loop and register the resulting taz_exec_t with
      * the dispatch layer via taz_dispatch_set_stream_exec. Closes the
      * stream itself (taz_dispatch_stream_done) either synchronously, on a

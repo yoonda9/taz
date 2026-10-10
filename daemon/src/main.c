@@ -6,6 +6,7 @@
 
 #include "taz/build_info.h"
 #include "taz/connection.h"
+#include "taz/log.h"
 #include "taz/platform.h"
 #include "taz/server.h"
 
@@ -73,16 +74,19 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    taz_log_init();
+
     rc = taz_server_start(&server, host, port, taz_conn_on_new_connection);
     if (rc != 0)
     {
-        (void)fprintf(stderr, "error: server start failed: %s\n",
-                      uv_strerror(rc));
+        taz_log(TAZ_LOG_ERROR, "server start failed: %s", uv_strerror(rc));
+        taz_log_shutdown();
         return EXIT_FAILURE;
     }
 
     taz_platform_init_signals(&server.loop);
     uv_run(&server.loop, UV_RUN_DEFAULT);
     taz_platform_flush();
+    taz_log_shutdown();
     return EXIT_SUCCESS;
 }

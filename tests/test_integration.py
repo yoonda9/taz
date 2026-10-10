@@ -1789,6 +1789,53 @@ class TestConfigUpdate:
         assert common_pb2.OPCODE_CONFIGURATION_UPDATE in ops
 
 
+class TestLog:
+    """``LOG`` (0x0042) returns ring-buffered diagnostic entries."""
+
+    def test_log_returns_entries_after_several_execs(
+        self, taz_client: TazClient
+    ) -> None:
+        for i in range(3):
+            result = taz_client.command.exec(PY, args=_py(f"print({i})"))
+            assert result.exit_code == 0
+        entries = taz_client.log(lines=10)
+        assert len(entries) >= 3
+        for entry in entries:
+            assert entry.timestamp > 0
+            assert entry.level
+            assert entry.message
+        assert sum(1 for e in entries if "executed command" in e.message) >= 3
+
+    def test_log_level_filter_excludes_info_exec_entries(
+        self, taz_client: TazClient
+    ) -> None:
+        taz_client.command.exec(PY, args=_py("print('hi')"))
+        entries = taz_client.log(level="ERROR")
+        assert not any("executed command" in e.message for e in entries)
+
+    @pytest.mark.slow
+    def test_log_wrap_does_not_deadlock_the_drained_stderr_fixture(
+        self, taz_client: TazClient
+    ) -> None:
+        # The fixture used to read stderr only at stop(), so a test that
+        # wraps the log ring would write well past the 64 KiB pipe buffer
+        # and deadlock the daemon mid-test. Pings log at DEBUG
+        # (dispatch.c), so enough of them exceed both the ring capacity and
+        # the pipe buffer cheaply, with no process spawn per entry.
+        taz_client.config_update({"log.level": "DEBUG"})
+        target = 4200  # > the 4096-entry ring, each line far exceeds 64 KiB total
+        deadline = time.monotonic() + 30
+        sent = 0
+        while sent < target and time.monotonic() < deadline:
+            taz_client.ping()
+            sent += 1
+        assert sent == target, f"only sent {sent}/{target} pings before the deadline"
+        # The connection, and the daemon behind it, must still be responsive.
+        taz_client.ping()
+        entries = taz_client.log(lines=5)
+        assert len(entries) == 5
+
+
 class TestErrorFrames:
     """The daemon's ERROR frames raise TazError; the connection stays usable."""
 

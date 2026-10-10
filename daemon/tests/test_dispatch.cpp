@@ -15,6 +15,7 @@
 #include "taz/dispatch.h"
 #include "taz/exec.h"
 #include "taz/frame.h"
+#include "taz/log.h"
 #include "taz/v1/advanced.pb.h"
 #include "taz/v1/command.pb.h"
 #include "taz/v1/common.pb.h"
@@ -180,6 +181,34 @@ TEST(Dispatch, PingProducesPong)
     EXPECT_EQ(resp.stream_id, 7U);
     EXPECT_EQ(resp.length, 0U);
     EXPECT_EQ(d.active_count, 0U);
+}
+
+TEST(Dispatch, PingLogsAtDebugOnlyNotAtDefaultInfoLevel)
+{
+    taz_config_reset();
+    taz_log_init();
+    taz_log_reset_for_tests();
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    WriteCtx wctx;
+
+    const taz_frame_header_t h = MakeHeader(
+        static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_PING), 0U, 7U);
+    taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
+
+    // log.level defaults to INFO, so a DEBUG-only ping log leaves no trace.
+    taz_v1_LogEntry entries[4];
+    EXPECT_EQ(taz_log_collect(0, 0, TAZ_LOG_DEBUG, entries, 4), 0U);
+
+    taz_log_set_level(TAZ_LOG_DEBUG);
+    taz_dispatch_frame(&d, &h, nullptr, TAZ_FRAME_OK, capture_write, &wctx);
+
+    ASSERT_EQ(taz_log_collect(0, 0, TAZ_LOG_DEBUG, entries, 4), 1U);
+    EXPECT_STREQ(entries[0].level, "DEBUG");
+    EXPECT_NE(std::string(entries[0].message).find("ping"), std::string::npos);
+
+    taz_config_reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +423,44 @@ TEST(Dispatch, CommandExecRunsRealProcessThroughDispatchFrame)
     EXPECT_EQ(decoded.exit_code, 0);
     EXPECT_FALSE(decoded.timed_out);
     EXPECT_FALSE(stdout_bytes.empty());
+}
+
+TEST(Dispatch, CommandExecLogsOneInfoEntryToRing)
+{
+    taz_config_reset();
+    taz_log_init();
+    taz_log_reset_for_tests();
+
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    WriteCtx wctx;
+
+    const std::string exe = SelfExePath();
+    ASSERT_FALSE(exe.empty());
+    const auto payload =
+        CommandExecRequestBytes(exe, {"--gtest_filter=NoSuchSuite.*"});
+
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   19U, static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    taz_v1_LogEntry entries[8];
+    ASSERT_EQ(taz_log_collect(0, 0, TAZ_LOG_INFO, entries, 8), 1U);
+    EXPECT_STREQ(entries[0].level, "INFO");
+    EXPECT_NE(std::string(entries[0].message).find("exit=0"),
+              std::string::npos);
+
+    taz_config_reset();
 }
 
 TEST(Dispatch, CommandExecWithAsUserIsNotSupported)

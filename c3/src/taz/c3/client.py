@@ -11,6 +11,7 @@ from taz.c3.connection import Connection
 from taz.c3.directory import DirectoryNamespace
 from taz.c3.errors import TazError
 from taz.c3.file import FileNamespace
+from taz.c3.logs import LogEntry
 from taz.c3.process import ProcessNamespace
 from taz.c3.protocol.dispatch import Dispatcher
 from taz.c3.protocol.frame import Frame
@@ -186,6 +187,36 @@ class TazClient:
             daemon_control_pb2.ConfigurationUpdateResponse,
             keepalive,
         )
+
+    def log(
+        self,
+        lines: int = 100,
+        since: int = 0,
+        level: str = "DEBUG",
+        keepalive: Keepalive | None = None,
+    ) -> list[LogEntry]:
+        """Return up to ``lines`` recorded log entries, oldest first.
+
+        ``lines=0`` returns every matching entry. ``since`` excludes entries
+        at or before that Unix timestamp. ``level`` is a minimum, one of
+        ``"DEBUG"``, ``"INFO"``, ``"WARN"`` or ``"ERROR"`` (case-sensitive;
+        empty means DEBUG); anything else raises
+        ``TazError(INVALID_REQUEST)``. A chunked ``LogResponse`` (more than
+        64 entries) is merged by the dispatcher before this method sees it.
+        """
+        req = advanced_pb2.LogRequest(lines=lines, since=since, level=level)
+        resp = self._call(
+            common_pb2.OPCODE_LOG,
+            req.SerializeToString(),
+            advanced_pb2.LogResponse,
+            keepalive,
+        )
+        return [
+            LogEntry(
+                timestamp=entry.timestamp, level=entry.level, message=entry.message
+            )
+            for entry in resp.entries
+        ]
 
     def cancel(self, stream_id: int, keepalive: Keepalive | None = None) -> bool:
         """Cancel the transfer on ``stream_id``.

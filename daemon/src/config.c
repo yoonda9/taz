@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "taz/log.h"
 #include "taz/v1/daemon_control.pb.h"
 
 /* Maximum length of a config value string (must fit in KeyValue.value[]) */
@@ -38,6 +39,23 @@ static config_entry_t g_config[] = {
 
 #define CONFIG_COUNT (sizeof(g_config) / sizeof(g_config[0]))
 
+/* Push g_config[i]'s current "log.level" value to log.c's cached gate, if
+ * that is the entry being reset/updated. Keeps taz_log's level in sync with
+ * the config store without taz_log reading g_config directly (which would
+ * race taz_config_update's unsynchronized strncpy). */
+static void sync_log_level(const config_entry_t *e)
+{
+    if (strcmp(e->key, "log.level") != 0)
+    {
+        return;
+    }
+    taz_log_level_t level;
+    if (taz_log_level_parse(e->value, &level) == 0)
+    {
+        taz_log_set_level(level);
+    }
+}
+
 void taz_config_reset(void)
 {
     for (size_t i = 0; i < CONFIG_COUNT; i++)
@@ -45,6 +63,7 @@ void taz_config_reset(void)
         (void)strncpy(g_config[i].value, g_config[i].default_value,
                       CONFIG_VAL_MAX - 1U);
         g_config[i].value[CONFIG_VAL_MAX - 1U] = '\0';
+        sync_log_level(&g_config[i]);
     }
 }
 
@@ -71,8 +90,11 @@ static void append_kv(taz_v1_ConfigurationGetResponse *out, const char *key,
     taz_v1_KeyValue *kv = &out->config[out->config_count];
     (void)strncpy(kv->key, key, sizeof(kv->key) - 1U);
     kv->key[sizeof(kv->key) - 1U] = '\0';
-    (void)strncpy(kv->value, value, sizeof(kv->value) - 1U);
-    kv->value[sizeof(kv->value) - 1U] = '\0';
+    /* value comes from g_config[i].value which is CONFIG_VAL_MAX bytes, so
+     * bound the copy to that size rather than the destination's 512 bytes to
+     * avoid analyzer false positives on a much-larger destination bound. */
+    (void)strncpy(kv->value, value, CONFIG_VAL_MAX - 1U);
+    kv->value[CONFIG_VAL_MAX - 1U] = '\0';
     out->config_count++;
 }
 
@@ -234,6 +256,7 @@ void taz_config_update(const taz_v1_ConfigurationUpdateRequest *req,
 
         (void)strncpy(e->value, kv->value, CONFIG_VAL_MAX - 1U);
         e->value[CONFIG_VAL_MAX - 1U] = '\0';
+        sync_log_level(e);
         append_applied(out, e->key);
     }
 }

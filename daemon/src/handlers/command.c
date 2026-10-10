@@ -9,6 +9,7 @@
 
 #include "taz/config.h"
 #include "taz/error.h"
+#include "taz/log.h"
 #include "taz/response.h"
 #include "taz/v1/command.pb.h"
 
@@ -28,6 +29,9 @@ typedef struct
 static void on_exec_done(const taz_exec_result_t *result, void *arg)
 {
     exec_ctx_t *ectx = (exec_ctx_t *)arg;
+
+    taz_log(TAZ_LOG_INFO, "executed command: exit=%lld output=%zu",
+            (long long)result->exit_status, result->out_len);
 
     taz_command_send_exec_response(ectx->write_fn, ectx->write_ctx,
                                    ectx->stream_id, ectx->opcode, result);
@@ -101,8 +105,8 @@ void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
         }
     }
 
-    /* RUN_AS (a non-empty as_user) is Step 10; never silently run as the
-     * daemon's own identity in the meantime. */
+    /* RUN_AS support via a non-empty as_user comes later; do not silently
+     * run as the daemon's own identity. */
     if (req->as_user[0] != '\0')
     {
         free(req);
@@ -141,8 +145,8 @@ void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
     spec.env = req->env;
     spec.env_count = (size_t)req->env_count;
     spec.cwd = req->working_dir;
-    /* timeout_ms = 0 already means "no timeout" until TIMEOUT_SET (Step 10)
-     * gives the connection a non-zero default to fall back to. */
+    /* timeout_ms = 0 already means "no timeout" until TIMEOUT_SET gives
+     * the connection a non-zero default to fall back to. */
     spec.timeout_ms = req->timeout_ms;
     spec.max_output_bytes = taz_config_exec_max_output_bytes();
 

@@ -19,6 +19,7 @@ add_executable(
     test_connection.cpp
     test_server.cpp
     test_config.cpp
+    test_log.cpp
     test_error.cpp
     test_response.cpp
     test_exec.cpp

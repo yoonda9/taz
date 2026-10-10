@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Generator
 from pathlib import Path
 
@@ -55,23 +56,57 @@ def daemon_binary(request: pytest.FixtureRequest) -> Path:
 
 @dataclasses.dataclass
 class Daemon:
-    """A running ``tazd`` subprocess listening on ``port``."""
+    """A running ``tazd`` subprocess listening on ``port``.
+
+    A background thread drains stderr for the process's whole lifetime: a
+    log-heavy test can write far more than the 64 KiB pipe buffer, and
+    nothing else reads stderr until ``stop()``, so an undrained pipe would
+    deadlock the daemon mid-test.
+    """
 
     proc: subprocess.Popen[bytes]
     port: int
     stderr: str = ""
+    _stderr_chunks: list[bytes] = dataclasses.field(
+        default_factory=list, repr=False, compare=False
+    )
+    _stderr_thread: threading.Thread | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+
+    def _start_stderr_reader(self) -> None:
+        assert self.proc.stderr is not None
+        stderr = self.proc.stderr
+
+        def _drain() -> None:
+            for chunk in stderr:
+                self._stderr_chunks.append(chunk)
+
+        self._stderr_thread = threading.Thread(target=_drain, daemon=True)
+        self._stderr_thread.start()
 
     def stop(self) -> None:
         """Terminate the daemon and collect its stderr; idempotent."""
-        if self.proc.returncode is not None:
-            return
-        self.proc.terminate()
-        try:
-            _, err = self.proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            _, err = self.proc.communicate(timeout=5)
-        self.stderr = err.decode(errors="replace")
+        if self.proc.returncode is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=5)
+        self.stderr = b"".join(self._stderr_chunks).decode(errors="replace")
+        if self.proc.stdout is not None:
+            self.proc.stdout.close()
+        # A child that outlived tazd can still hold the pipe open; closing it
+        # under the blocked reader would then wait for that child, so leave
+        # it to the (daemon) thread.
+        reader_alive = (
+            self._stderr_thread is not None and self._stderr_thread.is_alive()
+        )
+        if self.proc.stderr is not None and not reader_alive:
+            self.proc.stderr.close()
 
 
 def _launch(binary: Path, env: dict[str, str] | None = None) -> Daemon:
@@ -82,18 +117,20 @@ def _launch(binary: Path, env: dict[str, str] | None = None) -> Daemon:
         env={**os.environ, **env} if env else None,
     )
     assert proc.stdout is not None
+    daemon = Daemon(proc, 0)
+    daemon._start_stderr_reader()
     # The daemon flushes this line right after binding, so readline() returns
     # promptly; EOF means it died before listening.
     line = proc.stdout.readline()
     m = re.search(rb"LISTENING port=(\d+)", line)
     if m is None:
-        daemon = Daemon(proc, 0)
         daemon.stop()
         pytest.fail(
             f"daemon never printed LISTENING port=<N> (got {line!r});"
             f" stderr:\n{daemon.stderr}"
         )
-    return Daemon(proc, int(m.group(1)))
+    daemon.port = int(m.group(1))
+    return daemon
 
 
 def _check_exit(daemon: Daemon) -> None:

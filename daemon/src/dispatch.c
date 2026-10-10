@@ -7,10 +7,12 @@
 #include "handlers/config.h"
 #include "handlers/file.h"
 #include "handlers/file_transfer.h"
+#include "handlers/log.h"
 #include "handlers/process.h"
 #include "handlers/process_monitor.h"
 #include "handlers/version.h"
 #include "taz/error.h"
+#include "taz/log.h"
 #include "taz/v1/common.pb.h"
 
 /* Max payload in an outgoing frame from the dispatch layer.  The dispatcher
@@ -264,6 +266,10 @@ static void send_error(uint32_t stream_id, uint16_t opcode,
 static void handle_ping(const taz_frame_header_t *header,
                         taz_dispatch_write_fn_t write_fn, void *ctx)
 {
+    /* DEBUG, not INFO: a client's keepalive pings arrive far more often
+     * than every other request and would otherwise flood the ring and
+     * stderr at the default level. */
+    taz_log(TAZ_LOG_DEBUG, "ping stream=%u", header->stream_id);
     write_packed_frame((uint8_t)taz_v1_FrameType_FRAME_TYPE_PONG,
                        (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE, 0U,
                        header->stream_id, NULL, 0U, write_fn, ctx);
@@ -328,6 +334,7 @@ static const opcode_entry_t OPCODE_TABLE[] = {
      true},
     {NULL, handle_process_monitor,
      (uint16_t)taz_v1_Opcode_OPCODE_PROCESS_MONITOR, true},
+    {handle_log, NULL, (uint16_t)taz_v1_Opcode_OPCODE_LOG, false},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))

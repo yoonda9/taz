@@ -15,6 +15,8 @@
 
 #include "file_test_support.h"
 #include "handlers/file.h"
+#include "taz/config.h"
+#include "taz/log.h"
 #include "taz/v1/common.pb.h"
 #include "taz/v1/file.pb.h"
 
@@ -780,6 +782,31 @@ TEST_F(FileHandlerTest, ChmodTogglesReadOnlyAttributeOnWindows)
 
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+TEST_F(FileHandlerTest, ChmodUnrepresentableModeLogsWarningOnWindows)
+{
+    taz_config_reset();
+    taz_log_init();
+    taz_log_reset_for_tests();
+    const std::string path = JoinDir("hello.txt");
+    WriteFile(path, "hello");
+
+    // 0600 drops group/other read, which the READONLY attribute cannot say.
+    DispatchRequest(taz_v1_Opcode_OPCODE_FILE_CHMOD,
+                    encode_chmod_request(path, 0600U), 1U);
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_RESPONSE));
+
+    taz_v1_LogEntry entries[4];
+    ASSERT_EQ(taz_log_collect(0, 0, TAZ_LOG_WARN, entries, 4), 1U);
+    EXPECT_STREQ(entries[0].level, "WARN");
+    EXPECT_NE(std::string(entries[0].message).find("only partially honoured"),
+              std::string::npos);
+
+    taz_log_reset_for_tests();
+    taz_config_reset();
 }
 #endif
 

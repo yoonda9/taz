@@ -1,7 +1,6 @@
 #include "file.h"
 
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,6 +10,7 @@
 
 #include "taz/error.h"
 #include "taz/fsutil.h"
+#include "taz/log.h"
 #include "taz/response.h"
 #include "taz/v1/file.pb.h"
 #include "taz/work.h"
@@ -611,11 +611,10 @@ static void file_chmod_done(void *user, int closing)
 #ifdef _WIN32
             if (fctx->unrepresentable != 0U)
             {
-                (void)fprintf(
-                    stderr,
-                    "tazd: warning: chmod %s: mode %04o is only partially "
-                    "honoured on Windows (owner-write bit only)\n",
-                    fctx->req.path, (unsigned int)fctx->req.permissions);
+                taz_log(TAZ_LOG_WARN,
+                        "chmod %s: mode %04o is only partially honoured on "
+                        "Windows (owner-write bit only)",
+                        fctx->req.path, (unsigned int)fctx->req.permissions);
             }
 #endif
             taz_response_send(fctx->write_fn, fctx->write_ctx, fctx->stream_id,

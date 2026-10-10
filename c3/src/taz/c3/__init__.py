@@ -9,6 +9,7 @@ from taz.c3.errors import (
     TazProtocolError,
 )
 from taz.c3.file import FileStat, FileTransfer, Kind
+from taz.c3.logs import LogEntry
 from taz.c3.process import ProcessDetail, ProcessInfo, ProcessMonitorUpdate
 from taz.c3.settings import Backlog, Keepalive
 from taz.c3.stream import StreamIterator
@@ -21,6 +22,7 @@ __all__ = [
     "FileTransfer",
     "Keepalive",
     "Kind",
+    "LogEntry",
     "ProcessDetail",
     "ProcessInfo",
     "ProcessMonitorUpdate",
