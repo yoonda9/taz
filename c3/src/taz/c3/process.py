@@ -1,11 +1,14 @@
-"""ProcessNamespace: the PROCESS_LIST/KILL/INFO client API (``client.process``)."""
+"""ProcessNamespace: the PROCESS_LIST/KILL/INFO/MONITOR client API
+(``client.process``).
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from taz.c3.settings import Keepalive
+from taz.c3.stream import StreamIterator
 from taz.v1 import common_pb2, process_pb2
 
 if TYPE_CHECKING:
@@ -34,6 +37,37 @@ class ProcessDetail(ProcessInfo):
     command_line: str
     start_time: int
     open_files: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessMonitorUpdate:
+    """One frame of a ``client.process.monitor()`` stream."""
+
+    info: ProcessInfo
+    exited: bool
+    exit_code: int
+    exit_code_known: bool
+    reason: str
+
+
+def _parse_monitor_update(payload: bytes) -> ProcessMonitorUpdate:
+    resp = process_pb2.ProcessMonitorResponse()
+    resp.ParseFromString(payload)
+    info = resp.info
+    return ProcessMonitorUpdate(
+        info=ProcessInfo(
+            pid=info.pid,
+            name=info.name,
+            user=info.user,
+            cpu_percent=info.cpu_percent,
+            memory_bytes=info.memory_bytes,
+            state=info.state,
+        ),
+        exited=resp.exited,
+        exit_code=resp.exit_code,
+        exit_code_known=resp.exit_code_known,
+        reason=resp.reason,
+    )
 
 
 class ProcessNamespace:
@@ -113,4 +147,38 @@ class ProcessNamespace:
             command_line=resp.command_line,
             start_time=resp.start_time,
             open_files=list(resp.open_files),
+        )
+
+    def monitor(
+        self,
+        pid: int,
+        interval_ms: int = 1000,
+        *,
+        overflow: Literal["cancel", "drop_oldest"] = "cancel",
+        max_wait: float | None = None,
+        keepalive: Keepalive | None = None,
+    ) -> StreamIterator[ProcessMonitorUpdate]:
+        """Stream periodic ``ProcessMonitorUpdate``s for ``pid``.
+
+        Returns the stream without reading anything: a nonexistent ``pid``
+        (or any other request-time failure) surfaces as a ``TazError`` from
+        the first iteration, also inside a ``with`` block. Raises
+        ``TazError(NOT_SUPPORTED)`` without sending anything if the daemon
+        does not advertise PROCESS_MONITOR, and ``ValueError`` without
+        sending anything for a negative ``pid``.
+        """
+        client = self._client
+        kv = keepalive if keepalive is not None else client._keepalive
+        req = process_pb2.ProcessMonitorRequest(pid=pid, interval_ms=interval_ms)
+        stream_id = client._conn.send_request(
+            common_pb2.OPCODE_PROCESS_MONITOR, req.SerializeToString()
+        )
+        return StreamIterator(
+            client,
+            stream_id,
+            common_pb2.OPCODE_PROCESS_MONITOR,
+            _parse_monitor_update,
+            keepalive=kv,
+            max_wait=max_wait,
+            overflow=overflow,
         )

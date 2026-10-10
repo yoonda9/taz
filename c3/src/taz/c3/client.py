@@ -196,11 +196,12 @@ class TazClient:
         if the daemon does not advertise CANCEL.
         """
         req = advanced_pb2.CancelRequest(target_stream_id=stream_id)
+        was_already_closed = self._dispatcher.is_closed(stream_id)
         resp = self._call(
             common_pb2.OPCODE_CANCEL,
             req.SerializeToString(),
             advanced_pb2.CancelResponse,
             keepalive,
         )
-        self._dispatcher.close_stream(stream_id)
+        self._dispatcher.close_after_cancel(stream_id, was_already_closed)
         return resp.cancelled

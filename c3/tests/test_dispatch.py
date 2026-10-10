@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import socket
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 from google.protobuf.message import Message
 from taz.c3.connection import Connection
 from taz.c3.errors import TazConnectionLost, TazProtocolError
-from taz.c3.protocol.dispatch import Dispatcher
+from taz.c3.protocol.dispatch import Dispatcher, MaxWaitExpired
 from taz.c3.protocol.frame import Frame, pack_header
 from taz.c3.settings import Backlog, Keepalive
 from taz.v1 import command_pb2, common_pb2, daemon_control_pb2, process_pb2
@@ -75,6 +76,22 @@ def _response(
 
 def _pong() -> bytes:
     return _frame_bytes(common_pb2.FRAME_TYPE_PONG, stream_id=0)
+
+
+def _cont_frame(stream_id: int, payload: bytes) -> bytes:
+    """One non-final RESPONSE frame (CONTINUATION set) for a streamed op."""
+    return _frame_bytes(
+        common_pb2.FRAME_TYPE_RESPONSE,
+        payload,
+        stream_id=stream_id,
+        flags=common_pb2.FRAME_FLAG_CONTINUATION,
+    )
+
+
+def _never_readable_sleeping(sock: object, timeout: float | None) -> bool:
+    """A _wait_readable fake that really sleeps, so deadlines really elapse."""
+    time.sleep(timeout if timeout is not None else 0)
+    return False
 
 
 # socket.socket has no sendmsg on Windows, where send_frame uses sendall; a
@@ -296,7 +313,7 @@ class TestBacklogOverflow:
     def test_backlog_fill_no_exception(self) -> None:
         """Filling the backlog with frames for another stream raises nothing."""
         # max_frames=4: add 5 frames for stream 2, then get the RESPONSE for stream 1.
-        frames = b"".join(_response(stream_id=2) for _ in range(5))
+        frames = b"".join(_cont_frame(2, b"") for _ in range(5))
         resp1 = _response(stream_id=1)
         backlog = Backlog(max_frames=4)
         _, _, d = _dispatcher(frames, resp1, backlog=backlog)
@@ -306,7 +323,7 @@ class TestBacklogOverflow:
 
     def test_overflowed_stream_joins_closed(self) -> None:
         """The overflowed stream ends up in the closed set."""
-        frames = b"".join(_response(stream_id=2) for _ in range(5))
+        frames = b"".join(_cont_frame(2, b"") for _ in range(5))
         resp1 = _response(stream_id=1)
         backlog = Backlog(max_frames=4)
         _, _, d = _dispatcher(frames, resp1, backlog=backlog)
@@ -316,7 +333,7 @@ class TestBacklogOverflow:
 
     def test_overflowed_stream_later_frames_discarded(self) -> None:
         """Frames for the overflowed stream arriving after overflow are discarded."""
-        frames = b"".join(_response(stream_id=2) for _ in range(5))
+        frames = b"".join(_cont_frame(2, b"") for _ in range(5))
         resp1 = _response(stream_id=1)
         resp2_late = _response(stream_id=2)
         resp1_b = _response(stream_id=1, opcode=common_pb2.OPCODE_VERSION)
@@ -330,7 +347,7 @@ class TestBacklogOverflow:
 
     def test_no_cancel_when_not_advertised(self) -> None:
         """CANCEL is not sent when the daemon does not advertise it."""
-        frames = b"".join(_response(stream_id=2) for _ in range(5))
+        frames = b"".join(_cont_frame(2, b"") for _ in range(5))
         resp1 = _response(stream_id=1)
         backlog = Backlog(max_frames=4)
         # No OPCODE_CANCEL in operations.
@@ -342,7 +359,7 @@ class TestBacklogOverflow:
 
     def test_cancel_sent_when_advertised(self) -> None:
         """CANCEL REQUEST is sent for the victim when OPCODE_CANCEL is advertised."""
-        frames = b"".join(_response(stream_id=2) for _ in range(5))
+        frames = b"".join(_cont_frame(2, b"") for _ in range(5))
         resp1 = _response(stream_id=1)
         backlog = Backlog(max_frames=4)
         conn, sock, d = _dispatcher(
@@ -365,7 +382,7 @@ class TestBacklogOverflow:
         """Overflow triggers when bytes limit is reached."""
         payload = b"x" * 100
         # max_bytes=250: third frame (cumulative 300 bytes) triggers overflow.
-        frames = b"".join(_response(stream_id=2, payload=payload) for _ in range(3))
+        frames = b"".join(_cont_frame(2, payload) for _ in range(3))
         resp1 = _response(stream_id=1)
         backlog = Backlog(max_frames=999, max_bytes=250)
         _, _, d = _dispatcher(frames, resp1, backlog=backlog)
@@ -717,3 +734,405 @@ class TestChunkedResponse:
         assert _exec_response(first).stdout_data == b"a"
         assert not second.flags & common_pb2.FRAME_FLAG_CONTINUATION
         assert _exec_response(second).stdout_data == b"b"
+
+
+# ---------------------------------------------------------------------------
+# TestClosedStreamLeaveRule: a closed id leaves the set on its final frame
+# ---------------------------------------------------------------------------
+
+
+class TestClosedStreamLeaveRule:
+    def test_continuation_response_for_closed_stream_stays_closed(self) -> None:
+        """A RESPONSE with CONTINUATION for a closed stream stays discarded, closed."""
+        cont = _cont_frame(7, b"")
+        resp1 = _response(stream_id=1)
+        _, _, d = _dispatcher(cont, resp1)
+        d.close_stream(7)
+
+        frame = d.recv_response(1, Keepalive.OFF)
+
+        assert frame.stream_id == 1
+        assert 7 in d._closed
+
+    def test_final_response_for_closed_stream_leaves_set(self) -> None:
+        """A RESPONSE without CONTINUATION for a closed stream removes it (§11)."""
+        final = _frame_bytes(common_pb2.FRAME_TYPE_RESPONSE, stream_id=7, flags=0)
+        resp1 = _response(stream_id=1)
+        _, _, d = _dispatcher(final, resp1)
+        d.close_stream(7)
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert 7 not in d._closed
+
+    def test_error_for_closed_stream_leaves_set(self) -> None:
+        error = _frame_bytes(common_pb2.FRAME_TYPE_ERROR, stream_id=7)
+        resp1 = _response(stream_id=1)
+        _, _, d = _dispatcher(error, resp1)
+        d.close_stream(7)
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert 7 not in d._closed
+
+    def test_final_file_chunk_for_closed_stream_leaves_set(self) -> None:
+        chunk = _frame_bytes(common_pb2.FRAME_TYPE_FILE_CHUNK, stream_id=7, flags=0)
+        resp1 = _response(stream_id=1)
+        _, _, d = _dispatcher(chunk, resp1)
+        d.close_stream(7)
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert 7 not in d._closed
+
+    def test_leave_rule_applies_in_recv_pong(self) -> None:
+        final = _frame_bytes(common_pb2.FRAME_TYPE_RESPONSE, stream_id=7, flags=0)
+        pong = _pong()
+        _, _, d = _dispatcher(final, pong)
+        d.close_stream(7)
+
+        d.recv_pong(Keepalive.OFF)
+
+        assert 7 not in d._closed
+
+    def test_later_frame_for_left_stream_is_buffered_not_discarded(self) -> None:
+        """Proves the leave happened: a later frame for 7 is now buffered."""
+        final = _frame_bytes(common_pb2.FRAME_TYPE_RESPONSE, stream_id=7, flags=0)
+        later = _response(stream_id=7)
+        resp1 = _response(stream_id=1)
+        _, _, d = _dispatcher(final, later, resp1)
+        d.close_stream(7)
+
+        d.recv_response(1, Keepalive.OFF)
+        frame7 = d.recv_response(7, Keepalive.OFF)
+
+        assert frame7.stream_id == 7
+
+
+# ---------------------------------------------------------------------------
+# TestStreamIdWrap: closed-set reset on stream-id reuse, stream_assigned_hook
+# ---------------------------------------------------------------------------
+
+
+class TestStreamIdWrap:
+    def test_wrap_discards_stale_closed_entry(self) -> None:
+        """A reused id after the counter wraps leaves the closed set."""
+        conn, _, d = _dispatcher(operations=[common_pb2.OPCODE_PING])
+        conn._next_stream_id = 0xFFFFFFFF
+        d.close_stream(1)
+
+        first = conn.send_request(common_pb2.OPCODE_PING, b"")
+        second = conn.send_request(common_pb2.OPCODE_PING, b"")
+
+        assert first == 0xFFFFFFFF
+        assert second == 1
+        assert 1 not in d._closed
+
+
+# ---------------------------------------------------------------------------
+# TestPerStreamOverflowCancel: the "cancel" overflow policy
+# ---------------------------------------------------------------------------
+
+
+class TestPerStreamOverflowCancel:
+    def test_registered_cancel_records_error_naming_the_limit(self) -> None:
+        frames = b"".join(_cont_frame(2, b"") for _ in range(5))
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=4)
+        conn, _, d = _dispatcher(
+            frames,
+            resp1,
+            backlog=backlog,
+            operations=[common_pb2.OPCODE_PING, common_pb2.OPCODE_CANCEL],
+        )
+        d.register_stream(2, "cancel")
+        assert conn.send_request(common_pb2.OPCODE_PING, b"") == 1
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert 2 in d._closed
+        error = d.stream_error(2)
+        assert error is not None
+        assert error.code == common_pb2.ERROR_CODE_CANCELLED
+        assert "4 frames" in error.message
+        assert "slower interval" in error.message
+
+    def test_registered_cancel_no_cancel_sent_when_unadvertised(self) -> None:
+        frames = b"".join(_cont_frame(2, b"") for _ in range(5))
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=4)
+        _, sock, d = _dispatcher(frames, resp1, backlog=backlog)
+        d.register_stream(2, "cancel")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert _send_count(sock) == 0
+        assert 2 in d._closed
+        assert d.stream_error(2) is not None
+
+    def test_unregistered_stream_behaves_as_cancel(self) -> None:
+        """Today's default policy: an unregistered stream still gets an error."""
+        frames = b"".join(_cont_frame(2, b"") for _ in range(5))
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=4)
+        _, _, d = _dispatcher(frames, resp1, backlog=backlog)
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert 2 in d._closed
+        error = d.stream_error(2)
+        assert error is not None
+        assert error.code == common_pb2.ERROR_CODE_CANCELLED
+
+
+# ---------------------------------------------------------------------------
+# TestPerStreamOverflowDropOldest: the "drop_oldest" overflow policy
+# ---------------------------------------------------------------------------
+
+
+class TestPerStreamOverflowDropOldest:
+    def test_drop_oldest_keeps_stream_open_and_counts_dropped(self) -> None:
+        frames = b"".join(_cont_frame(2, bytes([c])) for c in b"012345")
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=4)
+        _, sock, d = _dispatcher(
+            frames,
+            resp1,
+            backlog=backlog,
+            operations=[common_pb2.OPCODE_CANCEL],
+        )
+        d.register_stream(2, "drop_oldest")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert 2 not in d._closed
+        assert d.stream_dropped(2) == 2
+        remaining = [bytes(f.payload) for f in d._buffer[2]]
+        assert remaining == [b"2", b"3", b"4", b"5"]
+        assert _send_count(sock) == 0
+
+    def test_exact_boundary_four_frames_no_drop(self) -> None:
+        frames = b"".join(_cont_frame(2, bytes([c])) for c in b"0123")
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=4)
+        _, _, d = _dispatcher(frames, resp1, backlog=backlog)
+        d.register_stream(2, "drop_oldest")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert d.stream_dropped(2) == 0
+
+    def test_fifth_frame_triggers_exactly_one_drop(self) -> None:
+        frames = b"".join(_cont_frame(2, bytes([c])) for c in b"01234")
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=4)
+        _, _, d = _dispatcher(frames, resp1, backlog=backlog)
+        d.register_stream(2, "drop_oldest")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert d.stream_dropped(2) == 1
+
+    def test_bytes_limit_triggers_drop_oldest(self) -> None:
+        payload = b"x" * 100
+        frames = b"".join(_cont_frame(2, payload) for _ in range(3))
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=999, max_bytes=250)
+        _, _, d = _dispatcher(frames, resp1, backlog=backlog)
+        d.register_stream(2, "drop_oldest")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert d.stream_dropped(2) == 1
+        assert 2 not in d._closed
+
+    def test_final_frame_never_dropped_when_update_also_buffered(self) -> None:
+        """buffered [update(CONT), final]: the update drops, the final survives."""
+        frames = _cont_frame(2, b"u") + _frame_bytes(
+            common_pb2.FRAME_TYPE_RESPONSE, b"final", stream_id=2, flags=0
+        )
+        other = _response(stream_id=3)
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=2)
+        _, _, d = _dispatcher(frames, other, resp1, backlog=backlog)
+        d.register_stream(2, "drop_oldest")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert d.stream_dropped(2) == 1
+        remaining = [bytes(f.payload) for f in d._buffer[2]]
+        assert remaining == [b"final"]
+
+    def test_final_only_buffer_is_skipped_search_continues(self) -> None:
+        """A final-only buffer can't yield a frame; the tied next victim does."""
+        final2 = _frame_bytes(
+            common_pb2.FRAME_TYPE_RESPONSE, b"final2", stream_id=2, flags=0
+        )
+        cont4 = _cont_frame(4, b"a")
+        other = _response(stream_id=5)
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=2)
+        _, _, d = _dispatcher(final2, cont4, other, resp1, backlog=backlog)
+        d.register_stream(2, "drop_oldest")
+        d.register_stream(4, "drop_oldest")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert d.stream_dropped(2) == 0
+        assert d.stream_dropped(4) == 1
+        assert [bytes(f.payload) for f in d._buffer[2]] == [b"final2"]
+
+    def test_no_droppable_frame_anywhere_buffers_incoming_overshoot(self) -> None:
+        """Nothing to drop → the incoming frame is buffered anyway."""
+        final2 = _frame_bytes(
+            common_pb2.FRAME_TYPE_RESPONSE, b"final2", stream_id=2, flags=0
+        )
+        other = _response(stream_id=3)
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=1)
+        _, _, d = _dispatcher(final2, other, resp1, backlog=backlog)
+        d.register_stream(2, "drop_oldest")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert d._total_frames == backlog.max_frames + 1
+        assert 2 not in d._closed
+        assert [bytes(f.payload) for f in d._buffer[2]] == [b"final2"]
+        assert d._buffer[3][0].stream_id == 3
+
+
+# ---------------------------------------------------------------------------
+# TestPerStreamOverflowMixed: the most-buffered stream's own policy applies
+# ---------------------------------------------------------------------------
+
+
+class TestPerStreamOverflowMixed:
+    def test_most_buffered_streams_own_policy_applies(self) -> None:
+        """Stream 2 (drop_oldest, 2 frames) outranks stream 3 (cancel, 1 frame)."""
+        frames = _cont_frame(2, b"a") + _cont_frame(2, b"b") + _cont_frame(3, b"x")
+        trigger = _response(stream_id=4)
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=3)
+        _, sock, d = _dispatcher(
+            frames,
+            trigger,
+            resp1,
+            backlog=backlog,
+            operations=[common_pb2.OPCODE_CANCEL],
+        )
+        d.register_stream(2, "drop_oldest")
+        d.register_stream(3, "cancel")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert d.stream_dropped(2) == 1
+        assert [bytes(f.payload) for f in d._buffer[2]] == [b"b"]
+        assert 3 not in d._closed
+        assert _send_count(sock) == 0
+
+    def test_tie_breaks_to_lowest_stream_id(self) -> None:
+        frames = _cont_frame(3, b"x") + _cont_frame(2, b"y")
+        trigger = _response(stream_id=4)
+        resp1 = _response(stream_id=1)
+        backlog = Backlog(max_frames=2)
+        _, _, d = _dispatcher(frames, trigger, resp1, backlog=backlog)
+        d.register_stream(2, "drop_oldest")
+        d.register_stream(3, "drop_oldest")
+
+        d.recv_response(1, Keepalive.OFF)
+
+        assert d.stream_dropped(2) == 1
+        assert d.stream_dropped(3) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestMaxWait: recv_response(max_wait=...) deadline
+# ---------------------------------------------------------------------------
+
+
+class TestMaxWait:
+    def test_expires_when_wait_never_readable(self) -> None:
+        _, _, d = _dispatcher(_wait_readable=_never_readable_sleeping)
+
+        with pytest.raises(MaxWaitExpired):
+            d.recv_response(1, Keepalive.OFF, max_wait=0.05)
+
+    def test_frame_for_other_stream_does_not_extend_deadline(self) -> None:
+        other = _response(stream_id=2)
+        waits: list[float | None] = []
+        calls = {"n": 0}
+
+        def fake_wait(sock: object, timeout: float | None) -> bool:
+            waits.append(timeout)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                time.sleep(0.03)
+                return True
+            time.sleep(timeout if timeout is not None else 0)
+            return False
+
+        _, _, d = _dispatcher(other, _wait_readable=fake_wait)
+
+        with pytest.raises(MaxWaitExpired):
+            d.recv_response(1, Keepalive.OFF, max_wait=0.05)
+
+        # Had the other stream's frame reset the deadline, the second wait
+        # would be back near 0.05 s. The bounds allow for float rounding and
+        # for Windows' coarse (~15.6 ms) monotonic clock.
+        assert waits[0] is not None and 0.04 < waits[0] <= 0.05 + 1e-9
+        assert waits[1] is not None and waits[1] < 0.045
+
+    def test_pong_during_wait_does_not_extend_deadline(self) -> None:
+        pong = _pong()
+        waits: list[float | None] = []
+        calls = {"n": 0}
+
+        def fake_wait(sock: object, timeout: float | None) -> bool:
+            waits.append(timeout)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                time.sleep(0.03)
+                return True
+            time.sleep(timeout if timeout is not None else 0)
+            return False
+
+        _, _, d = _dispatcher(pong, _wait_readable=fake_wait)
+
+        with pytest.raises(MaxWaitExpired):
+            d.recv_response(1, Keepalive.OFF, max_wait=0.05)
+
+        # Same bounds as the other-stream test above.
+        assert waits[1] is not None and waits[1] < 0.045
+
+    def test_buffered_frame_returns_immediately_with_zero_max_wait(self) -> None:
+        resp2 = _response(stream_id=2)
+        resp1 = _response(stream_id=1)
+        _, _, d = _dispatcher(resp2, resp1)
+        d.recv_response(1, Keepalive.OFF)  # buffers resp2
+
+        frame = d.recv_response(2, Keepalive.OFF, max_wait=0.0)
+
+        assert frame.stream_id == 2
+
+    def test_ping_sent_before_expiry_when_idle_shorter_than_max_wait(self) -> None:
+        _, sock, d = _dispatcher(_wait_readable=_never_readable_sleeping)
+
+        with pytest.raises(MaxWaitExpired):
+            d.recv_response(1, Keepalive(idle=0.02, timeout=5.0), max_wait=0.1)
+
+        assert _send_count(sock) >= 1
+
+    def test_max_wait_none_is_unbounded_as_before(self) -> None:
+        resp1 = _response(stream_id=1)
+        waits: list[float | None] = []
+
+        def fake_wait(sock: object, timeout: float | None) -> bool:
+            waits.append(timeout)
+            return True
+
+        _, _, d = _dispatcher(resp1, _wait_readable=fake_wait)
+
+        frame = d.recv_response(1, Keepalive(idle=7.0, timeout=15.0), max_wait=None)
+
+        assert frame.stream_id == 1
+        assert waits == [7.0]

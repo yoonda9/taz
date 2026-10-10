@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import socket
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 
 from taz.c3.errors import TazConnectionLost, TazError, TazProtocolError
 from taz.c3.protocol.frame import (
@@ -32,6 +32,10 @@ class Connection:
         self._limits: dict[int, int] = dict(DEFAULT_MAX_PAYLOAD)
         self._failure: BaseException | None = None
         self._next_stream_id: int = 1
+        # Set by Dispatcher at construction: called with a REQUEST's
+        # stream_id right before it is sent, so a closed-set entry does not
+        # outlive the counter wrapping back to that id.
+        self.stream_assigned_hook: Callable[[int], None] | None = None
 
     def connect(self, host: str, port: int) -> None:
         """Open a TCP connection and complete the CAPABILITY handshake."""
@@ -164,6 +168,8 @@ class Connection:
             raise RuntimeError("not connected")
         stream_id = self._next_stream_id
         self._next_stream_id = self._next_stream_id % 0xFFFFFFFF + 1
+        if self.stream_assigned_hook is not None:
+            self.stream_assigned_hook(stream_id)
         frame = Frame(
             type=common_pb2.FRAME_TYPE_REQUEST,
             flags=0,
