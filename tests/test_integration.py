@@ -474,9 +474,158 @@ class TestConnectionTimeout:
         assert taz_client.timeout(500) == 0
         assert taz_client.timeout(1000) == 500
 
-    def test_capabilities_advertise_timeout_set(self, taz_client: TazClient) -> None:
-        cap = taz_client.capabilities()
-        assert common_pb2.OPCODE_TIMEOUT_SET in set(cap.operations)
+    def test_capabilities_advertise_timeout_set_and_log_and_run_as_only_as_root(
+        self, taz_client: TazClient
+    ) -> None:
+        ops = set(taz_client.capabilities().operations)
+        assert common_pb2.OPCODE_TIMEOUT_SET in ops
+        assert common_pb2.OPCODE_LOG in ops
+        assert (common_pb2.OPCODE_RUN_AS in ops) == _DAEMON_IS_ROOT
+
+
+# The fixture's daemon inherits the test process's identity.
+_DAEMON_IS_ROOT = sys.platform != "win32" and os.geteuid() == 0
+
+_ROOT_ONLY = pytest.mark.skipif(
+    not _DAEMON_IS_ROOT,
+    reason="RUN_AS's privileged rows need a daemon started as root; no "
+    "gate runs as root, so these never run here - the C unit tests "
+    "(test_run_as.cpp) are the real proof",
+)
+
+_UNPRIVILEGED_ONLY = pytest.mark.skipif(
+    _DAEMON_IS_ROOT,
+    reason="a daemon started as root advertises RUN_AS; the test_root_* "
+    "rows cover it instead",
+)
+
+# A program the RUN_AS target can always execute: sys.executable may sit
+# under a home directory (e.g. a 0700 /home/<user>) the target cannot
+# traverse.
+_ID = "id"
+
+
+class TestRunAs:
+    """``RUN_AS`` (0x0040) is POSIX-only, gated by the daemon's *real*
+    privilege (not a client-side switch), and deferred entirely on
+    Windows. Most of this class only runs when euid is 0."""
+
+    @_UNPRIVILEGED_ONLY
+    def test_not_privileged_run_as_raises_not_supported_and_sends_nothing(
+        self, taz_client: TazClient
+    ) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.run_as("someone")
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
+        # Local rejection (RUN_AS is unadvertised): the connection is fine.
+        taz_client.ping()
+
+    @_UNPRIVILEGED_ONLY
+    def test_not_privileged_as_user_returns_not_supported_from_daemon(
+        self, taz_client: TazClient
+    ) -> None:
+        # Unlike run_as() above, COMMAND_EXEC is advertised, so as_user
+        # reaches the daemon and comes back as a real ERROR reply.
+        with pytest.raises(TazError) as exc_info:
+            taz_client.command.exec(PY, args=_py("print('hi')"), as_user="someone")
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
+        taz_client.ping()
+
+    @_ROOT_ONLY
+    def test_root_run_as_switches_and_resets_command_exec_identity(
+        self, taz_client: TazClient
+    ) -> None:
+        if sys.platform == "win32":
+            return  # unreachable at runtime; gives mypy the platform narrowing
+        import pwd
+
+        target_user = os.environ.get("TAZ_TEST_USER", "nobody")
+        target_uid = pwd.getpwnam(target_user).pw_uid
+
+        assert taz_client.run_as(target_user) == target_user
+        result = taz_client.command.exec(_ID, args=["-u"])
+        assert result.stdout.strip() == str(target_uid).encode()
+
+        assert taz_client.run_as("") == pwd.getpwuid(os.geteuid()).pw_name
+        result = taz_client.command.exec(_ID, args=["-u"])
+        assert result.stdout.strip() == b"0"
+
+    @_ROOT_ONLY
+    def test_root_run_as_sets_user_logname_and_home(
+        self, taz_client: TazClient
+    ) -> None:
+        if sys.platform == "win32":
+            return  # unreachable at runtime; gives mypy the platform narrowing
+        import pwd
+
+        target_user = os.environ.get("TAZ_TEST_USER", "nobody")
+        target_home = pwd.getpwnam(target_user).pw_dir or "/"
+        show = ["-c", 'printf "%s %s %s" "$USER" "$LOGNAME" "$HOME"']
+
+        assert taz_client.run_as(target_user) == target_user
+        result = taz_client.command.exec("sh", args=show)
+        assert result.stdout == f"{target_user} {target_user} {target_home}".encode()
+        # The request's own env still wins.
+        result = taz_client.command.exec("sh", args=show, env={"HOME": "/custom-home"})
+        assert result.stdout == f"{target_user} {target_user} /custom-home".encode()
+
+    @_ROOT_ONLY
+    def test_root_per_call_as_user_overrides_connection_identity(
+        self, taz_client: TazClient
+    ) -> None:
+        if sys.platform == "win32":
+            return  # unreachable at runtime; gives mypy the platform narrowing
+        import pwd
+
+        target_user = os.environ.get("TAZ_TEST_USER", "nobody")
+        target_uid = pwd.getpwnam(target_user).pw_uid
+
+        result = taz_client.command.exec(_ID, args=["-u"], as_user=target_user)
+        assert result.stdout.strip() == str(target_uid).encode()
+
+        assert taz_client.run_as(target_user) == target_user
+        result = taz_client.command.exec(_ID, args=["-u"], as_user="root")
+        assert result.stdout.strip() == b"0"
+        # The override applies to that call only.
+        result = taz_client.command.exec(_ID, args=["-u"])
+        assert result.stdout.strip() == str(target_uid).encode()
+
+    @_ROOT_ONLY
+    def test_root_run_as_still_allows_root_only_file_stat(
+        self, taz_client: TazClient
+    ) -> None:
+        target_user = os.environ.get("TAZ_TEST_USER", "nobody")
+        assert taz_client.run_as(target_user) == target_user
+        try:
+            # Only the spawned COMMAND_EXEC child's identity switches, never
+            # the daemon's own - a root-only path stays readable.
+            info = taz_client.file.stat("/etc/shadow")
+            assert info.size >= 0
+        finally:
+            taz_client.run_as("")
+
+    @_ROOT_ONLY
+    def test_root_run_as_unknown_user_returns_not_found(
+        self, taz_client: TazClient
+    ) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.run_as("definitely-no-such-user")
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_demo_timeout_run_as_and_log(self, taz_client: TazClient) -> None:
+        taz_client.timeout(5000)
+        if sys.platform != "win32" and os.geteuid() == 0:
+            import pwd
+
+            target_user = os.environ.get("TAZ_TEST_USER", "nobody")
+            assert taz_client.run_as(target_user) == target_user
+            result = taz_client.command.exec("whoami")
+            assert result.stdout.strip() == target_user.encode()
+            assert taz_client.run_as("") == pwd.getpwuid(os.geteuid()).pw_name
+        result = taz_client.command.exec(PY, args=_py("print('demo')"))
+        assert result.exit_code == 0
+        entries = taz_client.log(lines=10)
+        assert len(entries) >= 1
 
 
 @pytest.mark.slow

@@ -5,6 +5,7 @@
 #include <pb_encode.h>
 
 #include "taz/build_info.h"
+#include "taz/run_as.h"
 #include "taz/v1/common.pb.h"
 #include "taz/v1/daemon_control.pb.h"
 #include "taz/version.h"
@@ -50,6 +51,13 @@ size_t taz_payload_capability(uint8_t *buf, size_t bufsize)
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_PROCESS_MONITOR;
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_LOG;
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_TIMEOUT_SET;
+        /* RUN_AS is advertised only on a privileged daemon: an
+         * unprivileged one answers NOT_SUPPORTED anyway, and the client
+         * refuses locally for an unadvertised opcode before sending. */
+        if (taz_run_as_privileged())
+        {
+            msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_RUN_AS;
+        }
         msg.operations_count = op;
     }
     msg.compression_count = 1U;

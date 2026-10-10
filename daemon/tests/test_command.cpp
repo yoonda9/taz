@@ -1,10 +1,13 @@
 // Unit tests for handlers/command.c: CommandExecRequest/-Response wire
-// round-trips, the exec-result-to-RESPONSE encoder, and the connection-
-// timeout snapshot taken before taz_exec_start.
+// round-trips, the exec-result-to-RESPONSE encoder, the connection-timeout
+// snapshot taken before taz_exec_start, and the as_user identity
+// precedence taz_command_resolve_as_user computes.
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
@@ -13,10 +16,17 @@
 #include <gtest/gtest.h>
 #include <pb_decode.h>
 #include <pb_encode.h>
+#include <uv.h>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "handlers/command.h"
+#include "run_as_test_support.h"
 #include "taz/exec.h"
 #include "taz/frame.h"
+#include "taz/run_as.h"
 #include "taz/v1/command.pb.h"
 #include "taz/v1/common.pb.h"
 
@@ -136,6 +146,121 @@ std::vector<uint8_t> encode_exec_request(const std::string &command,
     buf.resize(ostream.bytes_written);
     return buf;
 }
+
+// Builds a CommandExecRequest naming command with the given as_user and no
+// per-call timeout - for the as_user precedence wiring tests, which never
+// reach taz_exec_start on the rows that exercise this helper (NOT_SUPPORTED/
+// NOT_FOUND return before the spawn).
+std::vector<uint8_t>
+encode_exec_request_with_as_user(const std::string &command,
+                                 const std::string &as_user)
+{
+    auto req = std::make_unique<taz_v1_CommandExecRequest>();
+    (void)strncpy(req->command, command.c_str(), sizeof(req->command) - 1U);
+    (void)strncpy(req->as_user, as_user.c_str(), sizeof(req->as_user) - 1U);
+
+    std::vector<uint8_t> buf(taz_v1_CommandExecRequest_size);
+    pb_ostream_t ostream = pb_ostream_from_buffer(buf.data(), buf.size());
+    EXPECT_TRUE(
+        pb_encode(&ostream, taz_v1_CommandExecRequest_fields, req.get()));
+    buf.resize(ostream.bytes_written);
+    return buf;
+}
+
+// RAII scratch /etc/passwd-style file in a fresh temp directory, removed on
+// scope exit - used only by the real-spawn PERMISSION_DENIED row below
+// (CommandResolveAsUserTest's fixture owns its own copy of this setup for
+// its per-test SetUp/TearDown lifecycle; this one-off does not need it).
+class TempPasswdFile
+{
+  public:
+    explicit TempPasswdFile(const std::string &contents)
+    {
+        char tmpdir[1024];
+        size_t tmpdir_len = sizeof(tmpdir) - 1U;
+        EXPECT_EQ(uv_os_tmpdir(tmpdir, &tmpdir_len), 0);
+        const std::string tpl_str =
+            std::string(tmpdir, tmpdir_len) + "/taz_spawn_test_XXXXXX";
+        std::vector<char> tpl(tpl_str.begin(), tpl_str.end());
+        tpl.push_back('\0');
+        uv_fs_t req;
+        EXPECT_EQ(uv_fs_mkdtemp(nullptr, &req, tpl.data(), nullptr), 0);
+        dir_ = req.path;
+        uv_fs_req_cleanup(&req);
+        path_ = dir_ + "/passwd";
+        std::ofstream out(path_, std::ios::binary | std::ios::trunc);
+        out << contents;
+    }
+    ~TempPasswdFile()
+    {
+        uv_fs_t unlink_req;
+        (void)uv_fs_unlink(nullptr, &unlink_req, path_.c_str(), nullptr);
+        uv_fs_req_cleanup(&unlink_req);
+        uv_fs_t rmdir_req;
+        (void)uv_fs_rmdir(nullptr, &rmdir_req, dir_.c_str(), nullptr);
+        uv_fs_req_cleanup(&rmdir_req);
+    }
+    TempPasswdFile(const TempPasswdFile &) = delete;
+    TempPasswdFile &operator=(const TempPasswdFile &) = delete;
+
+    const std::string &Path() const
+    {
+        return path_;
+    }
+
+  private:
+    std::string dir_;
+    std::string path_;
+};
+
+// Fixture for taz_command_resolve_as_user: a scratch /etc/passwd-style file
+// the privileged rows inject via ScopedPasswdPath. Mirrors test_fsutil.cpp's
+// PasswdLookupByName fixture.
+class CommandResolveAsUserTest : public ::testing::Test
+{
+  protected:
+    void SetUp() override
+    {
+        char tmpdir[1024];
+        size_t tmpdir_len = sizeof(tmpdir) - 1U;
+        ASSERT_EQ(uv_os_tmpdir(tmpdir, &tmpdir_len), 0);
+        const std::string tpl_str =
+            std::string(tmpdir, tmpdir_len) + "/taz_command_test_XXXXXX";
+        std::vector<char> tpl(tpl_str.begin(), tpl_str.end());
+        tpl.push_back('\0');
+
+        uv_fs_t req;
+        ASSERT_EQ(uv_fs_mkdtemp(nullptr, &req, tpl.data(), nullptr), 0);
+        dir_ = req.path;
+        uv_fs_req_cleanup(&req);
+        passwd_path_ = dir_ + "/passwd";
+    }
+
+    void TearDown() override
+    {
+        uv_fs_t unlink_req;
+        (void)uv_fs_unlink(nullptr, &unlink_req, passwd_path_.c_str(), nullptr);
+        uv_fs_req_cleanup(&unlink_req);
+        uv_fs_t rmdir_req;
+        (void)uv_fs_rmdir(nullptr, &rmdir_req, dir_.c_str(), nullptr);
+        uv_fs_req_cleanup(&rmdir_req);
+    }
+
+    void WritePasswd(const std::string &contents) const
+    {
+        std::ofstream out(passwd_path_, std::ios::binary | std::ios::trunc);
+        out << contents;
+    }
+
+    const std::string &PasswdPath() const
+    {
+        return passwd_path_;
+    }
+
+  private:
+    std::string dir_;
+    std::string passwd_path_;
+};
 
 // ---------------------------------------------------------------------------
 // Request round-trip
@@ -481,5 +606,224 @@ TEST_F(CommandExecSnapshotTest, LaterTimeoutSetDoesNotRetargetInFlightExec)
     EXPECT_TRUE(resp.timed_out);
     EXPECT_LT(elapsed, std::chrono::seconds(10));
 }
+
+// ---------------------------------------------------------------------------
+// taz_command_resolve_as_user: the precedence between a per-call
+// as_user override, the connection's RUN_AS identity, and no switch at
+// all. Pure - never spawns - so these build a bare taz_dispatch_t/
+// taz_exec_spec_t/CommandExecRequest and call it directly, without going
+// through dispatch or a real loop.
+// ---------------------------------------------------------------------------
+
+TEST_F(CommandResolveAsUserTest,
+       PerCallOverrideNotPrivilegedReturnsNotSupported)
+{
+    const ScopedPrivilege unprivileged(0);
+    auto req = std::make_unique<taz_v1_CommandExecRequest>();
+    (void)strncpy(req->as_user, "alice", sizeof(req->as_user) - 1U);
+
+    const taz_dispatch_t d{};
+    taz_exec_spec_t spec{};
+    taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *error_message = nullptr;
+
+    EXPECT_NE(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
+                                          &error_message),
+              0);
+    EXPECT_EQ(error_code, taz_v1_ErrorCode_ERROR_CODE_NOT_SUPPORTED);
+    EXPECT_NE(error_message, nullptr);
+    EXPECT_FALSE(spec.switch_identity);
+}
+
+// taz_run_as_set_privileged_for_tests is a documented no-op on _WIN32
+// (RUN_AS is deferred there regardless, so taz_run_as_privileged stays
+// hard-0), so the two rows below cannot run there - the per-call override
+// would see NOT_SUPPORTED, matching PerCallOverrideNotPrivilegedReturns-
+// NotSupported above instead of the privileged behaviour under test.
+#ifndef _WIN32
+
+TEST_F(CommandResolveAsUserTest,
+       PerCallOverridePrivilegedUnknownUserReturnsNotFound)
+{
+    const ScopedPrivilege privileged(1);
+    WritePasswd("alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
+    const ScopedPasswdPath passwd(PasswdPath());
+
+    auto req = std::make_unique<taz_v1_CommandExecRequest>();
+    (void)strncpy(req->as_user, "ghost", sizeof(req->as_user) - 1U);
+
+    const taz_dispatch_t d{};
+    taz_exec_spec_t spec{};
+    taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *error_message = nullptr;
+
+    EXPECT_NE(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
+                                          &error_message),
+              0);
+    EXPECT_EQ(error_code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+    EXPECT_FALSE(spec.switch_identity);
+}
+
+TEST_F(CommandResolveAsUserTest,
+       PerCallOverridePrivilegedKnownUserWinsOverConnectionIdentity)
+{
+    const ScopedPrivilege privileged(1);
+    WritePasswd("alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
+    const ScopedPasswdPath passwd(PasswdPath());
+
+    auto req = std::make_unique<taz_v1_CommandExecRequest>();
+    (void)strncpy(req->as_user, "alice", sizeof(req->as_user) - 1U);
+
+    taz_dispatch_t d{};
+    // A different connection identity is active; the per-call override
+    // must win outright, not merge with or defer to it.
+    d.run_as_active = 1;
+    d.run_as_uid = 9999U;
+    d.run_as_gid = 9999U;
+
+    taz_exec_spec_t spec{};
+    taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *error_message = nullptr;
+
+    EXPECT_EQ(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
+                                          &error_message),
+              0);
+    EXPECT_TRUE(spec.switch_identity);
+    EXPECT_EQ(spec.uid, 4242U);
+    EXPECT_EQ(spec.gid, 4243U);
+    EXPECT_STREQ(spec.identity_user, "alice");
+    EXPECT_STREQ(spec.identity_home, "/home/alice");
+}
+
+#endif /* !_WIN32 */
+
+TEST(CommandResolveAsUser, ConnectionIdentityAppliesWhenAsUserEmpty)
+{
+    auto req = std::make_unique<taz_v1_CommandExecRequest>(); // as_user == ""
+
+    taz_dispatch_t d{};
+    d.run_as_active = 1;
+    // taz_exec_spec_t::uid/gid is uv_uid_t/uv_gid_t, a 1-byte stub type on
+    // Windows (unused there, but this TU still compiles for that target),
+    // so these values must fit an unsigned char on every platform.
+    d.run_as_uid = 77U;
+    d.run_as_gid = 88U;
+    (void)snprintf(d.run_as_user, sizeof(d.run_as_user), "%s", "carol");
+    (void)snprintf(d.run_as_home, sizeof(d.run_as_home), "%s", "/home/carol");
+
+    taz_exec_spec_t spec{};
+    taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *error_message = nullptr;
+
+    EXPECT_EQ(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
+                                          &error_message),
+              0);
+    EXPECT_TRUE(spec.switch_identity);
+    EXPECT_EQ(spec.uid, 77U);
+    EXPECT_EQ(spec.gid, 88U);
+    EXPECT_STREQ(spec.identity_user, "carol");
+    EXPECT_STREQ(spec.identity_home, "/home/carol");
+}
+
+TEST(CommandResolveAsUser, NoSwitchWhenNeitherAsUserNorConnectionIdentitySet)
+{
+    auto req = std::make_unique<taz_v1_CommandExecRequest>();
+
+    const taz_dispatch_t d{};
+    taz_exec_spec_t spec{};
+    taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *error_message = nullptr;
+
+    EXPECT_EQ(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
+                                          &error_message),
+              0);
+    EXPECT_FALSE(spec.switch_identity);
+}
+
+// ---------------------------------------------------------------------------
+// handle_command_exec wiring: the as_user precedence's error rows surface
+// as the expected ERROR frame through the real dispatch path (not just the
+// pure resolve function above). Both rows return before taz_exec_start, so
+// no process is ever spawned here.
+// ---------------------------------------------------------------------------
+
+TEST_F(CommandExecSnapshotTest, AsUserNotPrivilegedReturnsNotSupported)
+{
+    const ScopedPrivilege unprivileged(0);
+    DispatchExec(
+        encode_exec_request_with_as_user(TAZ_TEST_SLEEPER_PATH, "alice"), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    pb_istream_t istream = pb_istream_from_buffer(
+        Frames()[0].data() + TAZ_FRAME_HEADER_SIZE,
+        Frames()[0].size() - static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_SUPPORTED);
+}
+
+// taz_run_as_set_privileged_for_tests is a documented no-op on _WIN32
+// (RUN_AS is deferred there regardless, so taz_run_as_privileged stays
+// hard-0), so the two rows below cannot run there - as_user would see
+// NOT_SUPPORTED instead of the privileged behaviour under test, and the
+// real-spawn row's identity switch (taz_exec_apply_identity) is itself a
+// no-op on Windows.
+#ifndef _WIN32
+
+TEST_F(CommandExecSnapshotTest, AsUserPrivilegedUnknownUserReturnsNotFound)
+{
+    const ScopedPrivilege privileged(1);
+    taz_run_as_set_passwd_path_for_tests("/nonexistent/taz-test-passwd");
+
+    DispatchExec(
+        encode_exec_request_with_as_user(TAZ_TEST_SLEEPER_PATH, "ghost"), 1U);
+
+    taz_run_as_set_passwd_path_for_tests(nullptr);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    pb_istream_t istream = pb_istream_from_buffer(
+        Frames()[0].data() + TAZ_FRAME_HEADER_SIZE,
+        Frames()[0].size() - static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+}
+
+TEST_F(CommandExecSnapshotTest,
+       AsUserPrivilegedRealSpawnFailsWithPermissionDeniedNotInternal)
+{
+    if (geteuid() == 0)
+    {
+        GTEST_SKIP() << "root can setuid(0), so the spawn this row needs to "
+                        "fail would succeed";
+    }
+    const ScopedPrivilege privileged(1);
+    const TempPasswdFile passwd_file("root:x:0:0:root:/:/bin/sh\n");
+    const ScopedPasswdPath passwd(passwd_file.Path());
+
+    // "root" resolves to uid/gid 0: setuid(0)/setgid(0) from this process
+    // (non-root, every gate) fails with EPERM, so this exercises a real
+    // uv_spawn failure (not a pre-spawn precedence rejection like the two
+    // rows above) and proves map_spawn_error maps UV_EPERM to
+    // PERMISSION_DENIED instead of falling through to INTERNAL.
+    DispatchExec(
+        encode_exec_request_with_as_user(TAZ_TEST_SLEEPER_PATH, "root"), 1U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(unpack_header(Frames()[0]).type,
+              static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_ERROR));
+    taz_v1_ErrorInfo err = taz_v1_ErrorInfo_init_zero;
+    pb_istream_t istream = pb_istream_from_buffer(
+        Frames()[0].data() + TAZ_FRAME_HEADER_SIZE,
+        Frames()[0].size() - static_cast<size_t>(TAZ_FRAME_HEADER_SIZE));
+    ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
+    EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_PERMISSION_DENIED);
+}
+
+#endif /* !_WIN32 */
 
 } // namespace

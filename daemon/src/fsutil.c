@@ -591,6 +591,146 @@ int taz_passwd_name_from_uid(const char *passwd_path, unsigned long uid,
     return 0;
 }
 
+int taz_passwd_lookup_by_name(const char *passwd_path, const char *name,
+                              unsigned long *uid, unsigned long *gid,
+                              char *home, size_t home_size)
+{
+    FILE *f;
+    char line[PASSWD_LINE_MAX];
+    size_t name_len = strlen(name);
+
+    f = fopen(passwd_path, "r");
+    if (f == NULL)
+    {
+        return 0;
+    }
+
+    while (fgets(line, (int)sizeof(line), f) != NULL)
+    {
+        size_t line_len = strlen(line);
+        int ends_in_newline = (line_len > 0U) && (line[line_len - 1U] == '\n');
+        char *name_end;
+        char *uid_start;
+        char *uid_end;
+        char *gid_start;
+        char *gid_end;
+        char *gecos_end;
+        const char *home_start = "";
+        size_t home_len = 0U;
+        char *end;
+        unsigned long line_uid;
+        unsigned long line_gid;
+        size_t field_name_len;
+
+        if (!ends_in_newline && (feof(f) == 0))
+        {
+            /* The buffer filled before the real line ended; drain the rest
+             * of it so its tail is never parsed as a fresh entry. */
+            int c;
+            int found_newline = 0;
+
+            while ((c = fgetc(f)) != EOF)
+            {
+                if (c == '\n')
+                {
+                    found_newline = 1;
+                    break;
+                }
+            }
+            if (!found_newline)
+            {
+                /* The overlong line ran to EOF; nothing left to read. */
+                break;
+            }
+            continue;
+        }
+
+        name_end = strchr(line, ':');
+        if ((name_end == NULL) || (name_end == line))
+        {
+            continue;
+        }
+        field_name_len = (size_t)(name_end - line);
+        if ((field_name_len != name_len) || (memcmp(line, name, name_len) != 0))
+        {
+            continue;
+        }
+
+        uid_start = strchr(name_end + 1, ':');
+        if (uid_start == NULL)
+        {
+            continue;
+        }
+        uid_start += 1;
+        uid_end = strchr(uid_start, ':');
+        if ((uid_end == NULL) || (uid_end == uid_start))
+        {
+            continue;
+        }
+        if ((uid_start[0] < '0') || (uid_start[0] > '9'))
+        {
+            continue; /* reject leading '-', '+', whitespace, etc. */
+        }
+
+        gid_start = uid_end + 1;
+        gid_end = strchr(gid_start, ':');
+        if ((gid_end == NULL) || (gid_end == gid_start))
+        {
+            continue;
+        }
+        if ((gid_start[0] < '0') || (gid_start[0] > '9'))
+        {
+            continue;
+        }
+
+        gecos_end = strchr(gid_end + 1, ':');
+        if (gecos_end != NULL)
+        {
+            const char *home_end;
+
+            home_start = gecos_end + 1;
+            home_end = home_start;
+            while ((*home_end != '\0') && (*home_end != ':') &&
+                   (*home_end != '\n'))
+            {
+                home_end++;
+            }
+            home_len = (size_t)(home_end - home_start);
+        }
+        if ((home != NULL) && (home_len >= home_size))
+        {
+            continue;
+        }
+
+        *uid_end = '\0';
+        line_uid = strtoul(uid_start, &end, PASSWD_UID_BASE);
+        if ((end != uid_end) || (line_uid > TAZ_PASSWD_ID_MAX))
+        {
+            continue; /* non-numeric or out-of-range uid field */
+        }
+
+        *gid_end = '\0';
+        line_gid = strtoul(gid_start, &end, PASSWD_UID_BASE);
+        if ((end != gid_end) || (line_gid > TAZ_PASSWD_ID_MAX))
+        {
+            continue; /* non-numeric or out-of-range gid field */
+        }
+
+        *uid = line_uid;
+        *gid = line_gid;
+        if (home != NULL)
+        {
+            (void)memcpy(home, home_start, home_len);
+            home[home_len] = '\0';
+        }
+        (void)fclose(f);
+        return 1;
+    }
+
+    (void)fclose(f);
+    return 0;
+}
+
 #ifndef _WIN32
 void taz_user_name_from_uid(const char *passwd_path, unsigned long uid,
                             char *buf, size_t bufsize)

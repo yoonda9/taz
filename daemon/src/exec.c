@@ -396,14 +396,46 @@ static void free_env(char **env)
     free((void *)env);
 }
 
-/* Build the NAME=VALUE environment for the child: the daemon's own
- * environment (from uv_os_environ) with extra/env entries added or, on a
- * name match (case-insensitive on Windows), overridden. The uv_os_environ
- * snapshot is freed here; the returned char ** is owned by the caller
- * (free_env). */
-static int build_env(const taz_v1_KeyValue *extra, size_t extra_count,
-                     char ***out_env)
+void taz_exec_free_env(char **env)
 {
+    free_env(env);
+}
+
+/* The variables taz_exec_build_env sets for a switched identity. */
+#define TAZ_EXEC_IDENTITY_ENV_COUNT 3U
+
+static int env_name_in_extra(const char *name, const taz_v1_KeyValue *extra,
+                             size_t extra_count)
+{
+    for (size_t j = 0U; j < extra_count; j++)
+    {
+        if (TAZ_EXEC_ENV_NAME_CMP(name, extra[j].key) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env)
+{
+    static const char *const identity_names[TAZ_EXEC_IDENTITY_ENV_COUNT] = {
+        "USER", "LOGNAME", "HOME"};
+    const char *identity_values[TAZ_EXEC_IDENTITY_ENV_COUNT] = {NULL, NULL,
+                                                                NULL};
+    size_t identity_count = 0U;
+    const taz_v1_KeyValue *extra = spec->env;
+    size_t extra_count = spec->env_count;
+
+    if (spec->switch_identity)
+    {
+        identity_values[0] = spec->identity_user;
+        identity_values[1] = spec->identity_user;
+        identity_values[2] =
+            (spec->identity_home[0] != '\0') ? spec->identity_home : "/";
+        identity_count = TAZ_EXEC_IDENTITY_ENV_COUNT;
+    }
+
     uv_env_item_t *base = NULL;
     int base_count = 0;
     int rc = uv_os_environ(&base, &base_count);
@@ -413,7 +445,8 @@ static int build_env(const taz_v1_KeyValue *extra, size_t extra_count,
     }
 
     char **merged =
-        (char **)calloc((size_t)base_count + extra_count + 1U, sizeof(*merged));
+        (char **)calloc((size_t)base_count + identity_count + extra_count + 1U,
+                        sizeof(*merged));
     if (merged == NULL)
     {
         uv_os_free_environ(base, base_count);
@@ -423,13 +456,12 @@ static int build_env(const taz_v1_KeyValue *extra, size_t extra_count,
     size_t n = 0U;
     for (int i = 0; i < base_count; i++)
     {
-        int overridden = 0;
-        for (size_t j = 0U; j < extra_count; j++)
+        int overridden = env_name_in_extra(base[i].name, extra, extra_count);
+        for (size_t k = 0U; (overridden == 0) && (k < identity_count); k++)
         {
-            if (TAZ_EXEC_ENV_NAME_CMP(base[i].name, extra[j].key) == 0)
+            if (TAZ_EXEC_ENV_NAME_CMP(base[i].name, identity_names[k]) == 0)
             {
                 overridden = 1;
-                break;
             }
         }
         if (overridden)
@@ -438,6 +470,22 @@ static int build_env(const taz_v1_KeyValue *extra, size_t extra_count,
         }
 
         merged[n] = join_name_value(base[i].name, base[i].value);
+        if (merged[n] == NULL)
+        {
+            uv_os_free_environ(base, base_count);
+            free_env(merged);
+            return UV_ENOMEM;
+        }
+        n++;
+    }
+
+    for (size_t k = 0U; k < identity_count; k++)
+    {
+        if (env_name_in_extra(identity_names[k], extra, extra_count))
+        {
+            continue;
+        }
+        merged[n] = join_name_value(identity_names[k], identity_values[k]);
         if (merged[n] == NULL)
         {
             uv_os_free_environ(base, base_count);
@@ -494,6 +542,22 @@ static int create_job_object(HANDLE *out_job)
 }
 #endif
 
+void taz_exec_apply_identity(uv_process_options_t *options,
+                             const taz_exec_spec_t *spec)
+{
+#ifndef _WIN32
+    if (spec->switch_identity)
+    {
+        options->uid = spec->uid;
+        options->gid = spec->gid;
+        options->flags |= UV_PROCESS_SETUID | UV_PROCESS_SETGID;
+    }
+#else
+    (void)options;
+    (void)spec;
+#endif
+}
+
 int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
                    taz_exec_done_fn_t on_done, void *arg, taz_exec_t **out)
 {
@@ -540,7 +604,7 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     rc = build_argv(spec, &argv);
     if (rc == 0)
     {
-        rc = build_env(spec->env, spec->env_count, &envp);
+        rc = taz_exec_build_env(spec, &envp);
     }
 #ifdef _WIN32
     if (rc == 0)
@@ -581,6 +645,7 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
 #else
     options.flags = UV_PROCESS_DETACHED;
 #endif
+    taz_exec_apply_identity(&options, spec);
 
     x->process.data = x;
     rc = uv_spawn(loop, &x->process, &options);

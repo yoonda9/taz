@@ -9,6 +9,12 @@
 
 #include "taz/v1/common.pb.h"
 
+/* Sizes of taz_exec_spec_t's identity strings: a username as long as the
+ * wire allows (RunAsRequest.user, CommandExecRequest.as_user), and a home
+ * directory as long as any passwd line taz_passwd_lookup_by_name parses. */
+#define TAZ_EXEC_USER_MAX 64U
+#define TAZ_EXEC_HOME_MAX 512U
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -74,6 +80,13 @@ extern "C"
         const char *cwd;     /* NULL/"" = daemon's cwd */
         uint32_t timeout_ms; /* 0 = none */
         size_t max_output_bytes;
+        uv_uid_t uid; /* only used when switch_identity is set */
+        uv_gid_t gid; /* only used when switch_identity is set */
+        bool switch_identity;
+        /* Only used when switch_identity is set: the target user's name and
+         * home directory, which become the child's USER/LOGNAME and HOME. */
+        char identity_user[TAZ_EXEC_USER_MAX];
+        char identity_home[TAZ_EXEC_HOME_MAX];
     } taz_exec_spec_t;
 
     /* Outcome of a finished exec. out/err point into buffers owned by the
@@ -94,6 +107,29 @@ extern "C"
 
     typedef void (*taz_exec_done_fn_t)(const taz_exec_result_t *result,
                                        void *arg);
+
+    /* Pure option-builder: when spec->switch_identity is set and this is not
+     * a Windows build, sets options->uid/options->gid from spec and ORs
+     * UV_PROCESS_SETUID|UV_PROCESS_SETGID into options->flags; otherwise a
+     * no-op. Callers can exercise this against a bare options struct without
+     * spawning anything. uv_spawn calls setgroups(0, NULL) when it switches
+     * identity, so supplementary groups can never be applied through it -
+     * this only ever sets the primary gid. */
+    void taz_exec_apply_identity(uv_process_options_t *options,
+                                 const taz_exec_spec_t *spec);
+
+    /* Build the child's NULL-terminated NAME=VALUE environment in three
+     * layers, a later one overriding an earlier one on a name match
+     * (case-insensitive on Windows): the daemon's own environment; then,
+     * when spec->switch_identity is set, USER and LOGNAME set to
+     * identity_user and HOME to identity_home ("/" when empty), as su and
+     * sudo set them; then spec->env. Returns 0 and stores the result in
+     * *out_env (free it with taz_exec_free_env), or a UV_E* code. Spawns
+     * nothing, so tests can call it directly. */
+    int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env);
+
+    /* Free an environment from taz_exec_build_env. NULL is a no-op. */
+    void taz_exec_free_env(char **env);
 
     /* Start *spec on loop. Returns 0 on success, in which case *out receives
      * the new handle and on_done will fire exactly once, later, from the

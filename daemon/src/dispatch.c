@@ -10,6 +10,7 @@
 #include "handlers/log.h"
 #include "handlers/process.h"
 #include "handlers/process_monitor.h"
+#include "handlers/run_as.h"
 #include "handlers/timeout.h"
 #include "handlers/version.h"
 #include "taz/error.h"
@@ -338,6 +339,7 @@ static const opcode_entry_t OPCODE_TABLE[] = {
     {handle_log, NULL, (uint16_t)taz_v1_Opcode_OPCODE_LOG, false},
     {NULL, handle_timeout_set, (uint16_t)taz_v1_Opcode_OPCODE_TIMEOUT_SET,
      true},
+    {NULL, handle_run_as, (uint16_t)taz_v1_Opcode_OPCODE_RUN_AS, true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))

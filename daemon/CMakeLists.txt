@@ -261,6 +261,7 @@ add_library(
     src/crc32c.c
     src/dispatch.c
     src/connection.c
+    src/run_as.c
     src/handlers/version.c
     src/handlers/config.c
     src/handlers/command.c
@@ -271,6 +272,7 @@ add_library(
     src/handlers/process_monitor.c
     src/handlers/log.c
     src/handlers/timeout.c
+    src/handlers/run_as.c
     src/platform/process_common.c
     ${TAZ_PROCESS_SRC}
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)

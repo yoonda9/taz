@@ -219,6 +219,22 @@ class TestCommandExec:
         assert req.working_dir == "/srv/app"
         assert req.timeout_ms == 5000
 
+    def test_exec_sends_as_user(self) -> None:
+        client, mock_sock = _connected_client_with_sock(_exec_response())
+        client.command.exec("cmd", as_user="bob")
+        sent = b"".join(mock_sock.sent)
+        req = command_pb2.CommandExecRequest()
+        req.ParseFromString(sent[HEADER_SIZE:])
+        assert req.as_user == "bob"
+
+    def test_exec_default_as_user_is_empty(self) -> None:
+        client, mock_sock = _connected_client_with_sock(_exec_response())
+        client.command.exec("cmd")
+        sent = b"".join(mock_sock.sent)
+        req = command_pb2.CommandExecRequest()
+        req.ParseFromString(sent[HEADER_SIZE:])
+        assert req.as_user == ""
+
     def test_exec_sends_request_via_sendall_fallback(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

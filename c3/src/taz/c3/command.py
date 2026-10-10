@@ -39,15 +39,20 @@ class CommandNamespace:
         env: dict[str, str] | None = None,
         working_dir: str | None = None,
         timeout_ms: int = 0,
+        as_user: str = "",
         keepalive: Keepalive | None = None,
     ) -> CommandResult:
         """Run ``command`` on the daemon and wait for it to finish.
 
         ``timeout_ms`` of 0 falls back to the connection's default timeout.
         ``env`` entries are merged into (not a replacement for) the daemon's
-        own environment.
+        own environment. ``as_user`` overrides the connection's RUN_AS
+        identity for this call only; the daemon answers NOT_SUPPORTED unless
+        it is privileged.
         """
-        req = command_pb2.CommandExecRequest(command=command, timeout_ms=timeout_ms)
+        req = command_pb2.CommandExecRequest(
+            command=command, timeout_ms=timeout_ms, as_user=as_user
+        )
         if args:
             req.args.extend(args)
         if env:

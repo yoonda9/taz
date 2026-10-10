@@ -607,6 +607,15 @@ class FileHandlerTest : public ::testing::Test
         return &loop_;
     }
 
+    // Direct access to the fake taz_dispatch_t, for tests that need to seed
+    // or inspect per-connection state a handler reads/writes (e.g. RUN_AS's
+    // run_as_active/uid/gid/user, TIMEOUT_SET's conn_timeout_ms) beyond
+    // what the frame-level assertions above cover.
+    taz_dispatch_t &Dispatch()
+    {
+        return d_;
+    }
+
   private:
     uv_loop_t loop_{};
     taz_dispatch_t d_{};

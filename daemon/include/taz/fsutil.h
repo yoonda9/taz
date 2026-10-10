@@ -87,6 +87,22 @@ extern "C"
     int taz_passwd_name_from_uid(const char *passwd_path, unsigned long uid,
                                  char *buf, size_t bufsize);
 
+/* Largest uid/gid taz_passwd_lookup_by_name accepts: anything above it
+ * would wrap when narrowed to a 32-bit uid_t/gid_t (2^32 becomes 0, root),
+ * and (uid_t)-1 means "unchanged" to the set*id calls. */
+#define TAZ_PASSWD_ID_MAX 4294967294UL
+
+    /* Parse passwd_path for the line whose first field equals name. On a
+     * match, fills *uid and *gid from the uid (field 3) and primary gid
+     * (field 4), copies the home directory (field 6, "" when absent) into
+     * home unless home is NULL, and returns 1. Returns 0 when the file is
+     * missing or no line matches. Malformed or short lines are skipped, as
+     * are ids above TAZ_PASSWD_ID_MAX and lines whose home does not fit in
+     * home_size (it is never truncated). */
+    int taz_passwd_lookup_by_name(const char *passwd_path, const char *name,
+                                  unsigned long *uid, unsigned long *gid,
+                                  char *home, size_t home_size);
+
 #ifndef _WIN32
     /* Wrapper for taz_passwd_name_from_uid that looks up uid in passwd_path,
      * falling back to decimal string representation of uid if not found or file

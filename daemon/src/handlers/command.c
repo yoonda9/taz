@@ -1,5 +1,6 @@
 #include "command.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -9,8 +10,10 @@
 
 #include "taz/config.h"
 #include "taz/error.h"
+#include "taz/fsutil.h"
 #include "taz/log.h"
 #include "taz/response.h"
+#include "taz/run_as.h"
 #include "taz/v1/command.pb.h"
 
 /* Carries what on_exec_done needs to send the response and close the
@@ -68,7 +71,65 @@ static taz_v1_ErrorCode map_spawn_error(int rc)
     {
         return taz_v1_ErrorCode_ERROR_CODE_PERMISSION_DENIED;
     }
+    if (rc == UV_EPERM)
+    {
+        /* uv_spawn's setuid()/setgid() failed: a RUN_AS/as_user identity was
+         * resolved (the daemon is "privileged" per taz_run_as_privileged),
+         * but the real process lacks the capability to switch to it. */
+        return taz_v1_ErrorCode_ERROR_CODE_PERMISSION_DENIED;
+    }
     return taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+}
+
+int taz_command_resolve_as_user(const taz_dispatch_t *d,
+                                const taz_v1_CommandExecRequest *req,
+                                taz_exec_spec_t *spec,
+                                taz_v1_ErrorCode *error_code,
+                                const char **error_message)
+{
+    if (req->as_user[0] != '\0')
+    {
+        unsigned long uid = 0UL;
+        unsigned long gid = 0UL;
+        char home[TAZ_EXEC_HOME_MAX];
+
+        if (!taz_run_as_privileged())
+        {
+            *error_code = taz_v1_ErrorCode_ERROR_CODE_NOT_SUPPORTED;
+            *error_message = "as_user requires a privileged daemon";
+            return -1;
+        }
+
+        if (!taz_passwd_lookup_by_name(taz_run_as_passwd_path(), req->as_user,
+                                       &uid, &gid, home, sizeof(home)))
+        {
+            *error_code = taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
+            *error_message = "as_user not found";
+            return -1;
+        }
+
+        spec->uid = (uv_uid_t)uid;
+        spec->gid = (uv_gid_t)gid;
+        spec->switch_identity = true;
+        (void)snprintf(spec->identity_user, sizeof(spec->identity_user), "%s",
+                       req->as_user);
+        (void)snprintf(spec->identity_home, sizeof(spec->identity_home), "%s",
+                       home);
+        return 0;
+    }
+
+    if (d->run_as_active)
+    {
+        spec->uid = (uv_uid_t)d->run_as_uid;
+        spec->gid = (uv_gid_t)d->run_as_gid;
+        spec->switch_identity = true;
+        (void)snprintf(spec->identity_user, sizeof(spec->identity_user), "%s",
+                       d->run_as_user);
+        (void)snprintf(spec->identity_home, sizeof(spec->identity_home), "%s",
+                       d->run_as_home);
+    }
+
+    return 0;
 }
 
 void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
@@ -117,18 +178,6 @@ void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
         }
     }
 
-    /* RUN_AS support via a non-empty as_user comes later; do not silently
-     * run as the daemon's own identity. */
-    if (req->as_user[0] != '\0')
-    {
-        free(req);
-        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
-                       taz_v1_ErrorCode_ERROR_CODE_NOT_SUPPORTED,
-                       "as_user is not supported yet", NULL);
-        taz_dispatch_stream_done(d, header->stream_id);
-        return;
-    }
-
     ectx = (exec_ctx_t *)malloc(sizeof(*ectx));
     if (ectx == NULL)
     {
@@ -165,6 +214,22 @@ void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
     spec.timeout_ms =
         (req->timeout_ms != 0U) ? req->timeout_ms : d->conn_timeout_ms;
     spec.max_output_bytes = taz_config_exec_max_output_bytes();
+
+    {
+        taz_v1_ErrorCode as_user_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+        const char *as_user_message = NULL;
+
+        if (taz_command_resolve_as_user(d, req, &spec, &as_user_code,
+                                        &as_user_message) != 0)
+        {
+            free(ectx);
+            free(req);
+            taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                           as_user_code, as_user_message, NULL);
+            taz_dispatch_stream_done(d, header->stream_id);
+            return;
+        }
+    }
 
     rc = taz_exec_start(d->loop, &spec, on_exec_done, ectx, &exec_handle);
     free(req);

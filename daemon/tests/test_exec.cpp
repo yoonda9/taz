@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <uv.h>
@@ -167,6 +168,168 @@ TEST_F(ExecCaptureTest, FreeOfUntouchedCaptureIsSafe)
     taz_exec_capture_init(Cap(), 10);
 
     taz_exec_capture_free(Cap());
+}
+
+// --- taz_exec_apply_identity ------------------------------------------------
+//
+// Pure option-building: exercised against a bare uv_process_options_t, no
+// spawn involved.
+
+TEST(ExecApplyIdentityTest, SwitchSetAppliesUidGidAndFlagsOnPosix)
+{
+    taz_exec_spec_t spec{};
+    spec.switch_identity = true;
+    // uv_uid_t/uv_gid_t is a 1-byte stub on Windows (unused there - RUN_AS
+    // is deferred - but this TU still compiles for that target), so this
+    // value must fit an unsigned char on every platform.
+    spec.uid = 99;
+    spec.gid = 99;
+    uv_process_options_t options{};
+
+    taz_exec_apply_identity(&options, &spec);
+
+#ifndef _WIN32
+    EXPECT_EQ(options.uid, spec.uid);
+    EXPECT_EQ(options.gid, spec.gid);
+    EXPECT_NE(options.flags & UV_PROCESS_SETUID, 0U);
+    EXPECT_NE(options.flags & UV_PROCESS_SETGID, 0U);
+#else
+    EXPECT_EQ(options.flags, 0U);
+#endif
+}
+
+TEST(ExecApplyIdentityTest, SwitchClearTouchesNeitherUidGidNorFlags)
+{
+    taz_exec_spec_t spec{};
+    spec.switch_identity = false;
+    spec.uid = 99;
+    spec.gid = 99;
+    uv_process_options_t options{};
+
+    taz_exec_apply_identity(&options, &spec);
+
+    EXPECT_EQ(options.uid, 0U);
+    EXPECT_EQ(options.gid, 0U);
+    EXPECT_EQ(options.flags, 0U);
+}
+
+TEST(ExecApplyIdentityTest, PreservesFlagsAlreadySetOnOptions)
+{
+    taz_exec_spec_t spec{};
+    spec.switch_identity = true;
+    uv_process_options_t options{};
+    options.flags = UV_PROCESS_DETACHED;
+
+    taz_exec_apply_identity(&options, &spec);
+
+#ifndef _WIN32
+    EXPECT_NE(options.flags & UV_PROCESS_DETACHED, 0U);
+    EXPECT_NE(options.flags & UV_PROCESS_SETUID, 0U);
+#endif
+}
+
+// --- taz_exec_build_env ---------------------------------------------------
+//
+// Pure: builds the child's environment without spawning anything.
+
+namespace
+{
+
+// Every NAME=... entry in env for name, matched exactly.
+std::vector<std::string> EnvValues(char **env, const char *name)
+{
+    std::vector<std::string> values;
+    const size_t len = std::strlen(name);
+    for (size_t i = 0U; env[i] != nullptr; i++)
+    {
+        if (std::strncmp(env[i], name, len) == 0 && env[i][len] == '=')
+        {
+            values.emplace_back(env[i] + len + 1U);
+        }
+    }
+    return values;
+}
+
+// The daemon's own value for name; empty when it is unset.
+std::vector<std::string> DaemonValues(const char *name)
+{
+    std::vector<char> value(4096);
+    size_t size = value.size();
+    if (uv_os_getenv(name, value.data(), &size) != 0)
+    {
+        return {};
+    }
+    return {std::string(value.data(), size)};
+}
+
+} // namespace
+
+TEST(ExecBuildEnvTest, SwitchedIdentitySetsUserLognameAndHomeOnce)
+{
+    taz_exec_spec_t spec{};
+    spec.switch_identity = true;
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        "alice");
+    (void)std::snprintf(spec.identity_home, sizeof(spec.identity_home), "%s",
+                        "/home/alice");
+    char **env = nullptr;
+
+    ASSERT_EQ(taz_exec_build_env(&spec, &env), 0);
+
+    EXPECT_EQ(EnvValues(env, "USER"), std::vector<std::string>{"alice"});
+    EXPECT_EQ(EnvValues(env, "LOGNAME"), std::vector<std::string>{"alice"});
+    EXPECT_EQ(EnvValues(env, "HOME"), std::vector<std::string>{"/home/alice"});
+    taz_exec_free_env(env);
+}
+
+TEST(ExecBuildEnvTest, RequestEnvOverridesTheIdentityVariables)
+{
+    taz_exec_spec_t spec{};
+    spec.switch_identity = true;
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        "alice");
+    (void)std::snprintf(spec.identity_home, sizeof(spec.identity_home), "%s",
+                        "/home/alice");
+    taz_v1_KeyValue extra{};
+    (void)std::snprintf(extra.key, sizeof(extra.key), "%s", "HOME");
+    (void)std::snprintf(extra.value, sizeof(extra.value), "%s", "/custom");
+    spec.env = &extra;
+    spec.env_count = 1U;
+    char **env = nullptr;
+
+    ASSERT_EQ(taz_exec_build_env(&spec, &env), 0);
+
+    EXPECT_EQ(EnvValues(env, "HOME"), std::vector<std::string>{"/custom"});
+    EXPECT_EQ(EnvValues(env, "USER"), std::vector<std::string>{"alice"});
+    taz_exec_free_env(env);
+}
+
+TEST(ExecBuildEnvTest, EmptyHomeBecomesRoot)
+{
+    taz_exec_spec_t spec{};
+    spec.switch_identity = true;
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        "nohome");
+    char **env = nullptr;
+
+    ASSERT_EQ(taz_exec_build_env(&spec, &env), 0);
+
+    EXPECT_EQ(EnvValues(env, "HOME"), std::vector<std::string>{"/"});
+    taz_exec_free_env(env);
+}
+
+TEST(ExecBuildEnvTest, NoIdentityKeepsTheDaemonsOwnValues)
+{
+    taz_exec_spec_t spec{};
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        "alice");
+    char **env = nullptr;
+
+    ASSERT_EQ(taz_exec_build_env(&spec, &env), 0);
+
+    EXPECT_EQ(EnvValues(env, "USER"), DaemonValues("USER"));
+    EXPECT_EQ(EnvValues(env, "HOME"), DaemonValues("HOME"));
+    taz_exec_free_env(env);
 }
 
 // --- taz_exec_start -------------------------------------------------------

@@ -11,6 +11,7 @@
 #include <pb_encode.h>
 #include <uv.h>
 
+#include "run_as_test_support.h"
 #include "taz/config.h"
 #include "taz/dispatch.h"
 #include "taz/exec.h"
@@ -501,6 +502,7 @@ TEST(Dispatch, TimedOutCommandExecLogsTimedOut)
 
 TEST(Dispatch, CommandExecWithAsUserIsNotSupported)
 {
+    const ScopedPrivilege unprivileged(0);
     uv_loop_t loop;
     ASSERT_EQ(uv_loop_init(&loop), 0);
 

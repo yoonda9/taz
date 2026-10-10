@@ -205,6 +205,26 @@ class TazClient:
         )
         return resp.previous_ms
 
+    def run_as(self, user: str, keepalive: Keepalive | None = None) -> str:
+        """Set (or, with ``user=""``, reset) the connection's RUN_AS identity.
+
+        Returns the ``effective_user`` now in effect: ``user``, or after a
+        reset the daemon's own user. Applies only to subsequent COMMAND_EXEC
+        calls that do not pass their own ``as_user``; the child also gets
+        that user's ``USER``, ``LOGNAME`` and ``HOME`` unless ``env`` sets
+        them. Raises
+        ``TazError(NOT_SUPPORTED)`` locally, without sending anything, if the
+        daemon does not advertise RUN_AS (unprivileged or Windows).
+        """
+        req = advanced_pb2.RunAsRequest(user=user)
+        resp = self._call(
+            common_pb2.OPCODE_RUN_AS,
+            req.SerializeToString(),
+            advanced_pb2.RunAsResponse,
+            keepalive,
+        )
+        return resp.effective_user
+
     def log(
         self,
         lines: int = 100,

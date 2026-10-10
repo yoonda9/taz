@@ -719,6 +719,201 @@ TEST_F(PasswdNameFromUid, LongNameIsTruncated)
 }
 
 // ---------------------------------------------------------------------------
+// taz_passwd_lookup_by_name
+// ---------------------------------------------------------------------------
+
+class PasswdLookupByName : public ::testing::Test
+{
+  protected:
+    void SetUp() override
+    {
+        char tmpdir[1024];
+        size_t tmpdir_len = sizeof(tmpdir) - 1;
+        ASSERT_EQ(uv_os_tmpdir(tmpdir, &tmpdir_len), 0);
+        const std::string tpl_str =
+            std::string(tmpdir, tmpdir_len) + "/taz_fsutil_test_XXXXXX";
+        std::vector<char> tpl(tpl_str.begin(), tpl_str.end());
+        tpl.push_back('\0');
+
+        uv_fs_t req;
+        const int rc = uv_fs_mkdtemp(NULL, &req, tpl.data(), NULL);
+        if (rc != 0)
+        {
+            uv_fs_req_cleanup(&req);
+        }
+        ASSERT_EQ(rc, 0);
+        dir_ = req.path;
+        uv_fs_req_cleanup(&req);
+        path_ = dir_ + "/passwd";
+    }
+
+    void TearDown() override
+    {
+        uv_fs_t req;
+        (void)uv_fs_unlink(NULL, &req, path_.c_str(), NULL);
+        uv_fs_req_cleanup(&req);
+        uv_fs_t rmdir_req;
+        (void)uv_fs_rmdir(NULL, &rmdir_req, dir_.c_str(), NULL);
+        uv_fs_req_cleanup(&rmdir_req);
+    }
+
+    void WriteFile(const std::string &contents) const
+    {
+        std::ofstream out(path_, std::ios::binary | std::ios::trunc);
+        out << contents;
+    }
+
+    const std::string &Path() const
+    {
+        return path_;
+    }
+
+  private:
+    std::string dir_;
+    std::string path_;
+};
+
+TEST_F(PasswdLookupByName, FindsMatchingNameWithUidAndGid)
+{
+    WriteFile("root:x:0:0:root:/root:/bin/bash\n"
+              "alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
+    unsigned long uid = 0;
+    unsigned long gid = 0;
+    EXPECT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "alice", &uid, &gid,
+                                        nullptr, 0U),
+              1);
+    EXPECT_EQ(uid, 4242UL);
+    EXPECT_EQ(gid, 4243UL);
+}
+
+TEST_F(PasswdLookupByName, NoMatchReturnsZero)
+{
+    WriteFile("root:x:0:0:root:/root:/bin/bash\n");
+    unsigned long uid = 0;
+    unsigned long gid = 0;
+    EXPECT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "ghost", &uid, &gid,
+                                        nullptr, 0U),
+              0);
+}
+
+TEST_F(PasswdLookupByName, MissingFileReturnsZero)
+{
+    unsigned long uid = 0;
+    unsigned long gid = 0;
+    EXPECT_EQ(taz_passwd_lookup_by_name((Path() + "-missing").c_str(), "alice",
+                                        &uid, &gid, nullptr, 0U),
+              0);
+}
+
+TEST_F(PasswdLookupByName, MalformedAndShortLinesAreSkipped)
+{
+    WriteFile("no-colons-at-all\n"
+              "only:one-colon\n"
+              "short:x:1\n"
+              "bob:x:42:42:Bob:/home/bob:/bin/bash\n");
+    unsigned long uid = 0;
+    unsigned long gid = 0;
+    EXPECT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "bob", &uid, &gid,
+                                        nullptr, 0U),
+              1);
+    EXPECT_EQ(uid, 42UL);
+    EXPECT_EQ(gid, 42UL);
+}
+
+TEST_F(PasswdLookupByName, NamePrefixOfAnotherLineIsNotAFalseMatch)
+{
+    WriteFile("bobby:x:99:99:Bobby:/home/bobby:/bin/bash\n"
+              "bob:x:42:42:Bob:/home/bob:/bin/bash\n");
+    unsigned long uid = 0;
+    unsigned long gid = 0;
+    EXPECT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "bob", &uid, &gid,
+                                        nullptr, 0U),
+              1);
+    EXPECT_EQ(uid, 42UL);
+    EXPECT_EQ(gid, 42UL);
+}
+
+TEST_F(PasswdLookupByName, InjectedPathIsHonoured)
+{
+    WriteFile("alice:x:1000:1000:Alice:/home/alice:/bin/bash\n");
+
+    const std::string other_path = Path() + "-other";
+    std::ofstream other(other_path, std::ios::binary | std::ios::trunc);
+    other << "alice:x:2000:2000:Alice:/home/alice:/bin/bash\n";
+    other.close();
+
+    unsigned long uid = 0;
+    unsigned long gid = 0;
+    EXPECT_EQ(taz_passwd_lookup_by_name(other_path.c_str(), "alice", &uid, &gid,
+                                        nullptr, 0U),
+              1);
+    EXPECT_EQ(uid, 2000UL);
+    EXPECT_EQ(gid, 2000UL);
+
+    uv_fs_t req;
+    (void)uv_fs_unlink(NULL, &req, other_path.c_str(), NULL);
+    uv_fs_req_cleanup(&req);
+}
+
+TEST_F(PasswdLookupByName, CopiesHomeDirectory)
+{
+    WriteFile("alice:x:4242:4243:Alice:/home/alice:/bin/bash\n"
+              "nohome:x:7:7:No Home\n"
+              "noshell:x:8:8::/srv/noshell\n");
+    unsigned long uid = 0;
+    unsigned long gid = 0;
+    char home[64];
+    ASSERT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "alice", &uid, &gid,
+                                        home, sizeof(home)),
+              1);
+    EXPECT_STREQ(home, "/home/alice");
+    ASSERT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "nohome", &uid, &gid,
+                                        home, sizeof(home)),
+              1);
+    EXPECT_STREQ(home, "");
+    ASSERT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "noshell", &uid, &gid,
+                                        home, sizeof(home)),
+              1);
+    EXPECT_STREQ(home, "/srv/noshell");
+}
+
+TEST_F(PasswdLookupByName, HomeThatDoesNotFitSkipsTheLine)
+{
+    WriteFile("alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
+    unsigned long uid = 0;
+    unsigned long gid = 0;
+    char home[11]; // "/home/alice" needs 12 bytes with its NUL
+    EXPECT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "alice", &uid, &gid,
+                                        home, sizeof(home)),
+              0);
+}
+
+TEST_F(PasswdLookupByName, IdsThatDoNotFitAValidUidAreSkipped)
+{
+    // 2^32 would narrow to 0 (root) and 2^32 - 1 is (uid_t)-1.
+    WriteFile("wrap:x:4294967296:0:Wrap:/:/bin/sh\n"
+              "minus1:x:4294967295:0:Minus1:/:/bin/sh\n"
+              "gwrap:x:0:4294967296:GWrap:/:/bin/sh\n"
+              "max:x:4294967294:4294967294:Max:/:/bin/sh\n");
+    unsigned long uid = 0;
+    unsigned long gid = 0;
+    EXPECT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "wrap", &uid, &gid,
+                                        nullptr, 0U),
+              0);
+    EXPECT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "minus1", &uid, &gid,
+                                        nullptr, 0U),
+              0);
+    EXPECT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "gwrap", &uid, &gid,
+                                        nullptr, 0U),
+              0);
+    ASSERT_EQ(taz_passwd_lookup_by_name(Path().c_str(), "max", &uid, &gid,
+                                        nullptr, 0U),
+              1);
+    EXPECT_EQ(uid, TAZ_PASSWD_ID_MAX);
+    EXPECT_EQ(gid, TAZ_PASSWD_ID_MAX);
+}
+
+// ---------------------------------------------------------------------------
 // taz_user_name_from_uid
 // ---------------------------------------------------------------------------
 

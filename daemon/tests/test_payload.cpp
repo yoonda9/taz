@@ -6,10 +6,12 @@
 #include <gtest/gtest.h>
 #include <pb_decode.h>
 
+#include "run_as_test_support.h"
 #include "taz/build_info.h"
 #include "taz/error.h"
 #include "taz/frame.h"
 #include "taz/payload.h"
+#include "taz/run_as.h"
 #include "taz/v1/common.pb.h"
 #include "taz/v1/daemon_control.pb.h"
 
@@ -23,7 +25,11 @@ namespace
 TEST(Payload, CapabilityRoundTrip)
 {
     uint8_t buf[TAZ_FRAME_MAX_PAYLOAD_CAPABILITY];
-    const size_t n = taz_payload_capability(buf, sizeof(buf));
+    size_t n = 0;
+    {
+        const ScopedPrivilege unprivileged(0);
+        n = taz_payload_capability(buf, sizeof(buf));
+    }
     ASSERT_GT(n, 0U);
     EXPECT_LE(n, static_cast<size_t>(TAZ_FRAME_MAX_PAYLOAD_CAPABILITY));
 
@@ -76,10 +82,39 @@ TEST(Payload, CapabilityRoundTrip)
     EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_LOG)));
     EXPECT_TRUE(
         ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TIMEOUT_SET)));
+    // RUN_AS is advertised only on a privileged daemon (forced off above,
+    // so this holds even when the suite runs as root).
+    EXPECT_FALSE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_RUN_AS)));
 
     ASSERT_GE(cap.compression_count, 1U);
     EXPECT_STREQ(cap.compression[0], "NONE");
 }
+
+#ifndef _WIN32
+// taz_run_as_set_privileged_for_tests is a documented no-op on _WIN32 (RUN_AS
+// is deferred there regardless, so taz_run_as_privileged stays hard-0), so
+// this row cannot run there - the count would stay 21 with RUN_AS absent.
+TEST(Payload, CapabilityAdvertisesRunAsOnlyWhenPrivileged)
+{
+    uint8_t buf[TAZ_FRAME_MAX_PAYLOAD_CAPABILITY];
+    size_t n = 0;
+    {
+        const ScopedPrivilege privileged(1);
+        n = taz_payload_capability(buf, sizeof(buf));
+    }
+
+    ASSERT_GT(n, 0U);
+
+    taz_v1_CapabilityPayload cap = taz_v1_CapabilityPayload_init_zero;
+    pb_istream_t stream = pb_istream_from_buffer(buf, n);
+    ASSERT_TRUE(pb_decode(&stream, taz_v1_CapabilityPayload_fields, &cap));
+
+    ASSERT_EQ(cap.operations_count, 22U);
+    const std::set<uint32_t> ops(cap.operations,
+                                 cap.operations + cap.operations_count);
+    EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_RUN_AS)));
+}
+#endif /* !_WIN32 */
 
 TEST(Payload, CapabilityFitsInFrameLimit)
 {

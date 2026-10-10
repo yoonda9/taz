@@ -90,6 +90,20 @@ extern "C"
          * TIMEOUT_SET never retargets an in-flight command. Zeroed by
          * taz_dispatch_init, which is what pure unit tests see. */
         uint32_t conn_timeout_ms;
+        /* Connection identity for RUN_AS (0x0040). run_as_active is 0 until
+         * a successful RUN_AS with a non-empty user; run_as_uid/run_as_gid
+         * are then the uid/primary gid to apply to subsequent
+         * process-spawning operations on this connection (uid + primary gid
+         * only - see taz_exec_apply_identity), run_as_user holds the
+         * sanitized username RUN_AS echoes back, and run_as_home the
+         * passwd home directory (the child's HOME). RUN_AS with an empty
+         * user resets all five fields. Zeroed by taz_dispatch_init, which is
+         * what pure unit tests see. */
+        int run_as_active;
+        uint32_t run_as_uid;
+        uint32_t run_as_gid;
+        char run_as_user[TAZ_EXEC_USER_MAX];
+        char run_as_home[TAZ_EXEC_HOME_MAX];
         /* Loop async handlers (e.g. COMMAND_EXEC) spawn on. Set by
          * connection.c right after taz_dispatch_init; left NULL by
          * taz_dispatch_init itself, which is what pure unit tests see. */
