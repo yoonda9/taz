@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import os
 import re
 import signal
@@ -22,6 +23,8 @@ from taz.c3 import (
     CommandResult,
     FileTransfer,
     Keepalive,
+    ProcessMonitorUpdate,
+    StreamIterator,
     TazClient,
     TazConnectionLost,
     TazError,
@@ -35,6 +38,7 @@ _PROCESS_OPCODES = {
     common_pb2.OPCODE_PROCESS_LIST,
     common_pb2.OPCODE_PROCESS_KILL,
     common_pb2.OPCODE_PROCESS_INFO,
+    common_pb2.OPCODE_PROCESS_MONITOR,
 }
 
 _FILE_OPCODES = {
@@ -139,6 +143,31 @@ def _unused_pid() -> int:
     return pid_max + 1
 
 
+_MONITOR_INTERVAL = 100
+
+
+def _drain(
+    m: StreamIterator[ProcessMonitorUpdate], n: int
+) -> list[ProcessMonitorUpdate]:
+    """Take ``n`` updates from a monitor stream with ``next``."""
+    return [next(m) for _ in range(n)]
+
+
+def _wait_final(
+    m: StreamIterator[ProcessMonitorUpdate], timeout: float
+) -> ProcessMonitorUpdate:
+    """Iterate ``m`` until its final update, bounded by a wall-clock
+    deadline: a loop with no daemon-independent bound is a livelock
+    if the final frame never arrives."""
+    deadline = time.monotonic() + timeout
+    update: ProcessMonitorUpdate | None = None
+    while not m.ended:
+        assert time.monotonic() < deadline, "stream never reached its final frame"
+        update = next(m)
+    assert update is not None
+    return update
+
+
 def _python_name_filter() -> str:
     """The substring that matches the helper's reported process name: the
     interpreter's basename, cut to the kernel's 15-byte ``comm`` limit on
@@ -169,6 +198,8 @@ def spawn_helper() -> Generator[
             proc.kill()
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=10)
+        if proc.stdout is not None:
+            proc.stdout.close()
         deadline = time.monotonic() + 5
         while not _process_gone(pid) and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -1339,12 +1370,11 @@ class TestProcessOps:
         assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
         assert proc.poll() is None
 
-    def test_capabilities_advertise_process_opcodes_not_monitor(
+    def test_capabilities_advertise_process_opcodes_including_monitor(
         self, taz_client: TazClient
     ) -> None:
         ops = set(taz_client.capabilities().operations)
         assert ops >= _PROCESS_OPCODES
-        assert common_pb2.OPCODE_PROCESS_MONITOR not in ops
 
     def test_demo_list_and_info(self, taz_client: TazClient, daemon: Daemon) -> None:
         entries = taz_client.process.list()
@@ -1421,6 +1451,293 @@ class TestProcessOps:
         # Nothing further to assert here: the daemon fixture's teardown
         # re-stops (idempotent) and audits the exit for sanitizer reports
         # and a non-zero code.
+
+
+class TestProcessMonitor:
+    """``PROCESS_MONITOR`` through the typed ``client.process.monitor()``
+    API (``StreamIterator[ProcessMonitorUpdate]``)."""
+
+    def test_updates_report_live_process_fields(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        ref = psutil.Process(pid)
+        m = taz_client.process.monitor(pid, _MONITOR_INTERVAL)
+        first, second, _third = _drain(m, 3)
+
+        assert first.exited is False
+        assert first.reason == ""
+        assert first.info.pid == pid
+        assert first.info.name == ref.name()
+        assert first.info.memory_bytes > 0
+        assert first.info.state != ""
+        expected_users = {ref.username()}
+        if sys.platform != "win32":
+            expected_users.add(str(os.getuid()))
+        assert first.info.user in expected_users
+        assert first.info.cpu_percent == 0
+        assert second.info.cpu_percent >= 0
+
+        m.close()
+        assert m.ended
+        taz_client.version()
+
+    @pytest.mark.filterwarnings("error::ResourceWarning")
+    def test_exit_detected_via_pidfd(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        m = taz_client.process.monitor(pid, _MONITOR_INTERVAL)
+        next(m)
+        psutil.Process(pid).kill()
+
+        final = _wait_final(m, 5.0)
+        assert final.exited is True
+        assert final.reason == "exited"
+        assert final.exit_code_known is (sys.platform == "win32")
+        with pytest.raises(StopIteration):
+            next(m)
+        assert m.ended
+        assert taz_client.cancel(m.stream_id) is False
+
+        del m
+        gc.collect()
+        taz_client.ping()
+
+    @pytest.mark.filterwarnings("error::ResourceWarning")
+    def test_exit_detected_via_timer_fallback(
+        self,
+        taz_client_no_pidfd: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        m = taz_client_no_pidfd.process.monitor(pid, _MONITOR_INTERVAL)
+        next(m)
+        psutil.Process(pid).kill()
+
+        final = _wait_final(m, 5.0)
+        assert final.exited is True
+        assert final.reason == "exited"
+        assert final.exit_code_known is (sys.platform == "win32")
+        with pytest.raises(StopIteration):
+            next(m)
+        assert m.ended
+        assert taz_client_no_pidfd.cancel(m.stream_id) is False
+
+        del m
+        gc.collect()
+        taz_client_no_pidfd.ping()
+
+    def test_cancel_via_break_leaves_no_buffered_or_closed_state(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        with taz_client.process.monitor(pid, _MONITOR_INTERVAL) as m:
+            for i, _update in enumerate(m):
+                if i == 1:
+                    break
+        assert m.cancelled is True
+
+        time.sleep(3 * _MONITOR_INTERVAL / 1000)
+        for _ in range(5):
+            taz_client.ping()
+        assert m.stream_id not in taz_client._dispatcher._buffer
+        assert m.stream_id not in taz_client._dispatcher._closed
+        taz_client.version()
+        assert taz_client.cancel(m.stream_id) is False
+
+    def test_nonexistent_pid_raises_not_found_and_connection_stays_usable(
+        self, taz_client: TazClient
+    ) -> None:
+        pid = _unused_pid()
+        with pytest.raises(TazError) as exc_info:
+            next(iter(taz_client.process.monitor(pid, _MONITOR_INTERVAL)))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+        taz_client.ping()
+
+        with (
+            pytest.raises(TazError) as exc_info,
+            taz_client.process.monitor(pid, _MONITOR_INTERVAL) as m,
+        ):
+            next(m)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+        taz_client.ping()
+
+    def test_pid_zero_raises_invalid_request(self, taz_client: TazClient) -> None:
+        with pytest.raises(TazError) as exc_info:
+            next(iter(taz_client.process.monitor(0, _MONITOR_INTERVAL)))
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+        taz_client.ping()
+
+    def test_interleaved_with_other_calls_no_deadlock(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+        tmp_path: Path,
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        scratch = tmp_path / "scratch.txt"
+        scratch.write_bytes(b"x")
+
+        start = time.monotonic()
+        m = taz_client.process.monitor(pid, _MONITOR_INTERVAL)
+        next(m)
+        taz_client.file.stat(str(scratch))
+        next(m)
+        taz_client.process.info(pid)
+        next(m)
+        assert time.monotonic() - start < 10
+        m.close()
+
+    def test_late_frames_are_not_buffered_after_close(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        m = taz_client.process.monitor(pid, _MONITOR_INTERVAL)
+        next(m)
+        m.close()
+
+        for _ in range(5):
+            taz_client.ping()
+        assert m.stream_id not in taz_client._dispatcher._buffer
+        taz_client.version()
+
+    @pytest.mark.filterwarnings("error::ResourceWarning")
+    def test_abandoning_without_close_warns_and_connection_stays_usable(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        it = taz_client.process.monitor(pid, _MONITOR_INTERVAL)
+        next(it)
+        with pytest.warns(ResourceWarning):
+            del it
+            gc.collect()
+
+        taz_client.ping()
+        taz_client.version()
+
+    def test_demo_monitor_cpu_and_memory(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        with taz_client.process.monitor(pid, interval_ms=1000) as updates:
+            for update in updates:
+                print(
+                    f"CPU: {update.info.cpu_percent}%, Mem: {update.info.memory_bytes}"
+                )
+                if update.info.memory_bytes > 0:
+                    break
+        out = capsys.readouterr().out
+        assert len(out.splitlines()) == 1
+        assert updates.cancelled is True
+
+    def test_closing_socket_with_open_monitor_stays_usable(
+        self,
+        daemon: Daemon,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        m = victim.process.monitor(pid, _MONITOR_INTERVAL)
+        next(m)
+        # Abrupt teardown: close the socket with the stream still open,
+        # mirroring TestProcessOps's 32-request mid-enumeration close test.
+        victim.close()
+
+        with TazClient("127.0.0.1", daemon.port) as other:
+            start = time.monotonic()
+            other.version()
+            assert time.monotonic() - start < 2.0
+            next(other.process.monitor(pid, _MONITOR_INTERVAL))
+
+    def test_closing_socket_mid_sample_eight_victims_exit_audit_passes(
+        self,
+        daemon: Daemon,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        sleeps_ms = (0, 25, 50)
+
+        for i in range(8):
+            victim = TazClient("127.0.0.1", daemon.port)
+            victim.connect()
+            victim.process.monitor(pid, _MONITOR_INTERVAL)
+            time.sleep(sleeps_ms[i % len(sleeps_ms)] / 1000)
+            victim.close()
+        # Nothing further to assert here: the daemon fixture's teardown
+        # audits the exit for sanitizer reports and a non-zero code - the
+        # ASan/TSan oracle for a socket close racing a sample in flight.
+
+    def test_sigterm_with_idle_monitor_raises_connection_lost_promptly(
+        self,
+        taz_client: TazClient,
+        daemon: Daemon,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        m = taz_client.process.monitor(pid, _MONITOR_INTERVAL)
+        next(m)
+
+        t0 = time.monotonic()
+        daemon.stop()
+        # The fixture's teardown re-stops (idempotent) and audits the exit
+        # for sanitizer reports and a non-zero code.
+        assert time.monotonic() - t0 < 3.0
+
+        with pytest.raises(TazConnectionLost):
+            next(m)
+
+    def test_sigterm_from_thread_while_next_is_blocked_raises_connection_lost(
+        self,
+        taz_client: TazClient,
+        daemon: Daemon,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        # A slow interval so the second next() call is genuinely blocked
+        # waiting on the socket for a frame that is not due for seconds,
+        # instead of racing the daemon's own 100 ms tick.
+        m = taz_client.process.monitor(pid, 10_000)
+        next(m)
+
+        def stop_soon() -> None:
+            time.sleep(0.2)
+            daemon.stop()
+
+        t = threading.Thread(target=stop_soon)
+        t.start()
+        with pytest.raises(TazConnectionLost):
+            next(m)
+        t.join(timeout=10)
+        assert not t.is_alive()
+
+    def test_cancel_storm_while_sample_may_be_in_flight(
+        self,
+        taz_client: TazClient,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+        for _ in range(10):
+            m = taz_client.process.monitor(pid, _MONITOR_INTERVAL)
+            next(m)
+            m.close()
+            assert m.cancelled is True
+            taz_client.ping()
 
 
 class TestConfigGet:

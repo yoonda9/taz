@@ -74,11 +74,12 @@ class Daemon:
         self.stderr = err.decode(errors="replace")
 
 
-def _launch(binary: Path) -> Daemon:
+def _launch(binary: Path, env: dict[str, str] | None = None) -> Daemon:
     proc = subprocess.Popen(
         [str(binary), "--port", "0"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env={**os.environ, **env} if env else None,
     )
     assert proc.stdout is not None
     # The daemon flushes this line right after binding, so readline() returns
@@ -112,10 +113,10 @@ def _check_exit(daemon: Daemon) -> None:
         )
 
 
-@pytest.fixture
-def daemon(daemon_binary: Path) -> Generator[Daemon, None, None]:
-    """Launch a daemon on an OS-assigned port; stop it and audit its exit."""
-    d = _launch(daemon_binary)
+def _daemon_for(
+    daemon_binary: Path, env: dict[str, str] | None = None
+) -> Generator[Daemon, None, None]:
+    d = _launch(daemon_binary, env)
     try:
         yield d
     finally:
@@ -124,8 +125,20 @@ def daemon(daemon_binary: Path) -> Generator[Daemon, None, None]:
 
 
 @pytest.fixture
-def taz_client(daemon: Daemon) -> Generator[TazClient, None, None]:
-    """A TazClient connected to the ``daemon`` fixture."""
+def daemon(daemon_binary: Path) -> Generator[Daemon, None, None]:
+    """Launch a daemon on an OS-assigned port; stop it and audit its exit."""
+    yield from _daemon_for(daemon_binary)
+
+
+@pytest.fixture
+def daemon_no_pidfd(daemon_binary: Path) -> Generator[Daemon, None, None]:
+    """Launch a daemon with PROCESS_MONITOR's pidfd exit detection disabled,
+    exercising the timer fallback that every dev/CI host's pidfd support
+    would otherwise always skip."""
+    yield from _daemon_for(daemon_binary, {"TAZ_MONITOR_NO_PIDFD": "1"})
+
+
+def _client_for(daemon: Daemon) -> Generator[TazClient, None, None]:
     client = TazClient(
         "127.0.0.1",
         daemon.port,
@@ -137,3 +150,15 @@ def taz_client(daemon: Daemon) -> Generator[TazClient, None, None]:
         yield client
     finally:
         client.close()
+
+
+@pytest.fixture
+def taz_client(daemon: Daemon) -> Generator[TazClient, None, None]:
+    """A TazClient connected to the ``daemon`` fixture."""
+    yield from _client_for(daemon)
+
+
+@pytest.fixture
+def taz_client_no_pidfd(daemon_no_pidfd: Daemon) -> Generator[TazClient, None, None]:
+    """A TazClient connected to the ``daemon_no_pidfd`` fixture."""
+    yield from _client_for(daemon_no_pidfd)
