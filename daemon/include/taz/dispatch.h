@@ -84,6 +84,12 @@ extern "C"
         const taz_stream_ops_t *stream_ops[TAZ_DISPATCH_MAX_STREAMS];
         void *stream_user[TAZ_DISPATCH_MAX_STREAMS];
         size_t active_count;
+        /* Connection-default timeout (ms) for COMMAND_EXEC, set by
+         * TIMEOUT_SET; 0 means no default. handle_command_exec snapshots
+         * this into its taz_exec_spec_t before taz_exec_start, so a later
+         * TIMEOUT_SET never retargets an in-flight command. Zeroed by
+         * taz_dispatch_init, which is what pure unit tests see. */
+        uint32_t conn_timeout_ms;
         /* Loop async handlers (e.g. COMMAND_EXEC) spawn on. Set by
          * connection.c right after taz_dispatch_init; left NULL by
          * taz_dispatch_init itself, which is what pure unit tests see. */

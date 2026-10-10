@@ -434,6 +434,51 @@ class TestCommandExec:
         assert result_box[0].exit_code == 0
 
 
+class TestConnectionTimeout:
+    """``TIMEOUT_SET`` establishes a per-connection default for COMMAND_EXEC."""
+
+    def test_default_timeout_kills_long_sleep(self, taz_client: TazClient) -> None:
+        taz_client.timeout(500)
+        result = taz_client.command.exec(PY, args=_py("import time; time.sleep(2)"))
+        assert result.timed_out is True
+
+    def test_default_timeout_zero_runs_to_completion(
+        self, taz_client: TazClient
+    ) -> None:
+        taz_client.timeout(500)
+        taz_client.timeout(0)
+        result = taz_client.command.exec(PY, args=_py("import time; time.sleep(0.2)"))
+        assert result.exit_code == 0
+        assert result.timed_out is False
+
+    def test_per_call_timeout_overrides_connection_default(
+        self, taz_client: TazClient
+    ) -> None:
+        taz_client.timeout(60000)
+        result = taz_client.command.exec(
+            PY, args=_py("import time; time.sleep(2)"), timeout_ms=300
+        )
+        assert result.timed_out is True
+
+    def test_longer_per_call_timeout_overrides_shorter_default(
+        self, taz_client: TazClient
+    ) -> None:
+        taz_client.timeout(200)
+        result = taz_client.command.exec(
+            PY, args=_py("import time; time.sleep(1)"), timeout_ms=30000
+        )
+        assert result.exit_code == 0
+        assert result.timed_out is False
+
+    def test_returns_previous_default(self, taz_client: TazClient) -> None:
+        assert taz_client.timeout(500) == 0
+        assert taz_client.timeout(1000) == 500
+
+    def test_capabilities_advertise_timeout_set(self, taz_client: TazClient) -> None:
+        cap = taz_client.capabilities()
+        assert common_pb2.OPCODE_TIMEOUT_SET in set(cap.operations)
+
+
 @pytest.mark.slow
 class TestCommandExecSlowKeepalive:
     """A long, idle-on-the-wire exec must survive the client's own keepalive

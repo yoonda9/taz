@@ -49,6 +49,7 @@ size_t taz_payload_capability(uint8_t *buf, size_t bufsize)
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_PROCESS_INFO;
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_PROCESS_MONITOR;
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_LOG;
+        msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_TIMEOUT_SET;
         msg.operations_count = op;
     }
     msg.compression_count = 1U;

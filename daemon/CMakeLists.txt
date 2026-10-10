@@ -270,6 +270,7 @@ add_library(
     src/handlers/process.c
     src/handlers/process_monitor.c
     src/handlers/log.c
+    src/handlers/timeout.c
     src/platform/process_common.c
     ${TAZ_PROCESS_SRC}
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)

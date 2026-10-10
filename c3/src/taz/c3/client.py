@@ -188,6 +188,23 @@ class TazClient:
             keepalive,
         )
 
+    def timeout(self, timeout_ms: int, keepalive: Keepalive | None = None) -> int:
+        """Set the connection's default COMMAND_EXEC timeout, in milliseconds.
+
+        Returns the previous default. Applies only to COMMAND_EXEC calls
+        dispatched after this one returns, and only when their own
+        ``timeout_ms`` is 0 (a nonzero per-call ``timeout_ms`` always
+        overrides it). 0 disables the default.
+        """
+        req = advanced_pb2.TimeoutSetRequest(timeout_ms=timeout_ms)
+        resp = self._call(
+            common_pb2.OPCODE_TIMEOUT_SET,
+            req.SerializeToString(),
+            advanced_pb2.TimeoutSetResponse,
+            keepalive,
+        )
+        return resp.previous_ms
+
     def log(
         self,
         lines: int = 100,

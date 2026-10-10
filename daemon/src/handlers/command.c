@@ -29,9 +29,21 @@ typedef struct
 static void on_exec_done(const taz_exec_result_t *result, void *arg)
 {
     exec_ctx_t *ectx = (exec_ctx_t *)arg;
+    const char *timed_out = "";
+    const char *cancelled = "";
 
-    taz_log(TAZ_LOG_INFO, "executed command: exit=%lld output=%zu",
-            (long long)result->exit_status, result->out_len);
+    if (result->timed_out)
+    {
+        timed_out = " timed_out";
+    }
+    if (result->cancelled)
+    {
+        cancelled = " cancelled";
+    }
+    taz_log(TAZ_LOG_INFO,
+            "executed command: exit=%lld signal=%d%s%s output=%zu",
+            (long long)result->exit_status, result->term_signal, timed_out,
+            cancelled, result->out_len);
 
     taz_command_send_exec_response(ectx->write_fn, ectx->write_ctx,
                                    ectx->stream_id, ectx->opcode, result);
@@ -145,9 +157,13 @@ void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
     spec.env = req->env;
     spec.env_count = (size_t)req->env_count;
     spec.cwd = req->working_dir;
-    /* timeout_ms = 0 already means "no timeout" until TIMEOUT_SET gives
-     * the connection a non-zero default to fall back to. */
-    spec.timeout_ms = req->timeout_ms;
+    /* Snapshot the effective timeout now, before taz_exec_start: a
+     * nonzero per-call timeout_ms wins, otherwise fall back to the
+     * connection default set by TIMEOUT_SET. Taking it here means a
+     * TIMEOUT_SET that lands after this point never retargets an
+     * already-dispatched exec. */
+    spec.timeout_ms =
+        (req->timeout_ms != 0U) ? req->timeout_ms : d->conn_timeout_ms;
     spec.max_output_bytes = taz_config_exec_max_output_bytes();
 
     rc = taz_exec_start(d->loop, &spec, on_exec_done, ectx, &exec_handle);

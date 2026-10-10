@@ -463,6 +463,42 @@ TEST(Dispatch, CommandExecLogsOneInfoEntryToRing)
     taz_config_reset();
 }
 
+TEST(Dispatch, TimedOutCommandExecLogsTimedOut)
+{
+    taz_config_reset();
+    taz_log_init();
+    taz_log_reset_for_tests();
+
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+    d.loop = &loop;
+    d.conn_timeout_ms = 100U;
+    WriteCtx wctx;
+
+    const auto payload = CommandExecRequestBytes(TAZ_TEST_SLEEPER_PATH, {});
+    const taz_frame_header_t h =
+        MakeHeader(static_cast<uint8_t>(taz_v1_FrameType_FRAME_TYPE_REQUEST),
+                   static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC),
+                   21U, static_cast<uint32_t>(payload.size()));
+    taz_dispatch_frame(&d, &h, payload.data(), TAZ_FRAME_OK, capture_write,
+                       &wctx);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    // A killed command's exit status alone ("exit=0" on POSIX) would read
+    // like a clean exit, so the entry must say why it ended.
+    taz_v1_LogEntry entries[8];
+    ASSERT_EQ(taz_log_collect(0, 0, TAZ_LOG_INFO, entries, 8), 1U);
+    EXPECT_NE(std::string(entries[0].message).find(" timed_out"),
+              std::string::npos);
+
+    taz_config_reset();
+}
+
 TEST(Dispatch, CommandExecWithAsUserIsNotSupported)
 {
     uv_loop_t loop;
