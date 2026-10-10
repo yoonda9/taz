@@ -267,6 +267,7 @@ add_library(
     src/handlers/file_transfer.c
     src/handlers/cancel.c
     src/handlers/process.c
+    src/handlers/process_monitor.c
     src/platform/process_common.c
     ${TAZ_PROCESS_SRC}
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)

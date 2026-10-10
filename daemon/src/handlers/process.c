@@ -59,6 +59,50 @@ static void process_flush_single_frame(taz_dispatch_write_fn_t write_fn,
     free(buf);
 }
 
+const char *taz_process_pid_check(uint32_t pid)
+{
+    if (pid == 0U || pid > (uint32_t)INT32_MAX)
+    {
+        return "pid must be positive and <= 2147483647";
+    }
+    return NULL;
+}
+
+void taz_process_send_frame(taz_dispatch_write_fn_t write_fn, void *ctx,
+                            uint32_t stream_id, uint16_t opcode,
+                            const pb_msgdesc_t *fields, const void *msg,
+                            uint8_t flags)
+{
+    size_t size = 0U;
+    uint8_t *payload;
+
+    if (!pb_get_encoded_size(&size, fields, msg))
+    {
+        return;
+    }
+
+    payload = (size > 0U) ? (uint8_t *)malloc(size) : NULL;
+    if (size > 0U && payload == NULL)
+    {
+        return;
+    }
+
+    if (size > 0U)
+    {
+        pb_ostream_t ostream = pb_ostream_from_buffer(payload, size);
+        if (!pb_encode(&ostream, fields, msg))
+        {
+            free(payload);
+            return;
+        }
+        size = ostream.bytes_written;
+    }
+
+    process_flush_single_frame(write_fn, ctx, stream_id, opcode, payload, size,
+                               flags);
+    free(payload);
+}
+
 void taz_process_list_send(taz_dispatch_write_fn_t write_fn, void *ctx,
                            uint32_t stream_id, uint16_t opcode,
                            const taz_process_entry_t *entries, size_t count)
@@ -376,12 +420,15 @@ void handle_process_kill(const taz_frame_header_t *header,
     }
 
     /* Validation: pid must be positive (1..INT32_MAX). */
-    if (req.pid == 0U || req.pid > (uint32_t)INT32_MAX)
     {
-        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
-                       taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
-                       "pid must be positive and <= 2147483647", NULL);
-        return;
+        const char *pid_msg = taz_process_pid_check(req.pid);
+        if (pid_msg != NULL)
+        {
+            taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                           taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST, pid_msg,
+                           NULL);
+            return;
+        }
     }
 
     /* Validation: signal must be non-negative. On POSIX, 0 means SIGTERM
@@ -406,47 +453,10 @@ void handle_process_kill(const taz_frame_header_t *header,
                 taz_v1_ProcessKillResponse_init_zero;
             resp.success = true;
 
-            size_t resp_size = 0U;
-            if (!pb_get_encoded_size(&resp_size,
-                                     taz_v1_ProcessKillResponse_fields, &resp))
-            {
-                taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
-                               taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
-                               "encode size failed", NULL);
-                return;
-            }
-
-            uint8_t *payload_buf =
-                (resp_size > 0U) ? (uint8_t *)malloc(resp_size) : NULL;
-            if (resp_size > 0U && payload_buf == NULL)
-            {
-                taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
-                               taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
-                               "out of memory", NULL);
-                return;
-            }
-
-            if (resp_size > 0U)
-            {
-                pb_ostream_t ostream =
-                    pb_ostream_from_buffer(payload_buf, resp_size);
-                if (!pb_encode(&ostream, taz_v1_ProcessKillResponse_fields,
-                               &resp))
-                {
-                    free(payload_buf);
-                    taz_error_send(write_fn, ctx, header->stream_id,
+            taz_process_send_frame(write_fn, ctx, header->stream_id,
                                    header->opcode,
-                                   taz_v1_ErrorCode_ERROR_CODE_INTERNAL,
-                                   "encode failed", NULL);
-                    return;
-                }
-                resp_size = ostream.bytes_written;
-            }
-
-            process_flush_single_frame(
-                write_fn, ctx, header->stream_id, header->opcode, payload_buf,
-                resp_size, (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE);
-            free(payload_buf);
+                                   taz_v1_ProcessKillResponse_fields, &resp,
+                                   (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE);
         }
         else
         {
@@ -526,13 +536,16 @@ void handle_process_info(taz_dispatch_t *d, const taz_frame_header_t *header,
     }
 
     /* Validation: pid must be positive (1..INT32_MAX). */
-    if (req.pid == 0U || req.pid > (uint32_t)INT32_MAX)
     {
-        taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
-                       taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST,
-                       "pid must be positive and <= 2147483647", NULL);
-        taz_dispatch_stream_done(d, header->stream_id);
-        return;
+        const char *pid_msg = taz_process_pid_check(req.pid);
+        if (pid_msg != NULL)
+        {
+            taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
+                           taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST, pid_msg,
+                           NULL);
+            taz_dispatch_stream_done(d, header->stream_id);
+            return;
+        }
     }
 
     pctx = (process_info_ctx_t *)calloc(1U, sizeof(*pctx));

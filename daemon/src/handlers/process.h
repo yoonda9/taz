@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <pb.h>
+
 #include "taz/dispatch.h"
 #include "taz/frame.h"
 #include "taz/process.h"
@@ -12,6 +14,25 @@
 extern "C"
 {
 #endif
+
+    /* NULL when pid is valid (1..INT32_MAX); otherwise the exact message
+     * every pid-validating handler (KILL, INFO, MONITOR) sends as an
+     * INVALID_REQUEST ERROR. The returned pointer is a string literal,
+     * valid for the life of the program. */
+    const char *taz_process_pid_check(uint32_t pid);
+
+    /* Encodes msg (described by fields) and sends it as exactly one
+     * RESPONSE frame with the given flags - never chunks, unlike
+     * taz_response_send, and never clears CONTINUATION on its own: the
+     * caller decides every frame's flags. Used for small, fixed-shape
+     * messages (ProcessKillResponse, ProcessMonitorResponse) that are
+     * always well under TAZ_FRAME_MAX_PAYLOAD_RESPONSE. A malloc/encode
+     * failure drops the frame silently, matching
+     * taz_process_list_send/taz_process_info_send. */
+    void taz_process_send_frame(taz_dispatch_write_fn_t write_fn, void *ctx,
+                                uint32_t stream_id, uint16_t opcode,
+                                const pb_msgdesc_t *fields, const void *msg,
+                                uint8_t flags);
 
     /* Async PROCESS_LIST handler: decode the request (an empty/absent
      * payload means filter == ""), then on the thread pool

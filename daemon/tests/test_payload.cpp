@@ -33,7 +33,7 @@ TEST(Payload, CapabilityRoundTrip)
 
     EXPECT_EQ(cap.protocol_major, 1U);
     EXPECT_EQ(cap.protocol_minor, 0U);
-    ASSERT_EQ(cap.operations_count, 18U);
+    ASSERT_EQ(cap.operations_count, 19U);
 
     // Collect operations into a set for order-independent verification.
     const std::set<uint32_t> ops(cap.operations,
@@ -71,6 +71,8 @@ TEST(Payload, CapabilityRoundTrip)
         ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_PROCESS_KILL)));
     EXPECT_TRUE(
         ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_PROCESS_INFO)));
+    EXPECT_TRUE(
+        ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_PROCESS_MONITOR)));
 
     ASSERT_GE(cap.compression_count, 1U);
     EXPECT_STREQ(cap.compression[0], "NONE");

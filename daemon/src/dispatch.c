@@ -8,6 +8,7 @@
 #include "handlers/file.h"
 #include "handlers/file_transfer.h"
 #include "handlers/process.h"
+#include "handlers/process_monitor.h"
 #include "handlers/version.h"
 #include "taz/error.h"
 #include "taz/v1/common.pb.h"
@@ -325,6 +326,8 @@ static const opcode_entry_t OPCODE_TABLE[] = {
      false},
     {NULL, handle_process_info, (uint16_t)taz_v1_Opcode_OPCODE_PROCESS_INFO,
      true},
+    {NULL, handle_process_monitor,
+     (uint16_t)taz_v1_Opcode_OPCODE_PROCESS_MONITOR, true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))
