@@ -1,15 +1,18 @@
 // Unit tests for the cross-platform process API in taz/process.h:
-// enumerate/inspect against the live host (finding this test binary
+// enumerate/inspect/watch against the live host (finding this test binary
 // itself) and kill against a spawned, cross-platform sleeper child.
-// Linux-specific assertions (open_files, POSIX signal mapping) are
-// guarded by #ifndef _WIN32; everything else runs on both platforms once
-// src/platform/process_win32.c exists.
+// Platform-specific assertions (open_files, POSIX signal mapping, pidfd
+// polling, the starttime-reuse check) are guarded by #ifndef _WIN32 /
+// #ifdef _WIN32; everything else runs on both platforms.
 
+#include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <string>
+#include <thread>
 
 #include <gtest/gtest.h>
 #include <uv.h>
@@ -19,8 +22,11 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <csignal>
+#include <cerrno>
 
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -271,6 +277,221 @@ TEST_F(ProcessPlatformTest, FreeFunctionsOnZeroedStructsAreNoops)
     EXPECT_EQ(zeroed_detail.command_line, nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// taz_process_interval_cpu_percent (pure, both platforms)
+// ---------------------------------------------------------------------------
+
+TEST(IntervalCpuPercent, HalfSecondOfOneSecondWallIsFiftyPercent)
+{
+    EXPECT_FLOAT_EQ(
+        taz_process_interval_cpu_percent(500000000ULL, 1000000000ULL), 50.0F);
+}
+
+TEST(IntervalCpuPercent, CanExceedOneHundredPercent)
+{
+    EXPECT_FLOAT_EQ(
+        taz_process_interval_cpu_percent(2000000000ULL, 1000000000ULL), 200.0F);
+}
+
+TEST(IntervalCpuPercent, ZeroWallDeltaIsZero)
+{
+    EXPECT_FLOAT_EQ(taz_process_interval_cpu_percent(1ULL, 0ULL), 0.0F);
+}
+
+// ---------------------------------------------------------------------------
+// taz_process_watch_open / _sample / _close (both platforms).
+// ---------------------------------------------------------------------------
+
+// Spins until at least cpu_ms milliseconds of *CPU* time (not wall time)
+// have been burned, capped by a 5 s wall-clock deadline so a starved CI
+// runner cannot hang the test.
+void BusySpinCpuMs(long cpu_ms)
+{
+    const clock_t start = clock();
+    const clock_t target = start + ((cpu_ms * CLOCKS_PER_SEC) / 1000);
+    const auto wall_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
+    while (clock() < target)
+    {
+        if (std::chrono::steady_clock::now() > wall_deadline)
+        {
+            break;
+        }
+    }
+}
+
+#ifndef _WIN32
+TEST_F(ProcessPlatformTest, OpenSelfWithPidfdYieldsAPollableNotYetReadableFd)
+{
+    taz_process_watch_t watch{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+
+    ASSERT_EQ(taz_process_watch_open(SelfPid(), 1, &watch, &code, &detail), 0);
+    ASSERT_GE(watch.exit_fd, 0);
+
+    struct pollfd pfd{};
+    pfd.fd = watch.exit_fd;
+    pfd.events = POLLIN;
+    EXPECT_EQ(poll(&pfd, 1, 0), 0)
+        << "a live process's pidfd must not be readable yet";
+
+    taz_process_watch_close(&watch);
+}
+#endif // !_WIN32
+
+TEST_F(ProcessPlatformTest, OpenSelfWithPidfdDisabledLeavesExitFdMinusOne)
+{
+    taz_process_watch_t watch{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+
+    // use_pidfd is Linux-only; Windows ignores it and always holds a
+    // handle, so exit_fd stays -1 there regardless of this argument.
+    ASSERT_EQ(taz_process_watch_open(SelfPid(), 0, &watch, &code, &detail), 0);
+    EXPECT_EQ(watch.exit_fd, -1);
+#ifdef _WIN32
+    EXPECT_NE(watch.handle, nullptr);
+#endif
+
+    taz_process_watch_close(&watch);
+}
+
+TEST_F(ProcessPlatformTest, SampleSelfLiveReportsCpuTimeAndInfoFields)
+{
+    taz_process_watch_t watch{};
+    taz_process_sample_t sample{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+
+    ASSERT_EQ(taz_process_watch_open(SelfPid(), 1, &watch, &code, &detail), 0);
+    BusySpinCpuMs(20);
+
+    ASSERT_EQ(taz_process_watch_sample(&watch, &sample, &code, &detail), 0);
+    EXPECT_EQ(sample.state, TAZ_PROCESS_SAMPLE_LIVE);
+    EXPECT_GT(sample.cpu_time_ns, 0ULL);
+    EXPECT_EQ(sample.info.pid, SelfPid());
+    EXPECT_EQ(sample.info.name, ExpectedSelfName());
+    EXPECT_NE(sample.info.state[0], '\0');
+    EXPECT_GT(sample.info.memory_bytes, 0ULL);
+    EXPECT_NE(sample.info.user[0], '\0');
+
+    taz_process_watch_close(&watch);
+}
+
+TEST_F(ProcessPlatformTest, TwoSamplesFiftyMillisecondsApartAreNonDecreasing)
+{
+    taz_process_watch_t watch{};
+    taz_process_sample_t first{};
+    taz_process_sample_t second{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+
+    ASSERT_EQ(taz_process_watch_open(SelfPid(), 1, &watch, &code, &detail), 0);
+    ASSERT_EQ(taz_process_watch_sample(&watch, &first, &code, &detail), 0);
+
+    BusySpinCpuMs(20);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ASSERT_EQ(taz_process_watch_sample(&watch, &second, &code, &detail), 0);
+    EXPECT_GE(second.cpu_time_ns, first.cpu_time_ns);
+
+    taz_process_watch_close(&watch);
+}
+
+// On Windows OpenProcess fails for an impossible pid regardless of
+// use_pidfd (it is ignored there), so this covers both platforms: Linux via
+// the pidfd syscall's ESRCH, Windows via OpenProcess's
+// ERROR_INVALID_PARAMETER.
+TEST_F(ProcessPlatformTest, ImpossiblePidIsNotFoundFromOpen)
+{
+    taz_process_watch_t watch{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+    const uint32_t pid = ImpossiblePid();
+
+    EXPECT_EQ(taz_process_watch_open(pid, 1, &watch, &code, &detail), -1);
+    EXPECT_EQ(code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+}
+
+#ifndef _WIN32
+// Only meaningful on the fallback path: with pidfd disabled, open cannot
+// tell an impossible pid from a real one (it makes no syscall at all), so
+// the first proof of nonexistence comes from the pool-side /proc read in
+// sample. Windows has no equivalent: OpenProcess always validates the pid
+// at open time (ImpossiblePidIsNotFoundFromOpen above already covers it).
+TEST_F(ProcessPlatformTest, ImpossiblePidWithPidfdDisabledIsNotFoundFromSample)
+{
+    taz_process_watch_t watch{};
+    taz_process_sample_t sample{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+    const uint32_t pid = ImpossiblePid();
+
+    ASSERT_EQ(taz_process_watch_open(pid, 0, &watch, &code, &detail), 0);
+    EXPECT_EQ(watch.exit_fd, -1);
+    EXPECT_EQ(taz_process_watch_sample(&watch, &sample, &code, &detail), -1);
+    EXPECT_EQ(code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    taz_process_watch_close(&watch);
+}
+#endif // !_WIN32
+
+TEST_F(ProcessPlatformTest, CloseTwiceIsNoop)
+{
+    taz_process_watch_t watch{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+
+    ASSERT_EQ(taz_process_watch_open(SelfPid(), 1, &watch, &code, &detail), 0);
+#ifndef _WIN32
+    const int fd = watch.exit_fd;
+    ASSERT_GE(fd, 0);
+#else
+    ASSERT_NE(watch.handle, nullptr);
+#endif
+
+    taz_process_watch_close(&watch);
+    EXPECT_EQ(watch.exit_fd, -1);
+#ifndef _WIN32
+    EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+#else
+    EXPECT_EQ(watch.handle, nullptr);
+#endif
+
+    taz_process_watch_close(&watch);
+    EXPECT_EQ(watch.exit_fd, -1);
+#ifdef _WIN32
+    EXPECT_EQ(watch.handle, nullptr);
+#endif
+}
+
+#ifndef _WIN32
+// The starttime-reuse check is Linux-only: a held Windows handle keeps the
+// pid's kernel object alive, so the same pid can never be reassigned to a
+// different process while the watch is open, and taz_process_watch_sample
+// does not implement the check there.
+TEST_F(ProcessPlatformTest, FirstStartTimeMismatchReportsExited)
+{
+    taz_process_watch_t watch{};
+    taz_process_sample_t sample{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+
+    ASSERT_EQ(taz_process_watch_open(SelfPid(), 1, &watch, &code, &detail), 0);
+    ASSERT_EQ(taz_process_watch_sample(&watch, &sample, &code, &detail), 0);
+    ASSERT_EQ(sample.state, TAZ_PROCESS_SAMPLE_LIVE);
+
+    watch.first_starttime = sample.starttime + 1U;
+    ASSERT_EQ(taz_process_watch_sample(&watch, &sample, &code, &detail), 0);
+    EXPECT_EQ(sample.state, TAZ_PROCESS_SAMPLE_EXITED);
+
+    taz_process_watch_close(&watch);
+}
+#endif // !_WIN32
+
 // --- spawn / kill against a real child -------------------------------------
 //
 // taz_test_sleeper (built from sleeper.c) sleeps for 60 s with no shell
@@ -376,6 +597,46 @@ TEST_F(ProcessSpawnTest, KillZeroSendsTerminateAndReportsNotFoundAfterReap)
     ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 }
 
+#ifndef _WIN32
+// libuv reaps a uv_spawn child itself (its SIGCHLD watcher calls waitpid
+// before the exit callback runs), so by the time outcome.called is true
+// /proc/<pid> is already gone: the fallback sample path reports NOT_FOUND,
+// not EXITED (documented divergence from the pidfd path, which the
+// PROCESS_MONITOR handler reconciles in a later step). The pidfd opened
+// before the kill does observe the exit, independent of the reap.
+TEST_F(ProcessSpawnTest, SleeperKilledAndReapedIsPidfdReadableButSampleNotFound)
+{
+    uv_process_t process{};
+    SpawnOutcome outcome;
+    const uint32_t pid = SpawnSleeper(Loop(), &process, &outcome);
+    ASSERT_NE(pid, 0U);
+
+    taz_process_watch_t watch{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+    ASSERT_EQ(taz_process_watch_open(pid, 1, &watch, &code, &detail), 0);
+    ASSERT_GE(watch.exit_fd, 0);
+
+    ASSERT_EQ(taz_process_kill(pid, 0, &code, &detail), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    EXPECT_TRUE(outcome.called);
+
+    struct pollfd pfd{};
+    pfd.fd = watch.exit_fd;
+    pfd.events = POLLIN;
+    ASSERT_EQ(poll(&pfd, 1, 2000), 1);
+    EXPECT_NE(pfd.revents & POLLIN, 0);
+
+    taz_process_sample_t sample{};
+    EXPECT_EQ(taz_process_watch_sample(&watch, &sample, &code, &detail), -1);
+    EXPECT_EQ(code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    taz_process_watch_close(&watch);
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+}
+#endif // !_WIN32
+
 #ifdef _WIN32
 // OpenProcess ignores a pid's low two bits, so pid + 1 would open the
 // sleeper itself. Windows pids are multiples of 4, so pid + 1 is never a
@@ -407,6 +668,58 @@ TEST_F(ProcessSpawnTest, AliasedPidIsNotFoundAndSleeperStaysAlive)
     uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
     ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 }
+
+// A watch opened before the kill holds the sleeper's handle for the
+// stream's life, so (unlike the Linux fallback, where libuv's own reap
+// beats the sample to /proc) the held handle survives the exit and the
+// sample reports it with the real exit code. The handle also keeps the pid
+// from being reused, so an aliased or impossible pid opened afterward is
+// still NOT_FOUND.
+TEST_F(ProcessSpawnTest, WatchHeldHandleSurvivesSleeperExitWithExitCode)
+{
+    uv_process_t process{};
+    SpawnOutcome outcome;
+    const uint32_t pid = SpawnSleeper(Loop(), &process, &outcome);
+    ASSERT_NE(pid, 0U);
+
+    taz_process_watch_t watch{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+    ASSERT_EQ(taz_process_watch_open(pid, 1, &watch, &code, &detail), 0);
+    EXPECT_NE(watch.handle, nullptr);
+    EXPECT_EQ(watch.exit_fd, -1);
+
+    ASSERT_EQ(uv_process_kill(&process, SIGTERM), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    EXPECT_TRUE(outcome.called);
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    taz_process_sample_t sample{};
+    ASSERT_EQ(taz_process_watch_sample(&watch, &sample, &code, &detail), 0);
+    EXPECT_EQ(sample.state, TAZ_PROCESS_SAMPLE_EXITED);
+    EXPECT_EQ(sample.exit_code_known, 1);
+    EXPECT_EQ(sample.exit_code, 1);
+
+    code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    taz_process_watch_t aliased_watch{};
+    EXPECT_EQ(
+        taz_process_watch_open(pid + 1U, 1, &aliased_watch, &code, &detail),
+        -1);
+    EXPECT_EQ(code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    taz_process_watch_t impossible_watch{};
+    EXPECT_EQ(taz_process_watch_open(ImpossiblePid(), 1, &impossible_watch,
+                                     &code, &detail),
+              -1);
+    EXPECT_EQ(code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+
+    taz_process_watch_close(&watch);
+    EXPECT_EQ(watch.handle, nullptr);
+    taz_process_watch_close(&watch);
+    EXPECT_EQ(watch.handle, nullptr);
+}
 #endif // _WIN32
 
 #ifndef _WIN32
@@ -429,6 +742,54 @@ TEST_F(ProcessSpawnTest, UnknownSignalIsInvalidRequestAndSleeperStaysAlive)
 
     uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
     ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+}
+#endif // !_WIN32
+
+#ifndef _WIN32
+// libuv's SIGCHLD watcher reaps every uv_spawn child itself, so a zombie
+// (killed but not yet waited) needs a raw fork+execv child instead - this
+// test waitpid()s it only at the very end, after the sample assertions.
+TEST(ProcessWatchZombie, SampleReportsExitedWithZombieState)
+{
+    const pid_t child = fork();
+    ASSERT_NE(child, -1);
+    if (child == 0)
+    {
+        char *const args[] = {const_cast<char *>(TAZ_TEST_SLEEPER_PATH),
+                              nullptr};
+        execv(TAZ_TEST_SLEEPER_PATH, args);
+        _exit(127);
+    }
+
+    const uint32_t pid = static_cast<uint32_t>(child);
+    taz_process_watch_t watch{};
+    taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *detail = nullptr;
+    ASSERT_EQ(taz_process_watch_open(pid, 1, &watch, &code, &detail), 0);
+
+    ASSERT_EQ(kill(child, SIGKILL), 0);
+
+    taz_process_sample_t sample{};
+    bool exited = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        if ((taz_process_watch_sample(&watch, &sample, &code, &detail) == 0) &&
+            (sample.state == TAZ_PROCESS_SAMPLE_EXITED))
+        {
+            exited = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(exited);
+    EXPECT_STREQ(sample.info.state, "zombie");
+
+    taz_process_watch_close(&watch);
+
+    int status = 0;
+    EXPECT_EQ(waitpid(child, &status, 0), child);
 }
 #endif // !_WIN32
 

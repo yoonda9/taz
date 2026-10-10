@@ -9,12 +9,27 @@
 #include <string.h>
 #include <time.h>
 
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <uv.h>
 
 #include "taz/error.h"
 #include "taz/fsutil.h"
+
+/* The glibc pidfd_open() wrapper needs glibc >= 2.36, and musl (used by
+ * the static/portable build target) may have none at all, so this calls
+ * the syscall directly. The number is the same across every architecture. */
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+
+/* sysconf(_SC_CLK_TCK)/_SC_PAGESIZE fallbacks for the (never observed on a
+ * real Linux host, but contractually possible) case where sysconf reports
+ * <= 0. Declared here (rather than next to their one other use site below)
+ * so the pure helpers just below can use them too. */
+#define TAZ_PROC_DEFAULT_CLK_TCK   100U
+#define TAZ_PROC_DEFAULT_PAGE_SIZE 4096U
 
 /* /proc/<pid>/stat field numbers (1-based, counting the leading pid and the
  * parenthesized comm as fields 1 and 2) this code reads. Everything between
@@ -365,6 +380,35 @@ float taz_proc_cpu_percent(uint64_t cpu_ticks, uint64_t ticks_per_sec,
     return (float)ratio;
 }
 
+int taz_proc_stat_is_exited(const taz_proc_stat_t *st, uint64_t first_starttime)
+{
+    if ((st->state == 'Z') || (st->state == 'X') || (st->state == 'x'))
+    {
+        return 1;
+    }
+    if ((first_starttime != 0U) && (st->starttime != first_starttime))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/* Nanoseconds per second: the scale taz_proc_ticks_to_ns converts clock
+ * ticks into. */
+#define TAZ_PROC_NS_PER_SEC 1000000000ULL
+
+uint64_t taz_proc_ticks_to_ns(uint64_t ticks, uint64_t ticks_per_sec)
+{
+    const uint64_t tps =
+        (ticks_per_sec > 0U) ? ticks_per_sec : TAZ_PROC_DEFAULT_CLK_TCK;
+
+    /* Whole seconds and the remainder separately: ticks * 1e9 would wrap
+     * past ~1.8e10 ticks, which a busy many-threaded process reaches in
+     * days. */
+    return ((ticks / tps) * TAZ_PROC_NS_PER_SEC) +
+           (((ticks % tps) * TAZ_PROC_NS_PER_SEC) / tps);
+}
+
 void taz_proc_cmdline_to_string(const uint8_t *buf, size_t len, char *out,
                                 size_t outsize)
 {
@@ -409,12 +453,6 @@ void taz_proc_cmdline_to_string(const uint8_t *buf, size_t len, char *out,
 
 #define TAZ_PROC_DIR       "/proc"
 #define TAZ_PROC_STAT_FILE "/proc/stat"
-
-/* sysconf(_SC_CLK_TCK)/_SC_PAGESIZE fallbacks for the (never observed on a
- * real Linux host, but contractually possible) case where sysconf reports
- * <= 0. */
-#define TAZ_PROC_DEFAULT_CLK_TCK   100U
-#define TAZ_PROC_DEFAULT_PAGE_SIZE 4096U
 
 /* "/proc/<pid><suffix>" and "/proc/<pid>/fd/<fd>": pid and fd are each at
  * most 10 decimal digits, so this is generous for both. */
@@ -706,6 +744,51 @@ static int proc_entry_list_append(taz_process_list_t *list,
     return 1;
 }
 
+/* Fills entry->name/state/memory_bytes from an already-parsed stat_info (no
+ * I/O). Shared by proc_fill_entry, taz_process_inspect and
+ * taz_process_watch_sample so the three cannot drift apart. */
+static void proc_fill_entry_name_state_memory(const taz_proc_stat_t *stat_info,
+                                              uint64_t page_size,
+                                              taz_process_entry_t *entry)
+{
+    taz_fsutil_sanitize_utf8(stat_info->comm, strlen(stat_info->comm),
+                             entry->name, sizeof(entry->name));
+    {
+        const char *word = taz_proc_state_word(stat_info->state);
+        taz_fsutil_sanitize_utf8(word, strlen(word), entry->state,
+                                 sizeof(entry->state));
+    }
+    entry->memory_bytes = stat_info->rss_pages * page_size;
+}
+
+/* Fills entry->user from /proc/<pid>/status; leaves it "" (the memset
+ * default) when the file is unreadable or has no parsable Uid: line. Not
+ * a failure of the caller - shared by proc_fill_entry, taz_process_inspect
+ * and taz_process_watch_sample. */
+static void proc_fill_entry_user(uint32_t pid, taz_process_entry_t *entry)
+{
+    char path[TAZ_PROC_PATH_BUF_LEN];
+
+    if (proc_build_path(path, sizeof(path), pid, "/status"))
+    {
+        char *status_text = NULL;
+        size_t status_len = 0U;
+
+        if (proc_read_file(path, TAZ_PROC_STATUS_READ_CAP, &status_text,
+                           &status_len, NULL, NULL) == 0)
+        {
+            unsigned long uid;
+
+            if (taz_proc_parse_status_uid(status_text, status_len, &uid))
+            {
+                taz_user_name_from_uid(TAZ_PASSWD_PATH, uid, entry->user,
+                                       sizeof(entry->user));
+            }
+            free(status_text);
+        }
+    }
+}
+
 /* Fills *entry for pid from /proc/<pid>/stat (+ /proc/<pid>/status for the
  * owning uid). Returns 0 when the process cannot be read at all (it
  * exited mid-scan, is inaccessible, or its stat line is malformed): the
@@ -740,13 +823,7 @@ static int proc_fill_entry(uint32_t pid, uint64_t btime, uint64_t clk_tck,
     }
     free(stat_text);
 
-    taz_fsutil_sanitize_utf8(stat_info.comm, strlen(stat_info.comm),
-                             entry->name, sizeof(entry->name));
-    {
-        const char *word = taz_proc_state_word(stat_info.state);
-        taz_fsutil_sanitize_utf8(word, strlen(word), entry->state,
-                                 sizeof(entry->state));
-    }
+    proc_fill_entry_name_state_memory(&stat_info, page_size, entry);
 
     start_time = btime + (stat_info.starttime / clk_tck);
     {
@@ -754,26 +831,8 @@ static int proc_fill_entry(uint32_t pid, uint64_t btime, uint64_t clk_tck,
         entry->cpu_percent = taz_proc_cpu_percent(
             stat_info.utime + stat_info.stime, clk_tck, elapsed);
     }
-    entry->memory_bytes = stat_info.rss_pages * page_size;
 
-    if (proc_build_path(path, sizeof(path), pid, "/status"))
-    {
-        char *status_text = NULL;
-        size_t status_len = 0U;
-
-        if (proc_read_file(path, TAZ_PROC_STATUS_READ_CAP, &status_text,
-                           &status_len, NULL, NULL) == 0)
-        {
-            unsigned long uid;
-
-            if (taz_proc_parse_status_uid(status_text, status_len, &uid))
-            {
-                taz_user_name_from_uid(TAZ_PASSWD_PATH, uid, entry->user,
-                                       sizeof(entry->user));
-            }
-            free(status_text);
-        }
-    }
+    proc_fill_entry_user(pid, entry);
 
     return 1;
 }
@@ -1010,39 +1069,14 @@ int taz_process_inspect(uint32_t pid, taz_process_detail_t *out,
     proc_read_btime(&btime);
 
     out->info.pid = pid;
-    taz_fsutil_sanitize_utf8(stat_info.comm, strlen(stat_info.comm),
-                             out->info.name, sizeof(out->info.name));
-    {
-        const char *word = taz_proc_state_word(stat_info.state);
-        taz_fsutil_sanitize_utf8(word, strlen(word), out->info.state,
-                                 sizeof(out->info.state));
-    }
+    proc_fill_entry_name_state_memory(&stat_info, page_size, &out->info);
     out->start_time = btime + (stat_info.starttime / clk_tck);
     {
         const double elapsed = (double)time(NULL) - (double)out->start_time;
         out->info.cpu_percent = taz_proc_cpu_percent(
             stat_info.utime + stat_info.stime, clk_tck, elapsed);
     }
-    out->info.memory_bytes = stat_info.rss_pages * page_size;
-
-    if (proc_build_path(path, sizeof(path), pid, "/status"))
-    {
-        char *status_text = NULL;
-        size_t status_len = 0U;
-
-        if (proc_read_file(path, TAZ_PROC_STATUS_READ_CAP, &status_text,
-                           &status_len, NULL, NULL) == 0)
-        {
-            unsigned long uid;
-
-            if (taz_proc_parse_status_uid(status_text, status_len, &uid))
-            {
-                taz_user_name_from_uid(TAZ_PASSWD_PATH, uid, out->info.user,
-                                       sizeof(out->info.user));
-            }
-            free(status_text);
-        }
-    }
+    proc_fill_entry_user(pid, &out->info);
 
     out->command_line = (char *)calloc(1U, TAZ_PROCESS_CMDLINE_CAP);
     if (out->command_line == NULL)
@@ -1108,6 +1142,104 @@ int taz_process_kill(uint32_t pid, int32_t signal, taz_v1_ErrorCode *code,
     }
     *detail = uv_strerror(uv_translate_sys_error(saved_errno));
     return -1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Watch/sample: taz_process_watch_open/_sample/_close. Open and close run
+ * inline on the loop thread; sample does blocking /proc I/O and runs on
+ * the pool.
+ * ------------------------------------------------------------------------- */
+
+int taz_process_watch_open(uint32_t pid, int use_pidfd, taz_process_watch_t *w,
+                           taz_v1_ErrorCode *code, const char **detail)
+{
+    memset(w, 0, sizeof(*w));
+    w->pid = pid;
+    w->exit_fd = -1;
+
+    if (use_pidfd == 0)
+    {
+        return 0;
+    }
+
+    {
+        const long rc = syscall(SYS_pidfd_open, (pid_t)pid, 0);
+        const int saved_errno = (rc < 0) ? errno : 0;
+
+        if (rc >= 0)
+        {
+            w->exit_fd = (int)rc;
+            return 0;
+        }
+        if (saved_errno == ESRCH)
+        {
+            *code = taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
+            *detail = uv_strerror(uv_translate_sys_error(saved_errno));
+            return -1;
+        }
+        /* ENOSYS (kernel < 5.3), EPERM (container seccomp) or anything
+         * else: fall back to the timer path (exit_fd stays -1). */
+        return 0;
+    }
+}
+
+int taz_process_watch_sample(const taz_process_watch_t *w,
+                             taz_process_sample_t *out, taz_v1_ErrorCode *code,
+                             const char **detail)
+{
+    char path[TAZ_PROC_PATH_BUF_LEN];
+    char *stat_text = NULL;
+    size_t stat_len = 0U;
+    taz_proc_stat_t stat_info;
+    const long clk_tck_raw = sysconf(_SC_CLK_TCK);
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    const uint64_t clk_tck =
+        (clk_tck_raw > 0) ? (uint64_t)clk_tck_raw : TAZ_PROC_DEFAULT_CLK_TCK;
+    const uint64_t page_size = (page_size_raw > 0) ? (uint64_t)page_size_raw
+                                                   : TAZ_PROC_DEFAULT_PAGE_SIZE;
+
+    memset(out, 0, sizeof(*out));
+
+    if (!proc_build_path(path, sizeof(path), w->pid, "/stat"))
+    {
+        *code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+        *detail = "pid path too long";
+        return -1;
+    }
+    if (proc_read_file(path, TAZ_PROC_STAT_READ_CAP, &stat_text, &stat_len,
+                       code, detail) != 0)
+    {
+        return -1;
+    }
+    if (!taz_proc_parse_stat(stat_text, stat_len, &stat_info))
+    {
+        free(stat_text);
+        *code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+        *detail = "unparseable /proc stat";
+        return -1;
+    }
+    free(stat_text);
+
+    out->info.pid = w->pid;
+    proc_fill_entry_name_state_memory(&stat_info, page_size, &out->info);
+    proc_fill_entry_user(w->pid, &out->info);
+    out->cpu_time_ns =
+        taz_proc_ticks_to_ns(stat_info.utime + stat_info.stime, clk_tck);
+    out->starttime = stat_info.starttime;
+    out->state = taz_proc_stat_is_exited(&stat_info, w->first_starttime)
+                     ? TAZ_PROCESS_SAMPLE_EXITED
+                     : TAZ_PROCESS_SAMPLE_LIVE;
+    return 0;
+}
+
+void taz_process_watch_close(taz_process_watch_t *w)
+{
+    if (w->exit_fd >= 0)
+    {
+        (void)close(w->exit_fd);
+    }
+    memset(w, 0, sizeof(*w));
+    w->exit_fd = -1;
 }
 
 #endif /* !_WIN32 */

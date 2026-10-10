@@ -31,6 +31,9 @@
  * szExeFile, or one path component): at most 3 bytes per unit, since a
  * surrogate pair's 4 bytes span 2 units, plus the NUL. */
 #define TAZ_WIN32_NAME_UTF8_SIZE ((MAX_PATH * 3U) + 1U)
+/* A FILETIME / GetProcessTimes tick is 100 ns; taz_process_sample_t's
+ * cpu_time_ns is nanoseconds. */
+#define TAZ_WIN32_FILETIME_UNIT_NS 100U
 
 /* Heap-owned copy of a process snapshot: the enumeration base for process
  * listing. */
@@ -769,6 +772,149 @@ int taz_process_kill(uint32_t pid, int32_t signal, taz_v1_ErrorCode *code,
     }
 
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Watch/sample: taz_process_watch_open/_sample/_close. All three are inline
+ * on the loop thread except _sample, which runs on the pool but only reads
+ * *w (the handle it holds is never touched by the loop while a sample is in
+ * flight).
+ * ------------------------------------------------------------------------- */
+
+int taz_process_watch_open(uint32_t pid, int use_pidfd, taz_process_watch_t *w,
+                           taz_v1_ErrorCode *code, const char **detail)
+{
+    HANDLE h_process;
+
+    /* Windows has no pidfd equivalent; the held handle below is the only
+     * exit-detection mechanism, so use_pidfd does not change anything. */
+    (void)use_pidfd;
+
+    memset(w, 0, sizeof(*w));
+    w->pid = pid;
+    w->exit_fd = -1;
+
+    h_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                            FALSE, pid);
+    if (h_process == NULL)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_INVALID_PARAMETER)
+        {
+            *code = taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
+        }
+        else if (err == ERROR_ACCESS_DENIED)
+        {
+            *code = taz_v1_ErrorCode_ERROR_CODE_PERMISSION_DENIED;
+        }
+        else
+        {
+            *code = taz_error_from_win32(err);
+        }
+        *detail = uv_strerror(uv_translate_sys_error((int)err));
+        return -1;
+    }
+
+    if (!win32_handle_matches_pid(h_process, pid))
+    {
+        CloseHandle(h_process);
+        *code = taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
+        *detail = uv_strerror(UV_ESRCH);
+        return -1;
+    }
+
+    if (WaitForSingleObject(h_process, 0) == WAIT_OBJECT_0)
+    {
+        CloseHandle(h_process);
+        *code = taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
+        *detail = "process has exited";
+        return -1;
+    }
+
+    w->handle = (void *)h_process;
+    return 0;
+}
+
+/* code/detail are never written here (a sample never fails once the handle
+ * is held - every query below is best-effort and leaves its field blank on
+ * failure): NOLINT(readability-non-const-parameter) on both, since the
+ * signature is shared with process_linux.c's implementation, which does
+ * write through them. */
+int taz_process_watch_sample(
+    const taz_process_watch_t *w, taz_process_sample_t *out,
+    taz_v1_ErrorCode *code, // NOLINT(readability-non-const-parameter)
+    const char **detail)    // NOLINT(readability-non-const-parameter)
+{
+    HANDLE h_process = (HANDLE)w->handle;
+
+    (void)code;
+    (void)detail;
+
+    memset(out, 0, sizeof(*out));
+    out->info.pid = w->pid;
+
+    if (WaitForSingleObject(h_process, 0) == WAIT_OBJECT_0)
+    {
+        DWORD exit_code = 0U;
+
+        out->state = TAZ_PROCESS_SAMPLE_EXITED;
+        if (GetExitCodeProcess(h_process, &exit_code))
+        {
+            out->exit_code = (int32_t)exit_code;
+            out->exit_code_known = 1;
+        }
+        return 0;
+    }
+
+    out->state = TAZ_PROCESS_SAMPLE_LIVE;
+
+    {
+        FILETIME create_time;
+        FILETIME exit_time;
+        FILETIME kernel_time;
+        FILETIME user_time;
+
+        if (GetProcessTimes(h_process, &create_time, &exit_time, &kernel_time,
+                            &user_time))
+        {
+            out->starttime = (((uint64_t)create_time.dwHighDateTime << 32) |
+                              create_time.dwLowDateTime);
+            out->cpu_time_ns = ((((uint64_t)kernel_time.dwHighDateTime << 32) |
+                                 kernel_time.dwLowDateTime) +
+                                (((uint64_t)user_time.dwHighDateTime << 32) |
+                                 user_time.dwLowDateTime)) *
+                               TAZ_WIN32_FILETIME_UNIT_NS;
+        }
+    }
+
+    {
+        PROCESS_MEMORY_COUNTERS mem_info;
+
+        mem_info.cb = sizeof(mem_info);
+        if (K32GetProcessMemoryInfo(h_process, &mem_info, sizeof(mem_info)))
+        {
+            out->info.memory_bytes = mem_info.WorkingSetSize;
+        }
+    }
+
+    win32_resolve_process_name(h_process, (DWORD)w->pid, out->info.name,
+                               sizeof(out->info.name));
+    win32_fill_process_user(h_process, out->info.user, sizeof(out->info.user));
+
+    (void)strncpy(out->info.state, "running", sizeof(out->info.state) - 1U);
+    out->info.state[sizeof(out->info.state) - 1U] = '\0';
+
+    return 0;
+}
+
+void taz_process_watch_close(taz_process_watch_t *w)
+{
+    if (w->handle != NULL)
+    {
+        CloseHandle((HANDLE)w->handle);
+    }
+    memset(w, 0, sizeof(*w));
+    w->exit_fd = -1;
 }
 
 #endif /* _WIN32 */

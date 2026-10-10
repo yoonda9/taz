@@ -260,6 +260,87 @@ TEST(CpuPercent, NegativeElapsedIsZero)
 }
 
 // ---------------------------------------------------------------------------
+// taz_proc_stat_is_exited
+// ---------------------------------------------------------------------------
+
+TEST(StatIsExited, SleepingWithMatchingStarttimeIsNotExited)
+{
+    taz_proc_stat_t st{};
+    st.state = 'S';
+    st.starttime = 55555U;
+
+    EXPECT_EQ(taz_proc_stat_is_exited(&st, 55555U), 0);
+}
+
+TEST(StatIsExited, ZombieIsExited)
+{
+    taz_proc_stat_t st{};
+    st.state = 'Z';
+
+    EXPECT_EQ(taz_proc_stat_is_exited(&st, 0U), 1);
+}
+
+TEST(StatIsExited, DeadUppercaseXIsExited)
+{
+    taz_proc_stat_t st{};
+    st.state = 'X';
+
+    EXPECT_EQ(taz_proc_stat_is_exited(&st, 0U), 1);
+}
+
+TEST(StatIsExited, DeadLowercaseXIsExited)
+{
+    taz_proc_stat_t st{};
+    st.state = 'x';
+
+    EXPECT_EQ(taz_proc_stat_is_exited(&st, 0U), 1);
+}
+
+TEST(StatIsExited, RunningWithNoPriorStarttimeIsNotExited)
+{
+    taz_proc_stat_t st{};
+    st.state = 'R';
+    st.starttime = 123U;
+
+    EXPECT_EQ(taz_proc_stat_is_exited(&st, 0U), 0);
+}
+
+TEST(StatIsExited, RunningWithChangedStarttimeIsExited)
+{
+    taz_proc_stat_t st{};
+    st.state = 'R';
+    st.starttime = 6U;
+
+    EXPECT_EQ(taz_proc_stat_is_exited(&st, 5U), 1);
+}
+
+// ---------------------------------------------------------------------------
+// taz_proc_ticks_to_ns
+// ---------------------------------------------------------------------------
+
+TEST(TicksToNs, HundredTicksAtHundredPerSecondIsOneSecond)
+{
+    EXPECT_EQ(taz_proc_ticks_to_ns(100U, 100U), 1000000000ULL);
+}
+
+TEST(TicksToNs, ZeroTicksIsZero)
+{
+    EXPECT_EQ(taz_proc_ticks_to_ns(0U, 100U), 0ULL);
+}
+
+TEST(TicksToNs, ZeroTicksPerSecondFallsBackToHundred)
+{
+    EXPECT_EQ(taz_proc_ticks_to_ns(1U, 0U), 10000000ULL);
+}
+
+// 1e11 ticks * 1e9 would wrap a uint64_t; the result (1e18 ns) does not.
+TEST(TicksToNs, LargeTickCountDoesNotWrap)
+{
+    EXPECT_EQ(taz_proc_ticks_to_ns(100000000050ULL, 100U),
+              1000000000500000000ULL);
+}
+
+// ---------------------------------------------------------------------------
 // taz_proc_cmdline_to_string
 // ---------------------------------------------------------------------------
 

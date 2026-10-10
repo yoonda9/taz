@@ -73,6 +73,89 @@ extern "C"
     int taz_process_kill(uint32_t pid, int32_t signal, taz_v1_ErrorCode *code,
                          const char **detail);
 
+    /* Per-stream watch on one pid. Opened and closed on the loop thread;
+     * sampled on the pool. Fields are plain so the handler can read
+     * exit_fd without any #ifdef. */
+    typedef struct taz_process_watch_s
+    {
+        uint32_t pid;
+        int exit_fd;  /* Linux: a pidfd (pollable, readable once the
+                         process exits); -1 on Windows, when pidfd is
+                         unavailable (ENOSYS/EPERM), or when use_pidfd ==
+                         0 */
+        void *handle; /* Windows: the HANDLE held for the stream's life;
+                         NULL on POSIX */
+        uint64_t first_starttime; /* Linux: field 22 of the first
+                                     successful sample (0 = none yet);
+                                     later samples with a different value
+                                     report exited (pid reuse) */
+    } taz_process_watch_t;
+
+    typedef enum
+    {
+        TAZ_PROCESS_SAMPLE_LIVE = 0,
+        TAZ_PROCESS_SAMPLE_EXITED = 1 /* Z/X/x, ENOENT/ESRCH, starttime
+                                         changed, WaitForSingleObject(0) ==
+                                         WAIT_OBJECT_0 */
+    } taz_process_sample_state_t;
+
+    typedef struct taz_process_sample_s
+    {
+        taz_process_entry_t info; /* name/user/state/memory as
+                                     PROCESS_INFO fills them; cpu_percent
+                                     is left 0 - the handler computes the
+                                     interval value */
+        uint64_t cpu_time_ns;     /* cumulative user+system CPU time
+                                     (Linux: (utime+stime) ticks scaled by
+                                     1e9/CLK_TCK; Windows: 100-ns units x
+                                     100) */
+        uint64_t starttime;       /* Linux field 22 ticks; Windows
+                                     creation FILETIME (reuse check) */
+        taz_process_sample_state_t state;
+        int32_t exit_code;   /* Windows: GetExitCodeProcess when EXITED;
+                               else 0 */
+        int exit_code_known; /* Windows: 1 when GetExitCodeProcess
+                               succeeded; POSIX: always 0 */
+    } taz_process_sample_t;
+
+    /* Loop thread, inline (no blocking I/O). pid already validated
+     * (1..INT32_MAX). Linux: use_pidfd != 0 -> syscall(SYS_pidfd_open);
+     * ESRCH -> -1 NOT_FOUND; ENOSYS/EPERM (or any other failure) -> 0
+     * with exit_fd == -1 (fallback); use_pidfd == 0 -> 0 with exit_fd -1
+     * and no syscall. Windows (use_pidfd ignored):
+     * OpenProcess(QUERY_LIMITED | SYNCHRONIZE): INVALID_PARAMETER ->
+     * NOT_FOUND, ACCESS_DENIED -> PERMISSION_DENIED, other -> mapped;
+     * GetProcessId(h) != pid -> NOT_FOUND; WaitForSingleObject(h, 0)
+     * signalled -> NOT_FOUND "process has exited" (handle closed); else 0
+     * with handle held. */
+    int taz_process_watch_open(uint32_t pid, int use_pidfd,
+                               taz_process_watch_t *w, taz_v1_ErrorCode *code,
+                               const char **detail);
+
+    /* Pool thread. Reads only *w (never written by the loop while a
+     * sample is in flight) and fills *out. Returns 0 (state LIVE or
+     * EXITED) or -1 with *code and *detail set: Linux ENOENT/ESRCH on
+     * /proc/<pid>/stat -> NOT_FOUND (the handler decides: first sample ->
+     * ERROR, later -> final exited), EACCES -> PERMISSION_DENIED,
+     * malformed -> INTERNAL "unparseable /proc stat"; Windows never fails
+     * once the handle is held (query failures leave fields blank).
+     * Linux: state Z/X/x -> EXITED; w->first_starttime != 0 && !=
+     * starttime -> EXITED. Windows: signalled -> EXITED +
+     * GetExitCodeProcess. Partial info never fails. */
+    int taz_process_watch_sample(const taz_process_watch_t *w,
+                                 taz_process_sample_t *out,
+                                 taz_v1_ErrorCode *code, const char **detail);
+
+    /* Loop thread, after the poll handle (if any) is closed:
+     * close(exit_fd) / CloseHandle; zeroes *w (exit_fd = -1). No-op on a
+     * zeroed/already-closed watch. */
+    void taz_process_watch_close(taz_process_watch_t *w);
+
+    /* 100 * cpu_delta_ns / wall_delta_ns; 0.0f when wall_delta_ns == 0.
+     * May exceed 100. */
+    float taz_process_interval_cpu_percent(uint64_t cpu_delta_ns,
+                                           uint64_t wall_delta_ns);
+
 #ifndef _WIN32
 
     /* The fields of /proc/<pid>/stat this code needs, parsed from a single
@@ -118,6 +201,15 @@ extern "C"
      * process). Returns 0.0f when elapsed_seconds <= 0. */
     float taz_proc_cpu_percent(uint64_t cpu_ticks, uint64_t ticks_per_sec,
                                double elapsed_seconds);
+
+    /* 1 when st reports Z/X/x, or first_starttime != 0 &&
+     * st->starttime != first_starttime. */
+    int taz_proc_stat_is_exited(const taz_proc_stat_t *st,
+                                uint64_t first_starttime);
+
+    /* ticks * (1e9 / ticks_per_sec) without overflow for realistic
+     * inputs; ticks_per_sec <= 0 -> 100. */
+    uint64_t taz_proc_ticks_to_ns(uint64_t ticks, uint64_t ticks_per_sec);
 
     /* Joins a /proc/<pid>/cmdline byte buffer (NUL-separated arguments,
      * len bytes total) into a single human-readable string: each NUL
