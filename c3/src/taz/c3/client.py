@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import TracebackType
 
 from google.protobuf.message import Message
@@ -9,11 +10,11 @@ from google.protobuf.message import Message
 from taz.c3.command import CommandNamespace
 from taz.c3.connection import Connection
 from taz.c3.directory import DirectoryNamespace
-from taz.c3.errors import TazError
+from taz.c3.errors import TazError, TazPriorityError
 from taz.c3.file import FileNamespace
 from taz.c3.logs import LogEntry
 from taz.c3.process import ProcessNamespace
-from taz.c3.protocol.dispatch import Dispatcher
+from taz.c3.protocol.dispatch import Dispatcher, PriorityPolicy
 from taz.c3.protocol.frame import Frame
 from taz.c3.settings import Backlog, Keepalive
 from taz.v1 import advanced_pb2, common_pb2, daemon_control_pb2
@@ -35,6 +36,16 @@ class TazClient:
             client.ping()
             info = client.version()
             result = client.command.exec("ls", args=["-la", "/tmp"])
+
+    ``priority_policy`` decides what happens to a detached task's
+    CRITICAL-priority failure (a PRIORITY error): ``"raise"`` (the default)
+    raises ``TazPriorityError`` from the discrete call in flight, or from the
+    next one, before it sends anything, when the error arrived during a
+    stream or with no call in flight. ``"queue"`` appends it to
+    ``priority_errors`` and calls ``on_priority_error``, if given, from
+    inside whichever call is reading; that callback must not call back into
+    the client, and an exception it raises is logged (logger
+    ``taz.c3.protocol.dispatch``) and ignored.
     """
 
     def __init__(
@@ -45,12 +56,19 @@ class TazClient:
         timeout: float | None = None,
         keepalive: Keepalive | None = None,
         backlog: Backlog | None = None,
+        priority_policy: PriorityPolicy = "raise",
+        on_priority_error: Callable[[TazPriorityError], None] | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._keepalive = keepalive if keepalive is not None else Keepalive()
         self._conn = Connection(timeout=timeout)
-        self._dispatcher = Dispatcher(self._conn, backlog)
+        self._dispatcher = Dispatcher(
+            self._conn,
+            backlog,
+            priority_policy=priority_policy,
+            on_priority_error=on_priority_error,
+        )
         self.command = CommandNamespace(self)
         self.file = FileNamespace(self)
         self.directory = DirectoryNamespace(self)
@@ -80,6 +98,11 @@ class TazClient:
     ) -> None:
         self.close()
 
+    @property
+    def priority_errors(self) -> list[TazPriorityError]:
+        """Every PRIORITY error seen so far, recorded under ``policy="queue"``."""
+        return self._dispatcher.priority_errors
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -90,13 +113,28 @@ class TazClient:
         payload: bytes,
         response_type: type[M],
         keepalive: Keepalive | None,
+        *,
+        discrete: bool = True,
     ) -> M:
         kv = keepalive if keepalive is not None else self._keepalive
+        if discrete:
+            # A PRIORITY error deferred during a stream is raised here,
+            # before this call's request exists on the daemon.
+            self._dispatcher.raise_pending_priority()
         stream_id = self._conn.send_request(opcode, payload)
         try:
             frame = self._dispatcher.recv_response(
-                stream_id, kv, expected_opcode=opcode, response_type=response_type
+                stream_id,
+                kv,
+                expected_opcode=opcode,
+                response_type=response_type,
+                discrete=discrete,
             )
+        except TazPriorityError:
+            # Not a connection failure: the dispatcher has only closed the
+            # interrupted call's own stream (so its late RESPONSE is
+            # discarded), leaving the connection itself fully usable.
+            raise
         except BaseException as exc:
             # wait_readable may raise outside Connection._io so ensure the
             # connection is closed and the failure recorded here too.
@@ -263,6 +301,14 @@ class TazClient:
         buffered). Raises ``TazError(NOT_SUPPORTED)`` without sending anything
         if the daemon does not advertise CANCEL.
         """
+        return self._cancel(stream_id, keepalive, discrete=True)
+
+    def _cancel(
+        self, stream_id: int, keepalive: Keepalive | None, *, discrete: bool
+    ) -> bool:
+        # discrete=False is for cleanup (closing a stream, abandoning a
+        # transfer): it neither raises a deferred PRIORITY error nor is
+        # interrupted by a new one, which stays deferred instead.
         req = advanced_pb2.CancelRequest(target_stream_id=stream_id)
         was_already_closed = self._dispatcher.is_closed(stream_id)
         resp = self._call(
@@ -270,6 +316,7 @@ class TazClient:
             req.SerializeToString(),
             advanced_pb2.CancelResponse,
             keepalive,
+            discrete=discrete,
         )
         self._dispatcher.close_after_cancel(stream_id, was_already_closed)
         return resp.cancelled

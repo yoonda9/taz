@@ -91,6 +91,7 @@ class StreamIterator[T]:
                 self._keepalive,
                 expected_opcode=self._opcode,
                 max_wait=self._max_wait,
+                discrete=False,
             )
         except MaxWaitExpired:
             # Cancel without waiting for the reply: when the daemon is what
@@ -145,7 +146,9 @@ class StreamIterator[T]:
         # A lost connection needs no CANCEL, and trying one would raise a
         # second error over the one already leaving a with block.
         if not self._client._conn.closed and dispatcher._cancel_advertised():
-            self.cancelled = self._client.cancel(self.stream_id, self._keepalive)
+            self.cancelled = self._client._cancel(
+                self.stream_id, self._keepalive, discrete=False
+            )
         else:
             self.cancelled = None
         dispatcher.forget_stream(self.stream_id)

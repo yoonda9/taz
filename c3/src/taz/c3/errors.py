@@ -64,3 +64,20 @@ class TazChecksumError(TazError):
         )
         self.expected = expected
         self.actual = actual
+
+
+class TazPriorityError(Exception):
+    """A detached task's CRITICAL-priority FAILED escalation (api.md §5.4).
+
+    Delivered out of band on a FRAME_FLAG_PRIORITY ERROR frame (protocol.md
+    §10.2) for the task's originating DETACH stream. Under the default
+    ``priority_policy="raise"`` this is raised from a discrete call;
+    ``"queue"`` instead appends it to ``TazClient.priority_errors``.
+    ``error`` is the ``TazError`` the frame's ``ErrorInfo`` decodes to.
+    """
+
+    def __init__(self, task_id: int, stream_id: int, error: TazError) -> None:
+        super().__init__(f"task {task_id} (stream {stream_id}): {error}")
+        self.task_id = task_id
+        self.stream_id = stream_id
+        self.error = error

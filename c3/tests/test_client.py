@@ -403,3 +403,39 @@ class TestConnectionLost:
         # Second call should also raise (fail-fast path).
         with pytest.raises(TazConnectionLost):
             client.version()
+
+
+# ---------------------------------------------------------------------------
+# priority_policy / on_priority_error / priority_errors passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestPriorityPolicyPassthrough:
+    def test_constructor_args_passed_to_dispatcher(self) -> None:
+        seen: list[object] = []
+        mock_sock = _mock_sock(_capability_bytes())
+        client = TazClient(
+            "127.0.0.1",
+            5555,
+            keepalive=Keepalive.OFF,
+            priority_policy="queue",
+            on_priority_error=seen.append,
+        )
+        with patch(_PATCH_CC, return_value=mock_sock):
+            client.connect()
+        assert client._dispatcher.priority_policy == "queue"
+        assert client._dispatcher.on_priority_error == seen.append
+
+    def test_default_priority_policy_is_raise(self) -> None:
+        client = _connected_client()
+        assert client._dispatcher.priority_policy == "raise"
+        assert client._dispatcher.on_priority_error is None
+
+    def test_priority_errors_passthrough_reflects_dispatcher(self) -> None:
+        from taz.c3.errors import TazPriorityError
+
+        client = _connected_client()
+        assert client.priority_errors == []
+        err = TazPriorityError(7, 1, TazError(common_pb2.ERROR_CODE_INTERNAL, "boom"))
+        client._dispatcher.priority_errors.append(err)
+        assert client.priority_errors == [err]

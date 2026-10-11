@@ -186,7 +186,7 @@ class FileNamespace:
         )
 
         frame = client._dispatcher.recv_response(
-            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT, discrete=False
         )
         _raise_if_error(frame)
         ack_resp = file_pb2.FilePutResponse()
@@ -220,11 +220,11 @@ class FileNamespace:
                         break
         except OSError:
             if client._dispatcher._cancel_advertised():
-                client.cancel(stream_id, keepalive=kv)
+                client._cancel(stream_id, kv, discrete=False)
             raise
 
         frame = client._dispatcher.recv_response(
-            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_PUT, discrete=False
         )
         _raise_if_error(frame)
         confirm_resp = file_pb2.FilePutResponse()
@@ -263,7 +263,7 @@ class FileNamespace:
         )
 
         frame = client._dispatcher.recv_response(
-            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_GET
+            stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_GET, discrete=False
         )
         _raise_if_error(frame)
         meta = file_pb2.FileGetResponse()
@@ -283,7 +283,10 @@ class FileNamespace:
         try:
             while True:
                 frame = client._dispatcher.recv_response(
-                    stream_id, kv, expected_opcode=common_pb2.OPCODE_FILE_GET
+                    stream_id,
+                    kv,
+                    expected_opcode=common_pb2.OPCODE_FILE_GET,
+                    discrete=False,
                 )
                 if frame.type == common_pb2.FRAME_TYPE_FILE_CHUNK:
                     data = frame.payload
@@ -291,7 +294,7 @@ class FileNamespace:
                         tmp.write(data)
                     except OSError:
                         if client._dispatcher._cancel_advertised():
-                            client.cancel(stream_id, keepalive=kv)
+                            client._cancel(stream_id, kv, discrete=False)
                         raise
                     crc = google_crc32c.extend(crc, data)
                     received += len(data)

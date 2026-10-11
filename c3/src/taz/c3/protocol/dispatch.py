@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import logging
 import socket
 import time
 from collections.abc import Callable, Sequence
@@ -12,7 +13,12 @@ from typing import TYPE_CHECKING, Literal
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message
 
-from taz.c3.errors import TazConnectionLost, TazError, TazProtocolError
+from taz.c3.errors import (
+    TazConnectionLost,
+    TazError,
+    TazPriorityError,
+    TazProtocolError,
+)
 from taz.c3.protocol.frame import DEFAULT_MAX_PAYLOAD, Frame, wait_readable
 from taz.c3.settings import Backlog, Keepalive
 from taz.v1 import advanced_pb2, common_pb2
@@ -22,7 +28,16 @@ if TYPE_CHECKING:
 
 _DEFAULT_BACKLOG: Backlog = Backlog()
 
+_log = logging.getLogger(__name__)
+
 Overflow = Literal["cancel", "drop_oldest"]
+PriorityPolicy = Literal["raise", "queue"]
+
+# No stream_id was ever registered for the task (the client never set up a
+# mapping, e.g. the frame arrived for a stream this Dispatcher never heard
+# of through register_priority_task). 0 is not a valid task_id (daemon
+# task_ids are a monotonic counter starting at 1).
+_UNKNOWN_TASK_ID = 0
 
 
 class MaxWaitExpired(Exception):  # noqa: N818
@@ -97,6 +112,8 @@ class Dispatcher:
         conn: Connection,
         backlog: Backlog | None = None,
         *,
+        priority_policy: PriorityPolicy = "raise",
+        on_priority_error: Callable[[TazPriorityError], None] | None = None,
         _wait_readable: (Callable[[socket.socket, float | None], bool] | None) = None,
     ) -> None:
         self._conn = conn
@@ -113,6 +130,19 @@ class Dispatcher:
         self._wait: Callable[[socket.socket, float | None], bool] = (
             _wait_readable if _wait_readable is not None else wait_readable
         )
+        # PRIORITY (protocol.md §10.2): the originating DETACH stream_id for
+        # a task the caller wants attributed, set via register_priority_task.
+        self._priority_tasks: dict[int, int] = {}
+        # policy="raise" errors seen while no discrete call was in flight
+        # (a StreamIterator/file transfer was reading, or nothing was),
+        # held until the next discrete call raises them before sending.
+        self._pending_priority: collections.deque[TazPriorityError] = (
+            collections.deque()
+        )
+        self.priority_policy: PriorityPolicy = priority_policy
+        self.on_priority_error = on_priority_error
+        # policy="queue": every PRIORITY error ever seen, appended in order.
+        self.priority_errors: list[TazPriorityError] = []
         # Discard a closed-set entry (and any stale buffer) the
         # moment its id is reused after the counter wraps.
         conn.stream_assigned_hook = self._forget_closed
@@ -168,8 +198,70 @@ class Dispatcher:
         return 0 if state is None else state.dropped
 
     # ------------------------------------------------------------------
+    # PRIORITY (protocol.md §10.2)
+    # ------------------------------------------------------------------
+
+    def register_priority_task(self, stream_id: int, task_id: int) -> None:
+        """Attribute a later PRIORITY ERROR on stream_id to task_id.
+
+        Called once a DETACH response for stream_id is in hand (the
+        request's own stream_id is also the one a CRITICAL-priority FAILED
+        escalation for that task arrives on). A task escalates at most
+        once, so the mapping is consumed by the first PRIORITY frame seen
+        for stream_id.
+        """
+        self._priority_tasks[stream_id] = task_id
+
+    def raise_pending_priority(self) -> None:
+        """Raise the oldest PRIORITY error deferred under policy "raise".
+
+        A discrete call runs this before sending its request, so a deferred
+        error never leaves that call's request running on the daemon with
+        nobody to read its response. A no-op when nothing is deferred.
+        """
+        if self._pending_priority:
+            raise self._pending_priority.popleft()
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _priority_error_from_frame(self, frame: Frame) -> TazPriorityError:
+        info = common_pb2.ErrorInfo()
+        info.ParseFromString(frame.payload)
+        task_id = self._priority_tasks.pop(frame.stream_id, _UNKNOWN_TASK_ID)
+        error = TazError(info.code, info.message, info.detail)
+        return TazPriorityError(task_id, frame.stream_id, error)
+
+    def _handle_priority_frame(
+        self, frame: Frame, expected: int, *, discrete: bool
+    ) -> None:
+        """Resolve one PRIORITY-flagged ERROR frame per priority_policy.
+
+        ``policy="queue"`` always records it (never raises) and calls
+        ``on_priority_error``; an exception from that callback is logged and
+        ignored, never a failure of the call that happened to be reading.
+        Otherwise (the default, "raise"): a discrete call in flight raises
+        it right away, closing its own ``expected`` stream so the real, late
+        RESPONSE for that call is discarded (§10.2) rather than misdelivered
+        to whatever next reuses the id; anything else (a StreamIterator, a
+        file transfer, a cleanup CANCEL, or no call in flight at all) defers
+        it to the next discrete call instead of interrupting a transfer that
+        is not equipped to handle it mid-stream.
+        """
+        error = self._priority_error_from_frame(frame)
+        if self.priority_policy == "queue":
+            self.priority_errors.append(error)
+            if self.on_priority_error is not None:
+                try:
+                    self.on_priority_error(error)
+                except Exception:
+                    _log.exception("on_priority_error raised; ignored")
+            return
+        if discrete:
+            self.close_stream(expected)
+            raise error
+        self._pending_priority.append(error)
 
     def _forget_closed(self, stream_id: int) -> None:
         """Discard a stale closed-set entry/buffer for a just-reused id."""
@@ -178,6 +270,9 @@ class Dispatcher:
         for frame in removed:
             self._total_frames -= 1
             self._total_bytes -= len(frame.payload)
+        # A stale task_id mapping would otherwise misattribute a PRIORITY
+        # frame meant for the old task to whatever reuses this stream_id.
+        self._priority_tasks.pop(stream_id, None)
 
     @staticmethod
     def _ends_stream(frame: Frame) -> bool:
@@ -351,6 +446,13 @@ class Dispatcher:
             if frame.type not in DEFAULT_MAX_PAYLOAD:
                 continue
 
+            if frame.type == common_pb2.FRAME_TYPE_ERROR and (
+                frame.flags & common_pb2.FRAME_FLAG_PRIORITY
+            ):
+                # recv_pong has no discrete call of its own in flight.
+                self._handle_priority_frame(frame, -1, discrete=False)
+                continue
+
             if frame.stream_id in self._closed:
                 if self._ends_stream(frame):
                     self._closed.discard(frame.stream_id)
@@ -370,6 +472,7 @@ class Dispatcher:
         expected_opcode: int | None = None,
         response_type: type[Message] | None = None,
         max_wait: float | None = None,
+        discrete: bool = True,
     ) -> Frame:
         """Receive the next RESPONSE or ERROR frame for ``expected`` stream_id.
 
@@ -387,9 +490,19 @@ class Dispatcher:
         start arriving; one deadline is set for the whole call (not reset by
         frames for other streams or by PONGs) and ``MaxWaitExpired`` is raised
         if it elapses.
+
+        ``discrete`` (default ``True``) marks this as a standalone
+        request/response call (``TazClient._call``), as opposed to one leg
+        of a ``StreamIterator`` or a file transfer, or a cleanup CANCEL
+        (all pass ``False``).
+        Under ``priority_policy="raise"`` (the default), only a discrete
+        call raises a PRIORITY error as it arrives; the other callers defer
+        it to the next discrete call instead, per docs/api.md §5.4.
         """
         deadline = None if max_wait is None else time.monotonic() + max_wait
-        frame = self._next_frame(expected, keepalive, expected_opcode, deadline)
+        frame = self._next_frame(
+            expected, keepalive, expected_opcode, deadline, discrete
+        )
         if response_type is None:
             return frame
         chunks: list[bytes] = []
@@ -398,7 +511,9 @@ class Dispatcher:
             and frame.flags & common_pb2.FRAME_FLAG_CONTINUATION
         ):
             chunks.append(frame.payload)
-            frame = self._next_frame(expected, keepalive, expected_opcode, deadline)
+            frame = self._next_frame(
+                expected, keepalive, expected_opcode, deadline, discrete
+            )
         if not chunks or frame.type != common_pb2.FRAME_TYPE_RESPONSE:
             return frame
         chunks.append(frame.payload)
@@ -411,6 +526,7 @@ class Dispatcher:
         keepalive: Keepalive,
         expected_opcode: int | None,
         deadline: float | None = None,
+        discrete: bool = True,
     ) -> Frame:
         """Return the next frame for ``expected``, buffered or read."""
         buffered = self._pop_buffered(expected)
@@ -473,9 +589,15 @@ class Dispatcher:
             if frame.type == common_pb2.FRAME_TYPE_PONG:
                 continue
 
-            # A PRIORITY error is routed by stream_id like any other frame:
-            # nothing runs in the background yet, so there is nothing to
-            # interrupt.
+            # PRIORITY (§10.2): checked before the closed-set/backlog logic,
+            # since it can arrive on a stream (the task's DETACH stream)
+            # this loop already treats as finished - and is never itself
+            # the frame `expected` is waiting for, even if the ids match.
+            if frame.type == common_pb2.FRAME_TYPE_ERROR and (
+                frame.flags & common_pb2.FRAME_FLAG_PRIORITY
+            ):
+                self._handle_priority_frame(frame, expected, discrete=discrete)
+                continue
 
             # Closed stream: discard (§10.2), leaving the set on its last frame.
             if frame.stream_id in self._closed:

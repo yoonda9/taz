@@ -6,6 +6,7 @@ from taz.c3.errors import (
     TazConnectionError,
     TazConnectionLost,
     TazError,
+    TazPriorityError,
     TazProtocolError,
 )
 from taz.c3.file import FileStat, FileTransfer, Kind
@@ -32,5 +33,6 @@ __all__ = [
     "TazConnectionError",
     "TazConnectionLost",
     "TazError",
+    "TazPriorityError",
     "TazProtocolError",
 ]
