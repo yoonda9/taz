@@ -135,7 +135,11 @@ if(TAZ_COVERAGE)
     if(MSVC)
         message(FATAL_ERROR "TAZ_COVERAGE requires GCC or Clang (gcov)")
     endif()
-    target_compile_options(taz_warnings INTERFACE --coverage -O0)
+    # Atomic counter updates: tests call first-party code from several threads
+    # at once, and racing plain increments can leave gcov with negative branch
+    # counts that gcovr rejects.
+    target_compile_options(taz_warnings INTERFACE --coverage
+                                                  -fprofile-update=atomic -O0)
     target_link_options(taz_warnings INTERFACE --coverage)
     message(STATUS "TAZ: coverage instrumentation enabled")
 endif()
