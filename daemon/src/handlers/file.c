@@ -24,14 +24,14 @@
 #define TAZ_FS_MODE_BITS 07777U
 
 /* FILE_CREATE's default mode when the request's permissions field is 0
- * (proto3 cannot distinguish "unset" from 0; DEC-008). */
+ * (proto3 cannot distinguish "unset" from 0). */
 #define TAZ_FILE_DEFAULT_MODE 0644U
 
 /* DIR_MAKE's default mode when the request's permissions field is 0. */
 #define TAZ_DIR_DEFAULT_MODE 0755U
 
 /* DIR_LIST's per-batch entry cap, matching taz_v1_DirListResponse's own
- * entries[] array size (DEC-003). */
+ * entries[] array size. */
 #define TAZ_DIR_LIST_BATCH_MAX 64U
 
 /* Carries everything file_stat_work/file_stat_done need: the request
@@ -54,7 +54,7 @@ typedef struct
 } file_stat_ctx_t;
 
 #ifdef _WIN32
-/* Best-effort "DOMAIN\name" owner lookup (DEC-007): gets the SID from
+/* Best-effort "DOMAIN\name" owner lookup: gets the SID from
  * GetNamedSecurityInfoW and delegates to taz_win32_account_from_sid.
  * Any failure leaves owner untouched (already "" from the caller's calloc)
  * rather than failing the stat. Runs on the pool thread; touches no shared

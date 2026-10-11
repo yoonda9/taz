@@ -11,14 +11,14 @@
 #include <windows.h>
 #endif
 
-/* Mode bits a Windows READONLY attribute cannot represent (DEC-005). */
+/* Mode bits a Windows READONLY attribute cannot represent. */
 #define MODE_READ_ALL          0444U  /* all three read bits */
 #define MODE_SPECIAL_BITS      07000U /* setuid, setgid, sticky */
 #define MODE_GROUP_OTHER_WRITE 0022U
 #define MODE_OWNER_WRITE       0200U
 
 /* UTF-8 continuation byte (10xxxxxx): mask selects the top two bits, tag is
- * the value they must have (DEC-009). */
+ * the value they must have. */
 #define UTF8_CONT_MASK 0xC0U
 #define UTF8_CONT_TAG  0x80U
 

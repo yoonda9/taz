@@ -274,9 +274,9 @@ class TestConnectionLifetime:
 
         victim = TazClient("127.0.0.1", daemon.port)
         victim.connect()
-        # Bypass CommandNamespace (Step 04, not landed yet): send the raw
-        # REQUEST and never read its response, simulating an abrupt client
-        # disconnect while COMMAND_EXEC is in flight.
+        # Bypass CommandNamespace: send the raw REQUEST and never read its
+        # response, simulating an abrupt client disconnect while COMMAND_EXEC
+        # is in flight.
         victim._conn.send_request(
             common_pb2.OPCODE_COMMAND_EXEC, req.SerializeToString()
         )

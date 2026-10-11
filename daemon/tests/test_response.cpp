@@ -547,8 +547,8 @@ TEST(ResponseSplitter, AllFramesWithinPayloadLimit)
 
 TEST(ResponseSendEncoded, LargeDirListingSplitsAcrossFrames)
 {
-    // Five 64-entry batches concatenated, as DEC-003's DIR_LIST handler will
-    // do: 320 entries of ~260 B each, well past the 64 KiB RESPONSE limit.
+    // Five 64-entry batches concatenated, as the DIR_LIST handler does: 320
+    // entries of ~260 B each, well past the 64 KiB RESPONSE limit.
     static const int kBatches = 5;
     static const int kPerBatch = 64;
     static const int kTotal = kBatches * kPerBatch;

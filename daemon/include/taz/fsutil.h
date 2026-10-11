@@ -31,7 +31,7 @@ extern "C"
      * Windows' single owner-write (READONLY) attribute: missing a read
      * bit, a setuid/setgid/sticky bit, or a write bit for group/other
      * without owner-write. 0 when Windows can represent the mode exactly
-     * enough (DEC-005). */
+     * enough. */
     uint32_t taz_fsutil_chmod_unrepresentable(uint32_t mode);
 
     /* True for a path separator: '/' everywhere, additionally '\' on
@@ -62,7 +62,7 @@ extern "C"
 
     /* Copies name into buf (NUL-terminated, at most bufsize - 1 bytes of
      * name). When name does not fit, the copy is trimmed at the last
-     * complete UTF-8 codepoint boundary rather than mid-codepoint (DEC-009):
+     * complete UTF-8 codepoint boundary rather than mid-codepoint:
      * a long non-ASCII NTFS name can need up to 765 UTF-8 bytes for 255
      * UTF-16 units, well past DirEntry.name's 256-byte field. No-op when
      * bufsize is 0. */

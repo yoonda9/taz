@@ -3,7 +3,7 @@
 # `just setup`). It pins only what detection cannot: every dependency is built
 # as a static library, and the C++ standard used for gtest.
 #
-# The fully static (musl) release build arrives in Step 13.
+# Only the dependencies are static: tazd itself still links glibc dynamically.
 [settings]
 # Match the Windows profile so dependency package ids agree across platforms.
 compiler.cppstd=17

@@ -20,7 +20,7 @@
 #define TAZ_FS_MODE_BITS 07777U
 
 /* FILE_PUT's default mode when the request's permissions field is 0
- * (proto3 cannot distinguish "unset" from 0; DEC-008). */
+ * (proto3 cannot distinguish "unset" from 0). */
 #define TAZ_FILE_PUT_DEFAULT_MODE 0644U
 
 /* Ingress backpressure: reads are paused once this many bytes are queued
