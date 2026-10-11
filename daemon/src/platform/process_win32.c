@@ -567,6 +567,41 @@ static void win32_resolve_process_name(HANDLE h_process, DWORD pid,
     }
 }
 
+int taz_process_start_key(uint32_t pid, uint64_t *out_key)
+{
+    HANDLE h_process;
+    FILETIME create_time;
+    FILETIME exit_time;
+    FILETIME kernel_time;
+    FILETIME user_time;
+    uint64_t key = 0U;
+
+    h_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (h_process == NULL)
+    {
+        return 0;
+    }
+    if (!win32_handle_matches_pid(h_process, pid))
+    {
+        CloseHandle(h_process);
+        return 0;
+    }
+
+    if (GetProcessTimes(h_process, &create_time, &exit_time, &kernel_time,
+                        &user_time))
+    {
+        key = ((uint64_t)create_time.dwHighDateTime << 32) |
+              create_time.dwLowDateTime;
+    }
+    CloseHandle(h_process);
+    if (key == 0U)
+    {
+        return 0;
+    }
+    *out_key = key;
+    return 1;
+}
+
 int taz_process_inspect(uint32_t pid, taz_process_detail_t *out,
                         taz_v1_ErrorCode *code, const char **detail)
 {

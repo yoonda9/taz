@@ -257,6 +257,7 @@ add_library(
     src/error.c
     src/config.c
     src/log.c
+    src/task_registry.c
     src/response.c
     src/exec.c
     src/server.c

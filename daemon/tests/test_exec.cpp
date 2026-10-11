@@ -2,10 +2,12 @@
 // spawn engine.
 
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -655,6 +657,283 @@ TEST_F(ExecSpawnTest, ZeroTimeoutMeansChildRunsToNormalCompletion)
     EXPECT_TRUE(outcome.called);
     EXPECT_EQ(outcome.exit_status, 0);
     EXPECT_FALSE(outcome.timed_out);
+}
+
+// --- taz_exec_pid / taz_exec_signal ----------------------------------------
+//
+// taz_test_sleeper (see above) gives these a live child to probe without
+// racing a fast exit; each test cancels it afterward so no sleeper outlives
+// its test.
+
+TEST_F(ExecSpawnTest, PidIsNonzeroAfterSpawnAndMatchesTheRealProcess)
+{
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    const uint32_t pid = taz_exec_pid(x);
+    EXPECT_GT(pid, 0U);
+    // uv_kill with signum 0 is a pure existence check on every platform
+    // (POSIX kill(pid, 0); Windows GetExitCodeProcess), never a terminate.
+    EXPECT_EQ(uv_kill(static_cast<int>(pid), 0), 0);
+
+    taz_exec_cancel(x);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.cancelled);
+}
+
+// Probes taz_exec_pid/taz_exec_signal from inside the on_done callback
+// itself, where x->done is already true but x has not yet been freed (that
+// only happens once close_all's handles finish closing, after on_done
+// returns) - the one place a test can safely observe the "already finished"
+// guard on a still-valid handle.
+struct DuringDoneProbe
+{
+    taz_exec_t *x = nullptr;
+    bool called = false;
+    uint32_t pid_during_done = 0xFFFFFFFFU;
+    int signal_rc_during_done = -1;
+};
+
+void probe_during_done(const taz_exec_result_t *result, void *arg)
+{
+    (void)result;
+    auto *probe = static_cast<DuringDoneProbe *>(arg);
+    probe->called = true;
+    probe->pid_during_done = taz_exec_pid(probe->x);
+    probe->signal_rc_during_done = taz_exec_signal(probe->x, 15);
+}
+
+TEST_F(ExecSpawnTest, PidAndSignalAreSafeNoOpsOnceOnDoneHasFired)
+{
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1U << 20;
+
+    DuringDoneProbe probe;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, probe_during_done, &probe, &x), 0);
+    probe.x = x;
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(probe.called);
+    EXPECT_EQ(probe.pid_during_done, 0U);
+    EXPECT_EQ(probe.signal_rc_during_done, 0);
+}
+
+// --- taz_exec_set_on_exit --------------------------------------------------
+//
+// taz_test_grandchild (see grandchild.c) forks a grandchild that inherits
+// stdout and briefly outlives it: the immediate child (the exec's own
+// process) exits almost instantly, while its stdout pipe stays open - and
+// EOF-less - until the grandchild exits later. This separates "the on-exit
+// hook fires" (at the immediate child's own exit) from "on_done fires" (once
+// the pipe finally drains), which is exactly the ordering the hook exists to
+// prove. The test asserts that ordering directly (a sequence of event
+// names), not via wall-clock deltas, so it stays robust under ASan/TSan/
+// Valgrind slowdowns.
+
+struct OnExitOrderProbe
+{
+    std::vector<std::string> order;
+    int on_exit_calls = 0;
+    uint32_t pid = 0;
+    uint64_t start_time = 0;
+};
+
+void record_on_exit_order(uint32_t pid, uint64_t start_time,
+                          int64_t exit_status, int term_signal, void *arg)
+{
+    (void)exit_status;
+    (void)term_signal;
+    auto *probe = static_cast<OnExitOrderProbe *>(arg);
+
+    probe->on_exit_calls++;
+    probe->pid = pid;
+    probe->start_time = start_time;
+    probe->order.emplace_back("on_exit");
+}
+
+#ifndef _WIN32
+void record_on_done_order(const taz_exec_result_t *result, void *arg)
+{
+    (void)result;
+    auto *probe = static_cast<OnExitOrderProbe *>(arg);
+
+    probe->order.emplace_back("on_done");
+}
+
+TEST_F(ExecSpawnTest, OnExitHookFiresBeforeOnDoneWhenGrandchildHoldsStdout)
+{
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_GRANDCHILD_PATH;
+    spec.max_output_bytes = 1024;
+
+    OnExitOrderProbe probe;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_on_done_order, &probe, &x),
+              0);
+    taz_exec_set_on_exit(x, record_on_exit_order, &probe);
+    const uint32_t pid = taz_exec_pid(x);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    ASSERT_EQ(probe.on_exit_calls, 1);
+    ASSERT_EQ(probe.order.size(), 2U);
+    EXPECT_EQ(probe.order[0], "on_exit");
+    EXPECT_EQ(probe.order[1], "on_done");
+    EXPECT_EQ(probe.pid, pid);
+    EXPECT_GT(probe.start_time, 0U);
+}
+#endif
+
+// Probes taz_exec_set_on_exit from inside the on_done callback itself,
+// where x->done is already true but x has not yet been freed (that only
+// happens once close_all's handles finish closing, after on_done returns) -
+// the same safe-to-observe window PidAndSignalAreSafeNoOpsOnceOnDoneHasFired
+// above uses for taz_exec_pid/taz_exec_signal. x must never be touched after
+// uv_run returns: by then on_done's close_all has already freed it.
+struct SetOnExitDuringDoneProbe
+{
+    taz_exec_t *x = nullptr;
+    OnExitOrderProbe *hook_probe = nullptr;
+    bool called = false;
+};
+
+void probe_set_on_exit_during_done(const taz_exec_result_t *result, void *arg)
+{
+    (void)result;
+    auto *probe = static_cast<SetOnExitDuringDoneProbe *>(arg);
+
+    probe->called = true;
+    taz_exec_set_on_exit(probe->x, record_on_exit_order, probe->hook_probe);
+}
+
+TEST_F(ExecSpawnTest, OnExitHookCannotBeArmedFromInsideOnDone)
+{
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1U << 20;
+
+    OnExitOrderProbe hook_probe;
+    SetOnExitDuringDoneProbe probe;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, probe_set_on_exit_during_done,
+                             &probe, &x),
+              0);
+    probe.x = x;
+    probe.hook_probe = &hook_probe;
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(probe.called);
+    // on_done had already set x->done by the time it ran, so the hook never
+    // got armed - there is no future exit event left to fire it from.
+    EXPECT_EQ(hook_probe.on_exit_calls, 0);
+}
+
+#ifndef _WIN32
+TEST_F(ExecSpawnTest, SignalReachesTheChildsProcessGroupOnPosix)
+{
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    EXPECT_EQ(taz_exec_signal(x, SIGTERM), 0);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.term_signal, SIGTERM);
+    EXPECT_FALSE(outcome.cancelled);
+    EXPECT_FALSE(outcome.timed_out);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+#else
+TEST_F(ExecSpawnTest, SignalIgnoresSignumAndTerminatesTheJobOnWindows)
+{
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    // The null signal delivers nothing, as on POSIX: the job keeps running.
+    EXPECT_EQ(taz_exec_signal(x, 0), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    (void)uv_run(Loop(), UV_RUN_NOWAIT);
+    EXPECT_FALSE(outcome.called);
+
+    EXPECT_EQ(taz_exec_signal(x, SIGTERM), 0);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_FALSE(outcome.cancelled);
+    EXPECT_FALSE(outcome.timed_out);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+TEST_F(ExecSpawnTest, OutOfRangeSignumIsEinvalAndLeavesJobIntactOnWindows)
+{
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    EXPECT_EQ(taz_exec_signal(x, 99999), UV_EINVAL);
+
+    taz_exec_cancel(x);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.cancelled);
+}
+#endif
+
+TEST_F(ExecSpawnTest, OutOfRangeSignumDoesNotCrashAndLeavesChildSignalable)
+{
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    (void)taz_exec_signal(x, 99999);
+
+    taz_exec_cancel(x);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.cancelled);
 }
 
 } // namespace

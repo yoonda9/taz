@@ -9,6 +9,12 @@ include(GoogleTest)
 add_executable(taz_test_sleeper sleeper.c)
 target_link_libraries(taz_test_sleeper PRIVATE taz_warnings libuv::uv_a)
 
+# POSIX-only helper for the exec on-exit-hook test: forks a grandchild that
+# inherits stdout and briefly outlives it. Test-only, not installed; compiles
+# (as a no-op) on Windows too, so this stays off the build's platform split.
+add_executable(taz_test_grandchild grandchild.c)
+target_link_libraries(taz_test_grandchild PRIVATE taz_warnings libuv::uv_a)
+
 add_executable(
     taz_tests
     test_proto.cpp
@@ -20,6 +26,7 @@ add_executable(
     test_server.cpp
     test_config.cpp
     test_log.cpp
+    test_task_registry.cpp
     test_timeout.cpp
     test_run_as.cpp
     test_error.cpp
@@ -44,6 +51,8 @@ target_link_libraries(taz_tests PRIVATE taz_core taz_cxx_warnings
 # taz_core does not expose publicly.
 target_include_directories(taz_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(
-    taz_tests PRIVATE TAZ_TEST_SLEEPER_PATH="$<TARGET_FILE:taz_test_sleeper>")
+    taz_tests
+    PRIVATE TAZ_TEST_SLEEPER_PATH="$<TARGET_FILE:taz_test_sleeper>"
+            TAZ_TEST_GRANDCHILD_PATH="$<TARGET_FILE:taz_test_grandchild>")
 
 gtest_discover_tests(taz_tests)

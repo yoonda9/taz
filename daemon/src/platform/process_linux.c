@@ -1029,6 +1029,39 @@ static void proc_fill_open_files(uint32_t pid, taz_process_detail_t *out)
     out->open_files_count = files.count;
 }
 
+int taz_process_start_key(uint32_t pid, uint64_t *out_key)
+{
+    char path[TAZ_PROC_PATH_BUF_LEN];
+    char *stat_text = NULL;
+    size_t stat_len = 0U;
+    taz_proc_stat_t stat_info;
+
+    if (!proc_build_path(path, sizeof(path), pid, "/stat"))
+    {
+        return 0;
+    }
+    if (proc_read_file(path, TAZ_PROC_STAT_READ_CAP, &stat_text, &stat_len,
+                       NULL, NULL) != 0)
+    {
+        return 0;
+    }
+    if (!taz_proc_parse_stat(stat_text, stat_len, &stat_info))
+    {
+        free(stat_text);
+        return 0;
+    }
+    free(stat_text);
+
+    /* Ticks since boot; 0 only for processes started in the first tick,
+     * which a daemon never spawns, so 0 can keep meaning "unknown". */
+    if (stat_info.starttime == 0U)
+    {
+        return 0;
+    }
+    *out_key = stat_info.starttime;
+    return 1;
+}
+
 int taz_process_inspect(uint32_t pid, taz_process_detail_t *out,
                         taz_v1_ErrorCode *code, const char **detail)
 {

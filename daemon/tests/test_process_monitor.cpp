@@ -29,6 +29,7 @@
 
 #include "file_test_support.h"
 #include "handlers/process_monitor.h"
+#include "taz/task_registry.h"
 #include "taz/v1/advanced.pb.h"
 #include "taz/v1/common.pb.h"
 #include "taz/v1/process.pb.h"
@@ -325,6 +326,64 @@ class ForkSleeper
 
   private:
     pid_t pid_ = -1;
+};
+
+// RAII around taz_task_registry_register, mirroring ScopedSampleFn's
+// restore-on-exit precedent for this file's other global-state hooks. The
+// registry has no remove (entries outlive their tasks), so the destructor
+// empties it.
+class ScopedRegistryEntry
+{
+  public:
+    ScopedRegistryEntry(uint32_t pid, uint64_t start_key)
+    {
+        EXPECT_EQ(taz_task_registry_register(pid, start_key), 0);
+    }
+    ~ScopedRegistryEntry()
+    {
+        taz_task_registry_reset_for_tests();
+    }
+    ScopedRegistryEntry(const ScopedRegistryEntry &) = delete;
+    ScopedRegistryEntry &operator=(const ScopedRegistryEntry &) = delete;
+};
+
+// Fires taz_task_registry_record_exit once, delay_ms after Start(), on the
+// same loop - used to make the record land strictly after this stream's
+// own first exit-detection attempt (the kill happens first and detection
+// is effectively immediate), unlike every ViaPoll/ViaSample test above
+// which calls record_exit synchronously before the loop runs again and so
+// never actually exercises monitor_finalize_exit's retry path.
+class DeferredRegistryRecord
+{
+  public:
+    void Start(uv_loop_t *loop, uint32_t pid, uint64_t start_key,
+               int64_t exit_status, uint64_t delay_ms)
+    {
+        pid_ = pid;
+        start_key_ = start_key;
+        exit_status_ = exit_status;
+        EXPECT_EQ(uv_timer_init(loop, &timer_), 0);
+        timer_.data = this;
+        EXPECT_EQ(uv_timer_start(&timer_, OnFire, delay_ms, 0), 0);
+    }
+
+    void Close()
+    {
+        uv_close(reinterpret_cast<uv_handle_t *>(&timer_), nullptr);
+    }
+
+  private:
+    static void OnFire(uv_timer_t *handle)
+    {
+        auto *self = static_cast<DeferredRegistryRecord *>(handle->data);
+        taz_task_registry_record_exit(self->pid_, self->start_key_,
+                                      self->exit_status_);
+    }
+
+    uv_timer_t timer_{};
+    uint32_t pid_ = 0;
+    uint64_t start_key_ = 0;
+    int64_t exit_status_ = 0;
 };
 #endif // !_WIN32
 
@@ -758,6 +817,265 @@ TEST_F(FileHandlerTest, MonitorZombieWithPidfdEnabledReportsExitedViaPoll)
     RunLoop();
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());
+}
+
+// ---------------------------------------------------------------------------
+// Exit-code registry wiring: a registered, exited pid is authoritative.
+// ---------------------------------------------------------------------------
+
+// on_exit_readable's path (pidfd poll fires before any sample runs).
+TEST_F(FileHandlerTest, MonitorRegisteredExitedPidReportsExitCodeViaPoll)
+{
+    uv_process_t process{};
+    SpawnOutcome outcome;
+    const uint32_t pid = SpawnSleeper(Loop(), &process, &outcome);
+    ASSERT_NE(pid, 0U);
+
+    uint64_t start_key = 0U;
+    ASSERT_TRUE(taz_process_start_key(pid, &start_key));
+    const ScopedRegistryEntry entry(pid, start_key);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_PROCESS_MONITOR,
+                         encode_monitor_request(pid, 100U), 66U);
+    RunLoopUntil(Loop(), [&]() { return !Frames().empty(); }, 1000);
+    ASSERT_GE(Frames().size(), 1U);
+
+    ASSERT_EQ(uv_process_kill(&process, SIGKILL), 0);
+    taz_task_registry_record_exit(pid, start_key, 7);
+
+    RunLoopUntil(
+        Loop(), [&]()
+        { return !Frames().empty() && !FrameHasContinuation(Frames().back()); },
+        5000);
+    const taz_v1_ProcessMonitorResponse resp =
+        decode_monitor_response(Frames().back());
+    EXPECT_TRUE(resp.exited);
+    EXPECT_STREQ(resp.reason, "exited");
+    EXPECT_TRUE(resp.exit_code_known);
+    EXPECT_EQ(resp.exit_code, 7);
+
+    RunLoop();
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+    RunLoop();
+}
+
+// monitor_sample_done's TAZ_PROCESS_SAMPLE_EXITED path (pidfd disabled, so
+// the timer sample itself is what notices the exit).
+TEST_F(FileHandlerTest, MonitorRegisteredExitedPidReportsExitCodeViaSample)
+{
+    const ScopedPidfdDisabled pidfd_guard;
+
+    uv_process_t process{};
+    SpawnOutcome outcome;
+    const uint32_t pid = SpawnSleeper(Loop(), &process, &outcome);
+    ASSERT_NE(pid, 0U);
+
+    uint64_t start_key = 0U;
+    ASSERT_TRUE(taz_process_start_key(pid, &start_key));
+    const ScopedRegistryEntry entry(pid, start_key);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_PROCESS_MONITOR,
+                         encode_monitor_request(pid, 100U), 67U);
+    RunLoopUntil(Loop(), [&]() { return !Frames().empty(); }, 1000);
+    ASSERT_GE(Frames().size(), 1U);
+
+    ASSERT_EQ(uv_process_kill(&process, SIGKILL), 0);
+    taz_task_registry_record_exit(pid, start_key, 9);
+
+    RunLoopUntil(
+        Loop(), [&]()
+        { return !Frames().empty() && !FrameHasContinuation(Frames().back()); },
+        5000);
+    const taz_v1_ProcessMonitorResponse resp =
+        decode_monitor_response(Frames().back());
+    EXPECT_TRUE(resp.exited);
+    EXPECT_STREQ(resp.reason, "exited");
+    EXPECT_TRUE(resp.exit_code_known);
+    EXPECT_EQ(resp.exit_code, 9);
+
+    RunLoop();
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+    RunLoop();
+}
+
+// A registry entry with the pid but a different start_key (a stale entry
+// from a reused pid, or simply never recorded exited) must never be
+// mistaken for this process's own - exit_code_known stays false, exactly
+// as the unregistered case.
+TEST_F(FileHandlerTest, MonitorRegisteredPidWithMismatchedStartTimeStaysUnknown)
+{
+    uv_process_t process{};
+    SpawnOutcome outcome;
+    const uint32_t pid = SpawnSleeper(Loop(), &process, &outcome);
+    ASSERT_NE(pid, 0U);
+
+    uint64_t start_key = 0U;
+    ASSERT_TRUE(taz_process_start_key(pid, &start_key));
+    const uint64_t wrong_start_key = start_key + 1000000U;
+    const ScopedRegistryEntry entry(pid, wrong_start_key);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_PROCESS_MONITOR,
+                         encode_monitor_request(pid, 100U), 68U);
+    RunLoopUntil(Loop(), [&]() { return !Frames().empty(); }, 1000);
+    ASSERT_GE(Frames().size(), 1U);
+
+    ASSERT_EQ(uv_process_kill(&process, SIGKILL), 0);
+    taz_task_registry_record_exit(pid, wrong_start_key, 7);
+
+    RunLoopUntil(
+        Loop(), [&]()
+        { return !Frames().empty() && !FrameHasContinuation(Frames().back()); },
+        5000);
+    const taz_v1_ProcessMonitorResponse resp =
+        decode_monitor_response(Frames().back());
+    EXPECT_TRUE(resp.exited);
+    EXPECT_FALSE(resp.exit_code_known);
+
+    RunLoop();
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+    RunLoop();
+}
+
+// monitor_sample_done's NOT_FOUND-after-reap path (pidfd disabled, process
+// reaped by libuv before the next sample runs) - mirrors
+// MonitorExitWithPidfdDisabledDetectedAfterReap but with a registry entry
+// recorded before the kill is observed, so exit_code_known must be true.
+TEST_F(FileHandlerTest, MonitorRegisteredExitedPidReportsExitCodeAfterReap)
+{
+    const ScopedPidfdDisabled guard;
+
+    uv_process_t process{};
+    SpawnOutcome outcome;
+    const uint32_t pid = SpawnSleeper(Loop(), &process, &outcome);
+    ASSERT_NE(pid, 0U);
+
+    uint64_t start_key = 0U;
+    ASSERT_TRUE(taz_process_start_key(pid, &start_key));
+    const ScopedRegistryEntry entry(pid, start_key);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_PROCESS_MONITOR,
+                         encode_monitor_request(pid, 100U), 69U);
+    RunLoopUntil(Loop(), [&]() { return !Frames().empty(); }, 1000);
+    ASSERT_GE(Frames().size(), 1U);
+
+    ASSERT_EQ(uv_process_kill(&process, SIGKILL), 0);
+    taz_task_registry_record_exit(pid, start_key, 11);
+
+    RunLoopUntil(
+        Loop(), [&]()
+        { return !Frames().empty() && !FrameHasContinuation(Frames().back()); },
+        5000);
+    const taz_v1_ProcessMonitorResponse resp =
+        decode_monitor_response(Frames().back());
+    EXPECT_TRUE(resp.exited);
+    EXPECT_STREQ(resp.reason, "exited");
+    EXPECT_TRUE(resp.exit_code_known);
+    EXPECT_EQ(resp.exit_code, 11);
+
+    RunLoop();
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+    RunLoop();
+}
+
+// monitor_finalize_exit's retry path: the pidfd poll (on_exit_readable)
+// detects the exit and finds the registry entry still "running" - a real
+// race between this stream's own exit detection and the owning task's
+// on-exit hook, which record_exit here stands in for, deliberately landing
+// after the kill via a timer instead of synchronously before the loop
+// runs again (every ViaPoll/ViaSample test above never gives the retry
+// path a chance to run at all).
+TEST_F(FileHandlerTest,
+       MonitorRegisteredPendingPidRetriesUntilDeferredRecordExitLands)
+{
+    uv_process_t process{};
+    SpawnOutcome outcome;
+    const uint32_t pid = SpawnSleeper(Loop(), &process, &outcome);
+    ASSERT_NE(pid, 0U);
+
+    uint64_t start_key = 0U;
+    ASSERT_TRUE(taz_process_start_key(pid, &start_key));
+    const ScopedRegistryEntry entry(pid, start_key);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_PROCESS_MONITOR,
+                         encode_monitor_request(pid, 100U), 71U);
+    RunLoopUntil(Loop(), [&]() { return !Frames().empty(); }, 1000);
+    ASSERT_GE(Frames().size(), 1U);
+
+    ASSERT_EQ(uv_process_kill(&process, SIGKILL), 0);
+    DeferredRegistryRecord deferred;
+    deferred.Start(Loop(), pid, start_key, 13, 30U);
+
+    RunLoopUntil(
+        Loop(), [&]()
+        { return !Frames().empty() && !FrameHasContinuation(Frames().back()); },
+        5000);
+    const taz_v1_ProcessMonitorResponse resp =
+        decode_monitor_response(Frames().back());
+    EXPECT_TRUE(resp.exited);
+    EXPECT_STREQ(resp.reason, "exited");
+    EXPECT_TRUE(resp.exit_code_known);
+    EXPECT_EQ(resp.exit_code, 13);
+
+    RunLoop();
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+
+    deferred.Close();
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+    RunLoop();
+}
+
+// The retry budget is bounded: a registered-but-pending entry whose
+// record_exit never arrives still finalizes (as "unknown", today's
+// pre-existing fallback) instead of hanging the stream forever.
+TEST_F(FileHandlerTest,
+       MonitorRegisteredPendingPidGivesUpAfterRetryBudgetWithNoRecordExit)
+{
+    uv_process_t process{};
+    SpawnOutcome outcome;
+    const uint32_t pid = SpawnSleeper(Loop(), &process, &outcome);
+    ASSERT_NE(pid, 0U);
+
+    uint64_t start_key = 0U;
+    ASSERT_TRUE(taz_process_start_key(pid, &start_key));
+    const ScopedRegistryEntry entry(pid, start_key);
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_PROCESS_MONITOR,
+                         encode_monitor_request(pid, 100U), 72U);
+    RunLoopUntil(Loop(), [&]() { return !Frames().empty(); }, 1000);
+    ASSERT_GE(Frames().size(), 1U);
+
+    ASSERT_EQ(uv_process_kill(&process, SIGKILL), 0);
+    // No record_exit call at all: the entry stays "running" forever.
+
+    RunLoopUntil(
+        Loop(), [&]()
+        { return !Frames().empty() && !FrameHasContinuation(Frames().back()); },
+        5000);
+    const taz_v1_ProcessMonitorResponse resp =
+        decode_monitor_response(Frames().back());
+    EXPECT_TRUE(resp.exited);
+    EXPECT_STREQ(resp.reason, "exited");
+    EXPECT_FALSE(resp.exit_code_known);
+
+    RunLoop();
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    EXPECT_EQ(RefCount(), UnrefCount());
+
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+    RunLoop();
 }
 #endif // !_WIN32
 

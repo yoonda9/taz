@@ -9,6 +9,7 @@
 
 #include "process.h"
 #include "taz/error.h"
+#include "taz/task_registry.h"
 #include "taz/v1/common.pb.h"
 #include "taz/v1/process.pb.h"
 #include "taz/work.h"
@@ -18,6 +19,18 @@
  * tests; the integration tests use it to reach the timer-only path. Read at
  * request time, not cached, so a test can flip it between requests. */
 #define TAZ_MONITOR_NO_PIDFD_ENV "TAZ_MONITOR_NO_PIDFD"
+
+/* A registered pid's own exit detector (detach.c's on-exit hook, fired from
+ * on_process_exit) and this stream's own exit detector (the pidfd poll, or
+ * a sample) are two independent kernel-level observers of the same
+ * process; either can run first. When this stream's own detector wins the
+ * race, retry the registry lookup a few times instead of reporting the
+ * exit code "unknown" outright - bounded, so a pid that was genuinely
+ * never registered still finalizes after exactly one failed lookup (see
+ * taz_task_registry_is_pending below), and so the retry itself can never
+ * hang if the hook somehow never fires. */
+#define TAZ_MONITOR_EXIT_REGISTRY_RETRY_MS    10U
+#define TAZ_MONITOR_EXIT_REGISTRY_MAX_RETRIES 10U
 
 static int g_pidfd_enabled = 1;
 static taz_process_sample_fn_t g_sample_fn = taz_process_watch_sample;
@@ -71,6 +84,10 @@ typedef struct
     uint16_t opcode;
     uint32_t pid;
     uint64_t interval_ms;
+    uint64_t start_key; /* taz_process_start_key at open time; 0 when
+                           unreadable (process gone already, or a platform
+                           read failure) - the exit-code registry lookup
+                           is then skipped. */
 
     uv_timer_t timer;
     uv_poll_t poll;
@@ -108,6 +125,15 @@ typedef struct
     int aborted;
     int final_sent;
     unsigned closes_pending;
+
+    /* Set while retrying a stale exit-code registry lookup (see
+     * TAZ_MONITOR_EXIT_REGISTRY_MAX_RETRIES above); exit_pending_info
+     * points at either &sample.info or &last_info, both stable for the
+     * retry window since no new sample runs while m->timer is repurposed
+     * for retries. */
+    const taz_process_entry_t *exit_pending_info;
+    int32_t exit_pending_code;
+    unsigned exit_registry_retries;
 
     taz_stream_ops_t ops;
 } monitor_ctx_t;
@@ -186,6 +212,28 @@ static void monitor_send_final_frame(monitor_ctx_t *m,
                                (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE);
     }
     m->final_sent = 1;
+}
+
+/* Looks up the exit-code registry for this monitor's (pid, start_key) and
+ * overwrites exit_code/exit_code_known when it holds a matching, exited
+ * entry - the authoritative source for a detached task's exit status
+ * (api.md's promise that POSIX exit codes are known for a detached pid).
+ * Left untouched means: no such pid was ever detached (the normal case
+ * for PROCESS_MONITOR on an arbitrary pid), the registered pid's
+ * start_key does not match (pid reuse), or the key itself could not be
+ * read at open time - the caller's own
+ * platform-reported values stand. */
+static void monitor_registry_exit_code(const monitor_ctx_t *m,
+                                       int32_t *exit_code, int *exit_code_known)
+{
+    int64_t status = 0;
+
+    if (m->start_key != 0U &&
+        taz_task_registry_lookup(m->pid, m->start_key, &status))
+    {
+        *exit_code = (int32_t)status;
+        *exit_code_known = 1;
+    }
 }
 
 static void monitor_send_final(monitor_ctx_t *m,
@@ -289,6 +337,63 @@ static void monitor_teardown(monitor_ctx_t *m)
     }
 }
 
+/* Re-checks the registry after a short wait; m->timer is idle (stopped by
+ * monitor_finalize_exit before the first retry was scheduled) and no new
+ * sample runs during the retry window, so exit_pending_info/code are still
+ * valid. A CANCEL or abort arriving mid-retry stops m->timer itself (via
+ * monitor_teardown/monitor_abort), so this callback simply never fires
+ * again - no separate guard needed here. */
+static void on_exit_registry_retry(uv_timer_t *handle)
+{
+    monitor_ctx_t *m = (monitor_ctx_t *)handle->data;
+    int64_t exit_status = 0;
+
+    if (taz_task_registry_lookup(m->pid, m->start_key, &exit_status))
+    {
+        monitor_send_final(m, m->exit_pending_info, (int32_t)exit_status, 1);
+        monitor_teardown(m);
+        return;
+    }
+
+    m->exit_registry_retries++;
+    if (m->exit_registry_retries >= TAZ_MONITOR_EXIT_REGISTRY_MAX_RETRIES)
+    {
+        monitor_send_final(m, m->exit_pending_info, m->exit_pending_code, 0);
+        monitor_teardown(m);
+        return;
+    }
+
+    (void)uv_timer_start(&m->timer, on_exit_registry_retry,
+                         TAZ_MONITOR_EXIT_REGISTRY_RETRY_MS, 0);
+}
+
+/* Every exit path's single call site for sending the final frame: when the
+ * registry lookup already run by the caller came up empty but the pid is
+ * a registered task whose exit just has not been recorded yet (as opposed
+ * to never having been detached at all), retries briefly instead of
+ * reporting "unknown" on the first miss - closing the race between this
+ * stream's own exit detection and the task's on-exit hook recording into
+ * the registry, both independent observers of the same process exit. */
+static void monitor_finalize_exit(monitor_ctx_t *m,
+                                  const taz_process_entry_t *info,
+                                  int32_t exit_code, int exit_code_known)
+{
+    if (exit_code_known || m->start_key == 0U ||
+        !taz_task_registry_is_pending(m->pid, m->start_key))
+    {
+        monitor_send_final(m, info, exit_code, exit_code_known);
+        monitor_teardown(m);
+        return;
+    }
+
+    uv_timer_stop(&m->timer);
+    m->exit_pending_info = info;
+    m->exit_pending_code = exit_code;
+    m->exit_registry_retries = 0U;
+    (void)uv_timer_start(&m->timer, on_exit_registry_retry,
+                         TAZ_MONITOR_EXIT_REGISTRY_RETRY_MS, 0);
+}
+
 static void monitor_sample_work(void *user)
 {
     monitor_ctx_t *m = (monitor_ctx_t *)user;
@@ -338,14 +443,18 @@ static void monitor_sample_done(void *user, int closing)
         if (m->sample_code == taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND &&
             m->updates_sent > 0)
         {
-            monitor_send_final(m, &m->last_info, 0, 0);
+            int32_t exit_code = 0;
+            int exit_code_known = 0;
+
+            monitor_registry_exit_code(m, &exit_code, &exit_code_known);
+            monitor_finalize_exit(m, &m->last_info, exit_code, exit_code_known);
         }
         else
         {
             monitor_send_failure(m, m->sample_code, "monitor failed",
                                  m->sample_detail);
+            monitor_teardown(m);
         }
-        monitor_teardown(m);
         return;
     }
 
@@ -361,9 +470,11 @@ static void monitor_sample_done(void *user, int closing)
              m->sample.info.name[0] != '\0')
                 ? &m->sample.info
                 : &m->last_info;
-        monitor_send_final(m, info, m->sample.exit_code,
-                           m->sample.exit_code_known);
-        monitor_teardown(m);
+        int32_t exit_code = m->sample.exit_code;
+        int exit_code_known = m->sample.exit_code_known;
+
+        monitor_registry_exit_code(m, &exit_code, &exit_code_known);
+        monitor_finalize_exit(m, info, exit_code, exit_code_known);
         return;
     }
 
@@ -413,6 +524,8 @@ static void on_tick(uv_timer_t *handle)
 static void on_exit_readable(uv_poll_t *handle, int status, int events)
 {
     monitor_ctx_t *m = (monitor_ctx_t *)handle->data;
+    int32_t exit_code = 0;
+    int exit_code_known = 0;
 
     (void)status;
     (void)events;
@@ -430,10 +543,11 @@ static void on_exit_readable(uv_poll_t *handle, int status, int events)
         return; /* monitor_sample_done's exit_pending check handles it. */
     }
 
-    /* The exit code is unknown on POSIX - this callback only ever fires on
-     * Linux, where the watch's exit_fd is a pidfd. */
-    monitor_send_final(m, &m->last_info, 0, 0);
-    monitor_teardown(m);
+    /* The exit code is otherwise unknown on POSIX - this callback only
+     * ever fires on Linux, where the watch's exit_fd is a pidfd - unless
+     * the pid is registered in the exit-code registry. */
+    monitor_registry_exit_code(m, &exit_code, &exit_code_known);
+    monitor_finalize_exit(m, &m->last_info, exit_code, exit_code_known);
 }
 
 static void monitor_on_chunk(void *user, const taz_frame_header_t *header,
@@ -575,6 +689,10 @@ void handle_process_monitor(taz_dispatch_t *d, const taz_frame_header_t *header,
         taz_dispatch_stream_done(d, header->stream_id);
         return;
     }
+
+    /* Failure leaves start_key 0, which just skips the registry lookup
+     * later - the platform sample's own exit_code_known stands. */
+    (void)taz_process_start_key(m->pid, &m->start_key);
 
     m->ops.on_chunk = monitor_on_chunk;
     m->ops.cancel = monitor_cancel;

@@ -254,6 +254,25 @@ TEST_F(ProcessPlatformTest, InspectImpossiblePidIsNotFound)
     EXPECT_EQ(code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
 }
 
+TEST_F(ProcessPlatformTest, StartKeySelfIsNonzeroAndStable)
+{
+    const uint32_t self_pid = SelfPid();
+    uint64_t first = 0U;
+    uint64_t second = 0U;
+
+    ASSERT_EQ(taz_process_start_key(self_pid, &first), 1);
+    ASSERT_EQ(taz_process_start_key(self_pid, &second), 1);
+    EXPECT_NE(first, 0U);
+    EXPECT_EQ(first, second);
+}
+
+TEST_F(ProcessPlatformTest, StartKeyImpossiblePidReturnsZero)
+{
+    uint64_t start_key = 0U;
+
+    EXPECT_EQ(taz_process_start_key(ImpossiblePid(), &start_key), 0);
+}
+
 TEST_F(ProcessPlatformTest, KillImpossiblePidIsNotFound)
 {
     taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
@@ -602,8 +621,9 @@ TEST_F(ProcessSpawnTest, KillZeroSendsTerminateAndReportsNotFoundAfterReap)
 // before the exit callback runs), so by the time outcome.called is true
 // /proc/<pid> is already gone: the fallback sample path reports NOT_FOUND,
 // not EXITED (documented divergence from the pidfd path, which the
-// PROCESS_MONITOR handler reconciles in a later step). The pidfd opened
-// before the kill does observe the exit, independent of the reap.
+// PROCESS_MONITOR handler reconciles: NOT_FOUND after an update counts as
+// an exit). The pidfd opened before the kill does observe the exit,
+// independent of the reap.
 TEST_F(ProcessSpawnTest, SleeperKilledAndReapedIsPidfdReadableButSampleNotFound)
 {
     uv_process_t process{};

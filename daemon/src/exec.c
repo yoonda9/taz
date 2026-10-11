@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "taz/process.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -180,8 +182,13 @@ struct taz_exec_s
     taz_exec_capture_t capture;
     taz_exec_done_fn_t on_done;
     void *arg;
-    int pending; /* counts down from TAZ_EXEC_PENDING_COUNT to 0 */
-    int closing; /* counts down from TAZ_EXEC_HANDLE_COUNT to 0 */
+    taz_exec_on_exit_fn_t on_exit; /* NULL unless taz_exec_set_on_exit armed
+                                    * it; cleared once fired */
+    void *on_exit_arg;
+    uint64_t start_key; /* read by taz_exec_set_on_exit; valid once on_exit
+                         * is non-NULL */
+    int pending;        /* counts down from TAZ_EXEC_PENDING_COUNT to 0 */
+    int closing;        /* counts down from TAZ_EXEC_HANDLE_COUNT to 0 */
     int64_t exit_status;
     int term_signal;
     bool timed_out;
@@ -276,6 +283,17 @@ static void on_process_exit(uv_process_t *process, int64_t exit_status,
 
     x->exit_status = exit_status;
     x->term_signal = term_signal;
+
+    if (x->on_exit != NULL)
+    {
+        taz_exec_on_exit_fn_t fn = x->on_exit;
+        void *fn_arg = x->on_exit_arg;
+
+        x->on_exit = NULL;
+        fn((uint32_t)process->pid, x->start_key, exit_status, term_signal,
+           fn_arg);
+    }
+
     finish_if_ready(x);
 }
 
@@ -300,6 +318,73 @@ void taz_exec_cancel(taz_exec_t *x)
     x->cancelled = true;
     tree_kill(x);
 }
+
+uint32_t taz_exec_pid(const taz_exec_t *x)
+{
+    if (x->done || x->process.pid <= 0)
+    {
+        return 0U;
+    }
+    return (uint32_t)x->process.pid;
+}
+
+void taz_exec_set_on_exit(taz_exec_t *x, taz_exec_on_exit_fn_t fn, void *arg)
+{
+    if (x->done)
+    {
+        return;
+    }
+
+    uint64_t start_key = 0U;
+
+    if (x->process.pid > 0)
+    {
+        (void)taz_process_start_key((uint32_t)x->process.pid, &start_key);
+    }
+
+    x->start_key = start_key;
+    x->on_exit = fn;
+    x->on_exit_arg = arg;
+}
+
+uint64_t taz_exec_start_key(const taz_exec_t *x)
+{
+    return x->start_key;
+}
+
+#ifdef _WIN32
+int taz_exec_signal(taz_exec_t *x, int signum)
+{
+    if (x->done)
+    {
+        return 0;
+    }
+    /* No POSIX signal numbering on Windows, but TASK_CANCEL still needs
+     * INVALID_REQUEST for the same obviously-invalid values uv_kill/kill(2)
+     * reject on POSIX, so reject out-of-range signums before ignoring the
+     * (valid) value and terminating the job unconditionally. 0 is POSIX's
+     * null signal, which delivers nothing, so it terminates nothing here
+     * either. */
+    if (signum < 0 || signum > 64)
+    {
+        return UV_EINVAL;
+    }
+    if (signum != 0 && x->job != NULL)
+    {
+        (void)TerminateJobObject(x->job, 1);
+    }
+    return 0;
+}
+#else
+int taz_exec_signal(taz_exec_t *x, int signum)
+{
+    if (x->done || x->process.pid <= 0)
+    {
+        return 0;
+    }
+    return uv_kill(-x->process.pid, signum);
+}
+#endif
 
 static void on_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
 {

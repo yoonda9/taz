@@ -67,6 +67,16 @@ extern "C"
      * No-op on an already-zeroed struct. */
     void taz_process_detail_free(taz_process_detail_t *detail);
 
+    /* Loop thread, inline. An opaque stamp of when pid started, at the
+     * platform's finest resolution: /proc/<pid>/stat's starttime in clock
+     * ticks since boot on Linux, the creation FILETIME (100 ns units) on
+     * Windows. Not the unix-seconds start_time PROCESS_INFO reports; it
+     * only tells two processes that shared a pid apart, so compare it for
+     * equality and nothing else. One small read (no command line, no fd
+     * walk). Returns 1 and fills *out_key (never 0) on success, 0 when the
+     * process cannot be read (exited, inaccessible, or a malformed stat). */
+    int taz_process_start_key(uint32_t pid, uint64_t *out_key);
+
     /* Loop thread, inline (no pool work item). pid is already validated
      * (1..INT32_MAX); signal >= 0 (0 means SIGTERM / platform terminate).
      * Returns 0 on success, or -1 with code and detail set. */

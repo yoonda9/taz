@@ -145,6 +145,41 @@ extern "C"
      * timeout. A no-op if on_done has already fired. */
     void taz_exec_cancel(taz_exec_t *x);
 
+    /* x's child pid, matching uv_process_t.pid, or 0 once on_done has fired
+     * (the process is reaped and its pid may be reused by something else). */
+    uint32_t taz_exec_pid(const taz_exec_t *x);
+
+    /* An on-exit hook: fn(pid, start_key, exit_status, term_signal, arg). */
+    typedef void (*taz_exec_on_exit_fn_t)(uint32_t pid, uint64_t start_key,
+                                          int64_t exit_status, int term_signal,
+                                          void *arg);
+
+    /* Arms an on-exit hook on x, to fire exactly once, from inside
+     * on_process_exit - at process exit, strictly before the pipes finish
+     * draining and before on_done (a grandchild holding stdout open delays
+     * on_done, never the hook). Must be called while x's process is still
+     * running (right after a successful taz_exec_start, before returning
+     * control to the loop): it reads x's taz_process_start_key, so a caller
+     * can key a registry on (pid, start_key) the same way the process
+     * monitor does. A no-op once on_done has fired. */
+    void taz_exec_set_on_exit(taz_exec_t *x, taz_exec_on_exit_fn_t fn,
+                              void *arg);
+
+    /* The start key taz_exec_set_on_exit read (the one its hook reports), or
+     * 0 if it was never armed or the read failed. */
+    uint64_t taz_exec_start_key(const taz_exec_t *x);
+
+    /* Send signum to x's process group: POSIX uv_kill(-pid, signum); Windows
+     * rejects an out-of-range signum with UV_EINVAL (there is no POSIX
+     * signal numbering to honour, but TASK_CANCEL still needs
+     * INVALID_REQUEST for an obviously-invalid value), delivers nothing for
+     * signum 0 (the null signal, as on POSIX), and otherwise ignores the
+     * value and terminates x's Job Object. A safe no-op once on_done has
+     * fired (the pid may already be reused), returning 0. TASK_CANCEL maps
+     * its own signal 0 to taz_exec_cancel instead of calling this. Returns
+     * a UV_E* code. */
+    int taz_exec_signal(taz_exec_t *x, int signum);
+
 #ifdef __cplusplus
 }
 #endif
