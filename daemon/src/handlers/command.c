@@ -60,8 +60,9 @@ static void on_exec_done(const taz_exec_result_t *result, void *arg)
 
 /* Map a taz_exec_start spawn-failure return (a UV_E* code, never a raw
  * errno - these differ on Windows) to an ErrorCode per the plan's §6.2
- * subset for this step. */
-static taz_v1_ErrorCode map_spawn_error(int rc)
+ * subset for this step. Shared with handlers/detach.c, whose DETACH spawn
+ * failure answers through the same mapping. */
+taz_v1_ErrorCode taz_command_map_spawn_error(int rc)
 {
     if (rc == UV_ENOENT)
     {
@@ -236,7 +237,7 @@ void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
 
     if (rc != 0)
     {
-        const taz_v1_ErrorCode code = map_spawn_error(rc);
+        const taz_v1_ErrorCode code = taz_command_map_spawn_error(rc);
         free(ectx);
         taz_error_send(write_fn, ctx, header->stream_id, header->opcode, code,
                        "spawn failed", uv_strerror(rc));
@@ -271,6 +272,37 @@ static bool encode_bytes(pb_ostream_t *stream, const pb_field_iter_t *field,
     return pb_encode_string(stream, bctx->data, bctx->len);
 }
 
+/* Populates *resp from *result, pointing its stdout_data/stderr_data encode
+ * callbacks at out_ctx and err_ctx (caller-owned, must outlive any encode
+ * of *resp). Shared by the send and byte-encoding paths so both produce
+ * identical wire content. */
+static void build_exec_response(taz_v1_CommandExecResponse *resp,
+                                bytes_ctx_t *out_ctx, bytes_ctx_t *err_ctx,
+                                const taz_exec_result_t *result)
+{
+    (void)memset(resp, 0, sizeof(*resp));
+
+    resp->exit_code = (result->term_signal != 0) ? -(int32_t)result->term_signal
+                                                 : (int32_t)result->exit_status;
+    resp->timed_out = result->timed_out;
+    resp->truncated = result->truncated;
+
+    if (result->out_len > 0U)
+    {
+        out_ctx->data = result->out;
+        out_ctx->len = result->out_len;
+        resp->stdout_data.funcs.encode = encode_bytes;
+        resp->stdout_data.arg = out_ctx;
+    }
+    if (result->err_len > 0U)
+    {
+        err_ctx->data = result->err;
+        err_ctx->len = result->err_len;
+        resp->stderr_data.funcs.encode = encode_bytes;
+        resp->stderr_data.arg = err_ctx;
+    }
+}
+
 void taz_command_send_exec_response(taz_dispatch_write_fn_t write_fn, void *ctx,
                                     uint32_t stream_id, uint16_t opcode,
                                     const taz_exec_result_t *result)
@@ -287,29 +319,68 @@ void taz_command_send_exec_response(taz_dispatch_write_fn_t write_fn, void *ctx,
                        NULL);
         return;
     }
-    (void)memset(resp, 0, sizeof(*resp));
-
-    resp->exit_code = (result->term_signal != 0) ? -(int32_t)result->term_signal
-                                                 : (int32_t)result->exit_status;
-    resp->timed_out = result->timed_out;
-    resp->truncated = result->truncated;
-
-    if (result->out_len > 0U)
-    {
-        out_ctx.data = result->out;
-        out_ctx.len = result->out_len;
-        resp->stdout_data.funcs.encode = encode_bytes;
-        resp->stdout_data.arg = &out_ctx;
-    }
-    if (result->err_len > 0U)
-    {
-        err_ctx.data = result->err;
-        err_ctx.len = result->err_len;
-        resp->stderr_data.funcs.encode = encode_bytes;
-        resp->stderr_data.arg = &err_ctx;
-    }
+    build_exec_response(resp, &out_ctx, &err_ctx, result);
 
     taz_response_send(write_fn, ctx, stream_id, opcode,
                       taz_v1_CommandExecResponse_fields, resp);
     free(resp);
+}
+
+bool taz_command_encode_exec_response(const taz_exec_result_t *result,
+                                      uint8_t **out_buf, size_t *out_len)
+{
+    taz_v1_CommandExecResponse *resp;
+    bytes_ctx_t out_ctx;
+    bytes_ctx_t err_ctx;
+    size_t size = 0U;
+    uint8_t *buf = NULL;
+    bool ok;
+
+    resp = (taz_v1_CommandExecResponse *)malloc(sizeof(*resp));
+    if (resp == NULL)
+    {
+        return false;
+    }
+    build_exec_response(resp, &out_ctx, &err_ctx, result);
+
+    if (!pb_get_encoded_size(&size, taz_v1_CommandExecResponse_fields, resp))
+    {
+        free(resp);
+        return false;
+    }
+
+    if (size == 0U)
+    {
+        free(resp);
+        *out_buf = NULL;
+        *out_len = 0U;
+        return true;
+    }
+
+    buf = (uint8_t *)malloc(size);
+    if (buf == NULL)
+    {
+        free(resp);
+        return false;
+    }
+
+    {
+        pb_ostream_t ostream = pb_ostream_from_buffer(buf, size);
+        ok = pb_encode(&ostream, taz_v1_CommandExecResponse_fields, resp);
+        if (ok)
+        {
+            size = ostream.bytes_written;
+        }
+    }
+    free(resp);
+
+    if (!ok)
+    {
+        free(buf);
+        return false;
+    }
+
+    *out_buf = buf;
+    *out_len = size;
+    return true;
 }

@@ -60,6 +60,16 @@ extern "C"
      * if none are outstanding. Idempotent; safe to call more than once. */
     void taz_work_request_shutdown(uv_loop_t *loop);
 
+    /* A hook invoked once, synchronously, at the very start of
+     * taz_work_request_shutdown - strictly before its outstanding-count
+     * check and before uv_stop can be issued - so it always runs on the
+     * loop thread while the loop is still executing. main.c uses this to
+     * reach connection.c's taz_conn_kill_all_task_trees without work.c
+     * needing to know what a connection is; NULL (the default, and what
+     * taz_work_reset_for_tests restores) means no hook runs. */
+    typedef void (*taz_work_shutdown_hook_fn_t)(const uv_loop_t *loop);
+    void taz_work_set_shutdown_hook(taz_work_shutdown_hook_fn_t hook);
+
 #ifdef __cplusplus
 }
 #endif

@@ -30,6 +30,8 @@
 #include "taz/dispatch.h"
 #include "taz/frame.h"
 #include "taz/fsutil.h"
+#include "taz/task.h"
+#include "taz/task_registry.h"
 #include "taz/v1/common.pb.h"
 #include "taz/work.h"
 
@@ -224,6 +226,7 @@ class FileHandlerTest : public ::testing::Test
     {
         ASSERT_EQ(uv_loop_init(&loop_), 0);
 
+        taz_task_registry_reset_for_tests();
         taz_dispatch_init(&d_);
         d_.loop = &loop_;
         d_.conn_ref = CountRef;
@@ -248,6 +251,9 @@ class FileHandlerTest : public ::testing::Test
 
     void TearDown() override
     {
+        // Finished monitor=true tasks keep their results until the
+        // connection is freed; this fixture's fake connection never is.
+        taz_task_table_free(&d_.tasks);
         RemoveTree(dir_);
         ASSERT_EQ(uv_loop_close(&loop_), 0);
     }

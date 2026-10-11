@@ -5,12 +5,15 @@
 #include "handlers/cancel.h"
 #include "handlers/command.h"
 #include "handlers/config.h"
+#include "handlers/detach.h"
 #include "handlers/file.h"
 #include "handlers/file_transfer.h"
 #include "handlers/log.h"
 #include "handlers/process.h"
 #include "handlers/process_monitor.h"
 #include "handlers/run_as.h"
+#include "handlers/task_cancel.h"
+#include "handlers/task_status.h"
 #include "handlers/timeout.h"
 #include "handlers/version.h"
 #include "taz/error.h"
@@ -123,6 +126,15 @@ void taz_dispatch_cancel_all(taz_dispatch_t *d)
             d->stream_ops[idx]->abort(d->stream_user[idx]);
         }
     }
+
+    /* Detached (DETACH) tasks are not stream-registered - their request
+     * stream closes immediately once DetachResponse is sent, long before
+     * the task itself finishes - so the loop above never reaches their
+     * execs. Kill every one of them too: the table itself (part of the
+     * owning taz_conn_t) stays alive until each one's own on_done fires
+     * and releases its connection reference, same as any other in-flight
+     * exec. */
+    taz_task_table_abort(&d->tasks);
 }
 
 void taz_dispatch_set_stream_ops(taz_dispatch_t *d, uint32_t stream_id,
@@ -340,6 +352,11 @@ static const opcode_entry_t OPCODE_TABLE[] = {
     {NULL, handle_timeout_set, (uint16_t)taz_v1_Opcode_OPCODE_TIMEOUT_SET,
      true},
     {NULL, handle_run_as, (uint16_t)taz_v1_Opcode_OPCODE_RUN_AS, true},
+    {NULL, handle_detach, (uint16_t)taz_v1_Opcode_OPCODE_DETACH, true},
+    {NULL, handle_task_status, (uint16_t)taz_v1_Opcode_OPCODE_TASK_STATUS,
+     true},
+    {NULL, handle_task_cancel, (uint16_t)taz_v1_Opcode_OPCODE_TASK_CANCEL,
+     true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))

@@ -39,7 +39,7 @@ TEST(Payload, CapabilityRoundTrip)
 
     EXPECT_EQ(cap.protocol_major, 1U);
     EXPECT_EQ(cap.protocol_minor, 0U);
-    ASSERT_EQ(cap.operations_count, 21U);
+    ASSERT_EQ(cap.operations_count, 24U);
 
     // Collect operations into a set for order-independent verification.
     const std::set<uint32_t> ops(cap.operations,
@@ -85,6 +85,11 @@ TEST(Payload, CapabilityRoundTrip)
     // RUN_AS is advertised only on a privileged daemon (forced off above,
     // so this holds even when the suite runs as root).
     EXPECT_FALSE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_RUN_AS)));
+    EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_DETACH)));
+    EXPECT_TRUE(
+        ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TASK_STATUS)));
+    EXPECT_TRUE(
+        ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TASK_CANCEL)));
 
     ASSERT_GE(cap.compression_count, 1U);
     EXPECT_STREQ(cap.compression[0], "NONE");
@@ -109,10 +114,15 @@ TEST(Payload, CapabilityAdvertisesRunAsOnlyWhenPrivileged)
     pb_istream_t stream = pb_istream_from_buffer(buf, n);
     ASSERT_TRUE(pb_decode(&stream, taz_v1_CapabilityPayload_fields, &cap));
 
-    ASSERT_EQ(cap.operations_count, 22U);
+    ASSERT_EQ(cap.operations_count, 25U);
     const std::set<uint32_t> ops(cap.operations,
                                  cap.operations + cap.operations_count);
     EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_RUN_AS)));
+    EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_DETACH)));
+    EXPECT_TRUE(
+        ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TASK_STATUS)));
+    EXPECT_TRUE(
+        ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TASK_CANCEL)));
 }
 #endif /* !_WIN32 */
 

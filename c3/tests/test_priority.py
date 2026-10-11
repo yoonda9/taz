@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 import socket
+from collections.abc import Callable
+from typing import Literal
 from unittest.mock import MagicMock, patch
 
 import pytest
 import taz.c3
+from taz.c3.client import TazClient
 from taz.c3.connection import Connection
 from taz.c3.errors import TazPriorityError
 from taz.c3.protocol.dispatch import Dispatcher
 from taz.c3.protocol.frame import Frame, pack_header
 from taz.c3.settings import Backlog, Keepalive
-from taz.v1 import command_pb2, common_pb2, daemon_control_pb2
+from taz.c3.task import TaskState
+from taz.v1 import advanced_pb2, command_pb2, common_pb2, daemon_control_pb2
 
 # ---------------------------------------------------------------------------
 # Test helpers (same pattern as test_dispatch.py)
@@ -357,3 +362,116 @@ class TestPriorityDispatch:
             )
 
         assert exc_info.value.task_id == 3
+
+
+# ---------------------------------------------------------------------------
+# TestPriorityClient: how TazClient's discrete calls and cleanup CANCELs
+# treat a PRIORITY error
+# ---------------------------------------------------------------------------
+
+
+def _client(
+    *extra_chunks: bytes,
+    priority_policy: Literal["raise", "queue"] = "raise",
+    on_priority_error: Callable[[TazPriorityError], None] | None = None,
+) -> tuple[TazClient, MagicMock]:
+    cap = _capability_bytes(
+        operations=[common_pb2.OPCODE_CANCEL, common_pb2.OPCODE_TASK_STATUS]
+    )
+    sock = _mock_sock(cap, *extra_chunks)
+    client = TazClient(
+        "127.0.0.1",
+        5555,
+        keepalive=Keepalive.OFF,
+        priority_policy=priority_policy,
+        on_priority_error=on_priority_error,
+    )
+    with patch("taz.c3.connection.socket.create_connection", return_value=sock):
+        client.connect()
+    return client, sock
+
+
+def _sends(sock: MagicMock) -> int:
+    return int(sock.sendmsg.call_count + sock.sendall.call_count)
+
+
+def _task_status_response(stream_id: int) -> bytes:
+    resp = advanced_pb2.TaskStatusResponse(state=advanced_pb2.TASK_STATE_RUNNING)
+    return _response(common_pb2.OPCODE_TASK_STATUS, stream_id, resp.SerializeToString())
+
+
+def _cancel_response(stream_id: int) -> bytes:
+    resp = advanced_pb2.CancelResponse(cancelled=True)
+    return _response(common_pb2.OPCODE_CANCEL, stream_id, resp.SerializeToString())
+
+
+def _deferred(task_id: int) -> TazPriorityError:
+    error = taz.c3.TazError(common_pb2.ERROR_CODE_INTERNAL, "exit code 1")
+    return TazPriorityError(task_id, 9, error)
+
+
+class TestPriorityClient:
+    def test_deferred_error_is_raised_before_the_next_call_sends(self) -> None:
+        """The interrupted call never reaches the daemon, so nothing runs
+        there with nobody left to read its response."""
+        client, sock = _client(_task_status_response(stream_id=1))
+        client._dispatcher._pending_priority.append(_deferred(42))
+        before = _sends(sock)
+
+        with pytest.raises(TazPriorityError) as exc_info:
+            client.task.status(1)
+
+        assert exc_info.value.task_id == 42
+        assert _sends(sock) == before
+        # The next call is the first to send, on stream 1, and succeeds.
+        assert client.task.status(1).state == TaskState.RUNNING
+        assert not client._dispatcher._buffer
+
+    def test_closing_a_stream_leaves_a_deferred_error_queued(self) -> None:
+        """StreamIterator.close() (and so a with block) never raises a
+        deferred error, so it cannot replace the user's own exception."""
+        client, _ = _client(_cancel_response(stream_id=2))
+        client._dispatcher._pending_priority.append(_deferred(42))
+
+        with (
+            pytest.raises(ValueError, match="user code"),
+            client.task.status(1, subscribe=True) as it,
+        ):
+            raise ValueError("user code")
+
+        assert it.cancelled is True
+        assert len(client._dispatcher._pending_priority) == 1
+
+    def test_priority_arriving_during_a_cleanup_cancel_is_deferred(self) -> None:
+        client, _ = _client(_priority_error(stream_id=5), _cancel_response(2))
+        client._dispatcher.register_priority_task(5, task_id=7)
+
+        it = client.task.status(1, subscribe=True)
+        it.close()
+
+        assert it.cancelled is True
+        assert [e.task_id for e in client._dispatcher._pending_priority] == [7]
+        with pytest.raises(TazPriorityError):
+            client.task.status(1)
+
+    def test_failing_callback_is_logged_and_keeps_the_connection(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def buggy(error: TazPriorityError) -> None:
+            raise RuntimeError("buggy callback")
+
+        client, _ = _client(
+            _priority_error(stream_id=5),
+            _task_status_response(stream_id=1),
+            priority_policy="queue",
+            on_priority_error=buggy,
+        )
+
+        with caplog.at_level(logging.ERROR, logger="taz.c3.protocol.dispatch"):
+            status = client.task.status(1)
+
+        assert "on_priority_error raised" in caplog.text
+        assert "buggy callback" in caplog.text
+        assert status.state == TaskState.RUNNING
+        assert not client._conn.closed
+        assert len(client.priority_errors) == 1

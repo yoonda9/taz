@@ -197,6 +197,65 @@ TEST(Work, CloseWhileInFlightStillDeliversDoneWithClosingTrue)
     uv_sem_destroy(&w.release);
 }
 
+namespace
+{
+
+// A hook set via taz_work_set_shutdown_hook runs synchronously inside
+// taz_work_request_shutdown itself, strictly before the outstanding-count
+// check decides whether uv_stop fires immediately or is deferred - main.c
+// relies on this ordering to kill every connection's detached task trees
+// while the loop is still guaranteed to be running.
+int g_hook_calls = 0;
+const uv_loop_t *g_hook_loop = nullptr;
+
+void CountingHook(const uv_loop_t *loop)
+{
+    g_hook_calls++;
+    g_hook_loop = loop;
+}
+
+} // namespace
+
+TEST(Work, RequestShutdownInvokesHookBeforeStoppingImmediately)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+    g_hook_calls = 0;
+    g_hook_loop = nullptr;
+
+    taz_work_set_shutdown_hook(CountingHook);
+    taz_work_request_shutdown(&loop);
+
+    EXPECT_EQ(g_hook_calls, 1);
+    EXPECT_EQ(g_hook_loop, &loop);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    taz_work_reset_for_tests();
+}
+
+TEST(Work, NoHookSetIsANoop)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    uv_timer_t never_fires;
+    ASSERT_EQ(uv_timer_init(&loop, &never_fires), 0);
+    ASSERT_EQ(uv_timer_start(&never_fires, [](uv_timer_t *) {}, 2000U, 0U), 0);
+
+    // No taz_work_set_shutdown_hook call this time: must not crash, and
+    // shutdown proceeds exactly as before the hook mechanism existed -
+    // stopping the loop promptly despite the still-active timer.
+    taz_work_request_shutdown(&loop);
+    EXPECT_NE(uv_run(&loop, UV_RUN_DEFAULT), 0);
+
+    uv_close(reinterpret_cast<uv_handle_t *>(&never_fires), nullptr);
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+    taz_work_reset_for_tests();
+}
+
 TEST(Work, RequestShutdownStopsImmediatelyWhenNothingOutstanding)
 {
     uv_loop_t loop;

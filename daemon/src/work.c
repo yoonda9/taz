@@ -36,6 +36,7 @@ static void on_work(uv_work_t *req)
 static size_t g_outstanding = 0U;
 static uv_loop_t *g_shutdown_loop = NULL;
 static int g_shutdown_requested = 0;
+static taz_work_shutdown_hook_fn_t g_shutdown_hook = NULL;
 
 /* Loop thread, any status (including UV_ECANCELED, treated the same as a
  * normal completion): deliver the result, optionally release the stream,
@@ -121,10 +122,17 @@ int taz_work_shutdown_requested(void)
 void taz_work_reset_for_tests(void)
 {
     g_shutdown_requested = 0;
+    g_shutdown_loop = NULL;
+    g_shutdown_hook = NULL;
 }
 
 void taz_work_request_shutdown(uv_loop_t *loop)
 {
+    if (g_shutdown_hook != NULL)
+    {
+        g_shutdown_hook(loop);
+    }
+
     g_shutdown_requested = 1;
     if (g_outstanding == 0U)
     {
@@ -132,4 +140,9 @@ void taz_work_request_shutdown(uv_loop_t *loop)
         return;
     }
     g_shutdown_loop = loop;
+}
+
+void taz_work_set_shutdown_hook(taz_work_shutdown_hook_fn_t hook)
+{
+    g_shutdown_hook = hook;
 }

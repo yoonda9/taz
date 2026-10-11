@@ -17,6 +17,7 @@ from taz.c3.process import ProcessNamespace
 from taz.c3.protocol.dispatch import Dispatcher, PriorityPolicy
 from taz.c3.protocol.frame import Frame
 from taz.c3.settings import Backlog, Keepalive
+from taz.c3.task import TaskNamespace
 from taz.v1 import advanced_pb2, common_pb2, daemon_control_pb2
 
 
@@ -73,6 +74,7 @@ class TazClient:
         self.file = FileNamespace(self)
         self.directory = DirectoryNamespace(self)
         self.process = ProcessNamespace(self)
+        self.task = TaskNamespace(self)
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -114,6 +116,7 @@ class TazClient:
         response_type: type[M],
         keepalive: Keepalive | None,
         *,
+        on_stream_id: Callable[[int], None] | None = None,
         discrete: bool = True,
     ) -> M:
         kv = keepalive if keepalive is not None else self._keepalive
@@ -122,6 +125,8 @@ class TazClient:
             # before this call's request exists on the daemon.
             self._dispatcher.raise_pending_priority()
         stream_id = self._conn.send_request(opcode, payload)
+        if on_stream_id is not None:
+            on_stream_id(stream_id)
         try:
             frame = self._dispatcher.recv_response(
                 stream_id,

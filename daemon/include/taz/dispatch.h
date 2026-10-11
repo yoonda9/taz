@@ -9,6 +9,7 @@
 
 #include "taz/exec.h"
 #include "taz/frame.h"
+#include "taz/task.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -132,6 +133,9 @@ extern "C"
         taz_dispatch_conn_write_queue_size_fn_t conn_write_queue_size;
         taz_dispatch_conn_pause_reads_fn_t conn_pause_reads;
         taz_dispatch_conn_resume_reads_fn_t conn_resume_reads;
+        /* The connection's detached (DETACH) tasks. Zeroed by
+         * taz_dispatch_init, which is what pure unit tests see. */
+        taz_task_table_t tasks;
     } taz_dispatch_t;
 
     /* Initialise a dispatch context to the empty state. */

@@ -258,6 +258,7 @@ add_library(
     src/config.c
     src/log.c
     src/task_registry.c
+    src/task.c
     src/response.c
     src/exec.c
     src/server.c
@@ -278,6 +279,9 @@ add_library(
     src/handlers/log.c
     src/handlers/timeout.c
     src/handlers/run_as.c
+    src/handlers/detach.c
+    src/handlers/task_status.c
+    src/handlers/task_cancel.c
     src/platform/process_common.c
     ${TAZ_PROCESS_SRC}
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)

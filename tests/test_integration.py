@@ -25,12 +25,22 @@ from taz.c3 import (
     Keepalive,
     ProcessMonitorUpdate,
     StreamIterator,
+    TaskState,
+    TaskStatus,
     TazClient,
     TazConnectionLost,
     TazError,
+    TazPriorityError,
 )
 from taz.c3.file import Kind
-from taz.v1 import command_pb2, common_pb2, daemon_control_pb2, file_pb2, process_pb2
+from taz.v1 import (
+    advanced_pb2,
+    command_pb2,
+    common_pb2,
+    daemon_control_pb2,
+    file_pb2,
+    process_pb2,
+)
 
 from tests.conftest import Daemon
 
@@ -568,6 +578,35 @@ class TestRunAs:
         # The request's own env still wins.
         result = taz_client.command.exec("sh", args=show, env={"HOME": "/custom-home"})
         assert result.stdout == f"{target_user} {target_user} /custom-home".encode()
+
+    @_ROOT_ONLY
+    def test_root_detach_runs_as_the_connection_identity_or_as_user(
+        self, taz_client: TazClient
+    ) -> None:
+        if sys.platform == "win32":
+            return  # unreachable at runtime; gives mypy the platform narrowing
+        import pwd
+
+        target_user = os.environ.get("TAZ_TEST_USER", "nobody")
+        entry = pwd.getpwnam(target_user)
+        show = ["-c", 'printf "%s %s %s" "$(id -u)" "$USER" "$HOME"']
+
+        def detached_output(**kwargs: Any) -> bytes:
+            task = taz_client.task.detach(taz_client.command.exec, "sh", show, **kwargs)
+            deadline = time.monotonic() + 10
+            status = taz_client.task.status(task.task_id)
+            while status.state == TaskState.RUNNING:
+                assert time.monotonic() < deadline, "task never finished"
+                time.sleep(0.05)
+                status = taz_client.task.status(task.task_id)
+            assert status.state == TaskState.COMPLETED
+            assert status.result is not None
+            return status.result.stdout
+
+        expected = f"{entry.pw_uid} {target_user} {entry.pw_dir or '/'}".encode()
+        assert detached_output(as_user=target_user) == expected
+        assert taz_client.run_as(target_user) == target_user
+        assert detached_output() == expected
 
     @_ROOT_ONLY
     def test_root_per_call_as_user_overrides_connection_identity(
@@ -1726,6 +1765,58 @@ class TestProcessMonitor:
         gc.collect()
         taz_client_no_pidfd.ping()
 
+    def test_detached_task_exit_code_is_authoritative_via_monitor(
+        self, taz_client: TazClient
+    ) -> None:
+        # A short sleep first so the exit (and its registry record) races
+        # neither the DETACH response nor this test's own monitor() call.
+        task = taz_client.task.detach(
+            taz_client.command.exec,
+            PY,
+            args=_py("import sys, time; time.sleep(1); sys.exit(7)"),
+        )
+        m = taz_client.process.monitor(task.pid, _MONITOR_INTERVAL)
+        final = _wait_final(m, 5.0)
+        assert final.exited is True
+        assert final.exit_code_known is True
+        assert final.exit_code == 7
+        taz_client.ping()
+
+    def test_monitor_false_detached_task_exit_code_is_authoritative(
+        self, taz_client: TazClient
+    ) -> None:
+        # The task itself is freed as soon as it finishes; its registry
+        # entry is not.
+        task = taz_client.task.detach(
+            taz_client.command.exec,
+            PY,
+            args=_py("import sys, time; time.sleep(1); sys.exit(7)"),
+            monitor=False,
+        )
+        m = taz_client.process.monitor(task.pid, _MONITOR_INTERVAL)
+        final = _wait_final(m, 5.0)
+        assert final.exit_code_known is True
+        assert final.exit_code == 7
+
+    def test_cancelled_detached_task_reports_its_kill_not_exit_zero(
+        self, taz_client: TazClient
+    ) -> None:
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py("import time; time.sleep(30)")
+        )
+        m = taz_client.process.monitor(task.pid, _MONITOR_INTERVAL)
+        assert next(m).exited is False
+        assert taz_client.task.cancel(task.task_id) is True
+        final = _wait_final(m, 5.0)
+        assert final.exited is True
+        assert final.exit_code_known is True
+        # -signal on POSIX, as COMMAND_EXEC reports it; TerminateJobObject's
+        # exit code on Windows.
+        if sys.platform == "win32":
+            assert final.exit_code == 1
+        else:
+            assert final.exit_code == -signal.SIGKILL
+
     def test_cancel_via_break_leaves_no_buffered_or_closed_state(
         self,
         taz_client: TazClient,
@@ -1932,6 +2023,499 @@ class TestProcessMonitor:
             m.close()
             assert m.cancelled is True
             taz_client.ping()
+
+
+class TestDetach:
+    """``DETACH`` through the typed ``client.task.detach()`` API."""
+
+    def test_short_sleep_returns_task_id_and_pid_promptly(
+        self, taz_client: TazClient
+    ) -> None:
+        sleep_s = 2
+        start = time.monotonic()
+        task = taz_client.task.detach(
+            taz_client.command.exec,
+            PY,
+            args=_py(f"import time; time.sleep({sleep_s})"),
+        )
+        # Nonzero pid and a prompt reply: the DETACH response is sent as
+        # soon as the daemon has spawned the process, well before the
+        # process itself has finished sleeping.
+        assert task.task_id != 0
+        assert task.pid > 0
+        assert time.monotonic() - start < 1.0
+
+        assert taz_client.task.cancel(task.task_id) is True
+        deadline = time.monotonic() + 5
+        while not _process_gone(task.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _process_gone(task.pid)
+        taz_client.ping()
+
+    def test_file_put_raw_detach_request_is_not_supported(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        req = advanced_pb2.DetachRequest(
+            file_put=file_pb2.FilePutRequest(
+                dest=str(tmp_path / "dest.bin"), size=0, permissions=0o644
+            )
+        )
+        with pytest.raises(TazError) as exc_info:
+            taz_client._call(
+                common_pb2.OPCODE_DETACH,
+                req.SerializeToString(),
+                advanced_pb2.DetachResponse,
+                None,
+            )
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
+        assert not (tmp_path / "dest.bin").exists()
+        taz_client.ping()
+
+    def test_capabilities_advertise_detach(self, taz_client: TazClient) -> None:
+        ops = set(taz_client.capabilities().operations)
+        assert common_pb2.OPCODE_DETACH in ops
+
+
+class TestTaskStatus:
+    """``TASK_STATUS`` through the typed ``client.task.status()`` API."""
+
+    def test_poll_reports_running_then_completed_with_decoded_result(
+        self, taz_client: TazClient
+    ) -> None:
+        sleep_s = 2
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py(f"import time; time.sleep({sleep_s})")
+        )
+        running = taz_client.task.status(task.task_id)
+        assert running.state == TaskState.RUNNING
+        assert running.result is None
+        assert running.error is None
+
+        deadline = time.monotonic() + sleep_s + 5
+        status = running
+        while status.state == TaskState.RUNNING:
+            assert time.monotonic() < deadline, "task never left RUNNING"
+            time.sleep(0.05)
+            status = taz_client.task.status(task.task_id)
+
+        assert status.state == TaskState.COMPLETED
+        assert status.error is None
+        assert status.result is not None
+        assert status.result.exit_code == 0
+        taz_client.ping()
+
+    def test_subscribe_streams_updates_until_completed_with_no_result_on_final_frame(
+        self, taz_client: TazClient
+    ) -> None:
+        sleep_s = 1
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py(f"import time; time.sleep({sleep_s})")
+        )
+        m = taz_client.task.status(
+            task.task_id, subscribe=True, interval_ms=_MONITOR_INTERVAL
+        )
+        assert isinstance(m, StreamIterator)
+
+        first = next(m)
+        assert first.state == TaskState.RUNNING
+        # Streamed frames never carry `result`, even once the task is done -
+        # only a non-subscribed poll does.
+        assert first.result is None
+
+        deadline = time.monotonic() + sleep_s + 5
+        final: TaskStatus | None = None
+        while not m.ended:
+            assert time.monotonic() < deadline, "stream never reached its final frame"
+            final = next(m)
+        assert final is not None
+        assert final.state == TaskState.COMPLETED
+        assert final.result is None
+        with pytest.raises(StopIteration):
+            next(m)
+
+        # The final frame ended the stream without a result: a separate
+        # non-subscribed poll is how a caller actually retrieves it.
+        status = taz_client.task.status(task.task_id)
+        assert status.state == TaskState.COMPLETED
+        assert status.result is not None
+        assert status.result.exit_code == 0
+        taz_client.ping()
+
+    def test_subscription_on_monitor_false_task_ends_with_terminal_frame(
+        self, taz_client: TazClient
+    ) -> None:
+        # A monitor=false task is freed when it finishes, but only after an
+        # open subscription has had its final frame, which goes out as soon
+        # as the task finishes rather than at the next 60 s interval.
+        task = taz_client.task.detach(
+            taz_client.command.exec,
+            PY,
+            args=_py("import time; time.sleep(2)"),
+            monitor=False,
+        )
+        m = taz_client.task.status(
+            task.task_id, subscribe=True, interval_ms=60_000, max_wait=15
+        )
+        states = [update.state for update in m]
+        assert states[-1] == TaskState.COMPLETED
+        assert m.ended
+        with pytest.raises(TazError) as exc_info:
+            taz_client.task.status(task.task_id)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_cancelling_a_subscription_ends_it_with_a_final_frame(
+        self, taz_client: TazClient
+    ) -> None:
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py("import time; time.sleep(30)")
+        )
+        with taz_client.task.status(
+            task.task_id, subscribe=True, interval_ms=_MONITOR_INTERVAL
+        ) as m:
+            assert next(m).state == TaskState.RUNNING
+        assert m.cancelled is True
+
+        # The daemon's final frame on the cancelled stream lets the client
+        # forget the stream instead of tracking it as closed forever.
+        for _ in range(5):
+            taz_client.ping()
+        assert m.stream_id not in taz_client._dispatcher._closed
+        assert m.stream_id not in taz_client._dispatcher._buffer
+        assert taz_client.task.cancel(task.task_id) is True
+
+    def test_failed_task_status_carries_error(self, taz_client: TazClient) -> None:
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py("import sys; sys.exit(3)")
+        )
+        deadline = time.monotonic() + 5
+        status = taz_client.task.status(task.task_id)
+        while status.state == TaskState.RUNNING:
+            assert time.monotonic() < deadline, "task never left RUNNING"
+            time.sleep(0.05)
+            status = taz_client.task.status(task.task_id)
+
+        assert status.state == TaskState.FAILED
+        assert status.error is not None
+        assert status.error.code == common_pb2.ERROR_CODE_INTERNAL
+        assert status.error.message == "exit code 3"
+        assert status.result is not None
+        assert status.result.exit_code == 3
+        taz_client.ping()
+
+    def test_capabilities_advertise_task_status(self, taz_client: TazClient) -> None:
+        ops = set(taz_client.capabilities().operations)
+        assert common_pb2.OPCODE_TASK_STATUS in ops
+
+
+class TestTaskCancel:
+    """``TASK_CANCEL`` through the typed ``client.task.cancel()`` API."""
+
+    def test_cancel_running_detached_sleep_returns_accepted_true(
+        self, taz_client: TazClient
+    ) -> None:
+        sleep_s = 10
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py(f"import time; time.sleep({sleep_s})")
+        )
+        pid = task.pid
+
+        accepted = taz_client.task.cancel(task.task_id)
+        assert accepted is True
+
+        deadline = time.monotonic() + 5
+        status = taz_client.task.status(task.task_id)
+        while status.state == TaskState.RUNNING:
+            assert time.monotonic() < deadline, "task never left RUNNING"
+            time.sleep(0.05)
+            status = taz_client.task.status(task.task_id)
+
+        assert status.state == TaskState.CANCELLED
+        # Process should be gone shortly after cancellation.
+        deadline = time.monotonic() + 5
+        while psutil.pid_exists(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not psutil.pid_exists(pid), f"pid {pid} still exists"
+        taz_client.ping()
+
+    def test_cancel_signal_zero_kills_process_tree(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        grandchild_pid_file = tmp_path / "grandchild.pid"
+        # repr() (not a hand-rolled quoted/raw string) escapes the path
+        # safely for embedding as a Python literal one level down - needed
+        # on Windows, where tmp_path contains backslashes (e.g. "\Users")
+        # that a careless embedding mangles into bogus \U.. escapes.
+        grandchild_code = (
+            "import os, pathlib, time; "
+            f"pathlib.Path({str(grandchild_pid_file)!r}).write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        )
+        snippet = (
+            "import subprocess, sys, time; "
+            f"child = subprocess.Popen([sys.executable, '-c', {grandchild_code!r}]); "
+            "print(child.pid); sys.stdout.flush(); "
+            "time.sleep(60)"
+        )
+        task = taz_client.task.detach(taz_client.command.exec, PY, args=_py(snippet))
+        parent_pid = task.pid
+
+        deadline = time.monotonic() + 5
+        while not grandchild_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert grandchild_pid_file.exists(), "grandchild never started"
+        grandchild_pid = int(grandchild_pid_file.read_text())
+
+        accepted = taz_client.task.cancel(task.task_id, signal=0)
+        assert accepted is True
+
+        # Both parent and grandchild should be gone.
+        deadline = time.monotonic() + 5
+        while (
+            psutil.pid_exists(parent_pid) or psutil.pid_exists(grandchild_pid)
+        ) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not psutil.pid_exists(parent_pid), (
+            f"parent pid {parent_pid} still exists"
+        )
+        assert not psutil.pid_exists(grandchild_pid), (
+            f"grandchild pid {grandchild_pid} still exists"
+        )
+        taz_client.ping()
+
+    def test_cancel_with_nonzero_signal_kills_task(self, taz_client: TazClient) -> None:
+        sleep_s = 10
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py(f"import time; time.sleep({sleep_s})")
+        )
+
+        # Use SIGTERM (signal 15) to request termination.
+        accepted = taz_client.task.cancel(task.task_id, signal=15)
+        assert accepted is True
+
+        deadline = time.monotonic() + 5
+        status = taz_client.task.status(task.task_id)
+        while status.state == TaskState.RUNNING:
+            assert time.monotonic() < deadline, "task never left RUNNING"
+            time.sleep(0.05)
+            status = taz_client.task.status(task.task_id)
+
+        assert status.state == TaskState.CANCELLED
+        taz_client.ping()
+
+    def test_cancel_finished_task_returns_accepted_false(
+        self, taz_client: TazClient
+    ) -> None:
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py("import sys; sys.exit(0)")
+        )
+
+        deadline = time.monotonic() + 5
+        status = taz_client.task.status(task.task_id)
+        while status.state == TaskState.RUNNING:
+            assert time.monotonic() < deadline, "task never left RUNNING"
+            time.sleep(0.05)
+            status = taz_client.task.status(task.task_id)
+
+        assert status.state == TaskState.COMPLETED
+
+        accepted = taz_client.task.cancel(task.task_id)
+        assert accepted is False
+        taz_client.ping()
+
+    def test_cancel_with_invalid_signal_raises_invalid_request(
+        self, taz_client: TazClient
+    ) -> None:
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py("import time; time.sleep(10)")
+        )
+
+        # Use an obviously invalid signal number (far beyond typical range).
+        with pytest.raises(TazError) as exc_info:
+            taz_client.task.cancel(task.task_id, signal=999)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_INVALID_REQUEST
+
+        # Clean up: cancel the task properly to avoid leaving it running.
+        taz_client.task.cancel(task.task_id, signal=0)
+        taz_client.ping()
+
+    def test_cancel_unknown_task_raises_not_found(self, taz_client: TazClient) -> None:
+        with pytest.raises(TazError) as exc_info:
+            taz_client.task.cancel(999999)
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_capabilities_advertise_task_cancel(self, taz_client: TazClient) -> None:
+        ops = set(taz_client.capabilities().operations)
+        assert common_pb2.OPCODE_TASK_CANCEL in ops
+
+
+class TestPriority:
+    """A CRITICAL-priority detached task's FAILED escalation (protocol.md
+    §10.2) delivered out of band on the ``DETACH`` stream."""
+
+    def test_raise_policy_interrupts_discrete_call_and_connection_stays_usable(
+        self, taz_client: TazClient
+    ) -> None:
+        task = taz_client.task.detach(
+            taz_client.command.exec,
+            PY,
+            args=_py("import sys; sys.exit(1)"),
+            error_priority="critical",
+        )
+
+        with pytest.raises(TazPriorityError) as exc_info:
+            taz_client.command.exec(PY, args=_py("import time; time.sleep(2)"))
+
+        err = exc_info.value
+        assert err.task_id == task.task_id
+        assert err.error.code == common_pb2.ERROR_CODE_INTERNAL
+        assert err.error.message == "exit code 1"
+
+        # The connection stays usable, and the interrupted 2 s exec's late
+        # RESPONSE, which arrives while this 3 s call is in flight, is
+        # discarded rather than buffered or delivered here.
+        taz_client.ping()
+        result = taz_client.command.exec(
+            PY, args=_py("import sys, time; time.sleep(3); sys.exit(42)")
+        )
+        assert result.exit_code == 42
+        assert not taz_client._dispatcher._buffer
+        assert not taz_client._dispatcher._closed
+
+    def test_queue_policy_appends_to_priority_errors_without_raising(
+        self, daemon: Daemon
+    ) -> None:
+        with TazClient("127.0.0.1", daemon.port, priority_policy="queue") as client:
+            task = client.task.detach(
+                client.command.exec,
+                PY,
+                args=_py("import sys; sys.exit(1)"),
+                error_priority="critical",
+            )
+
+            result = client.command.exec(PY, args=_py("import time; time.sleep(2)"))
+            assert result.exit_code == 0
+
+            assert len(client.priority_errors) == 1
+            err = client.priority_errors[0]
+            assert err.task_id == task.task_id
+            assert err.error.code == common_pb2.ERROR_CODE_INTERNAL
+            assert err.error.message == "exit code 1"
+            client.ping()
+
+
+class TestTaskLifetime:
+    """A detached task's process tree is scoped to the connection that owns
+    it, running tasks don't starve other requests on the same connection,
+    and the plan's demo snippet works end to end."""
+
+    def test_sigterm_before_any_client_connects_exits_cleanly(
+        self, daemon: Daemon
+    ) -> None:
+        # The SIGTERM tree kill used to mistake the listening socket for a
+        # connection until the first client connected, and crash.
+        daemon.stop()
+        if sys.platform != "win32":
+            assert daemon.proc.returncode == 0 or "LeakSanitizer" in daemon.stderr
+
+    def test_interleaved_synchronous_calls_succeed_while_a_task_runs(
+        self, taz_client: TazClient
+    ) -> None:
+        sleep_s = 3
+        task = taz_client.task.detach(
+            taz_client.command.exec,
+            PY,
+            args=_py(f"import time; time.sleep({sleep_s})"),
+        )
+        for i in range(5):
+            result = taz_client.command.exec(PY, args=_py(f"import sys; sys.exit({i})"))
+            assert result.exit_code == i
+
+        deadline = time.monotonic() + sleep_s + 5
+        status = taz_client.task.status(task.task_id)
+        while status.state == TaskState.RUNNING:
+            assert time.monotonic() < deadline, "task never left RUNNING"
+            time.sleep(0.05)
+            status = taz_client.task.status(task.task_id)
+        assert status.state == TaskState.COMPLETED
+        taz_client.ping()
+
+    def test_closing_connection_kills_detached_task_tree(self, daemon: Daemon) -> None:
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        task = victim.task.detach(
+            victim.command.exec, PY, args=_py("import time; time.sleep(60)")
+        )
+        pid = task.pid
+        assert psutil.pid_exists(pid)
+
+        # Abrupt teardown: close the socket with the task still running.
+        victim.close()
+
+        with TazClient("127.0.0.1", daemon.port) as other:
+            start = time.monotonic()
+            other.version()
+            assert time.monotonic() - start < 2.0
+
+            # conn_close kills every task's tree; a wide margin, not a tight
+            # bound, per the lifetime hazard notes.
+            deadline = time.monotonic() + 2.0
+            while not _process_gone(pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert _process_gone(pid), f"pid {pid} still exists"
+
+            # The daemon itself agrees, from a second connection, that the
+            # pid is gone - not just the OS-level check above.
+            with pytest.raises(TazError) as exc_info:
+                other.process.info(pid)
+            assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_concurrency_ten_detached_sleeps_do_not_starve_other_requests(
+        self, taz_client: TazClient, tmp_path: Path
+    ) -> None:
+        sleep_s = 3
+        tasks = [
+            taz_client.task.detach(
+                taz_client.command.exec,
+                PY,
+                args=_py(f"import time; time.sleep({sleep_s})"),
+            )
+            for _ in range(10)
+        ]
+
+        start = time.monotonic()
+        taz_client.file.stat(str(tmp_path))
+        assert time.monotonic() - start < 2.0
+
+        deadline = time.monotonic() + sleep_s + 5
+        for task in tasks:
+            status = taz_client.task.status(task.task_id)
+            while status.state == TaskState.RUNNING:
+                assert time.monotonic() < deadline, "task never left RUNNING"
+                time.sleep(0.05)
+                status = taz_client.task.status(task.task_id)
+            assert status.state == TaskState.COMPLETED
+        taz_client.ping()
+
+    def test_demo_detach_status_cancel(self, taz_client: TazClient) -> None:
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py("import time; time.sleep(10)")
+        )
+        print(f"Task {task.task_id} running (PID {task.pid})")
+        assert task.task_id != 0
+        assert task.pid > 0
+        assert taz_client.task.status(task.task_id).state == TaskState.RUNNING
+
+        accepted = taz_client.task.cancel(task.task_id)
+        assert accepted is True
+
+        deadline = time.monotonic() + 5
+        status = taz_client.task.status(task.task_id)
+        while status.state == TaskState.RUNNING:
+            assert time.monotonic() < deadline, "task never left RUNNING"
+            time.sleep(0.05)
+            status = taz_client.task.status(task.task_id)
+        assert status.state == TaskState.CANCELLED
+        taz_client.ping()
 
 
 class TestConfigGet:

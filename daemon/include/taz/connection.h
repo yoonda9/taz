@@ -28,6 +28,10 @@ extern "C"
         unsigned int refcount; /* 1 = alive; uv_write increments, done/close
                                   decrements */
         int closing;           /* 1 once teardown begins; gates new writes */
+        /* Links in connection.c's list of every connection not yet freed,
+         * which the SIGTERM tree kill walks. */
+        struct taz_conn_s *prev;
+        struct taz_conn_s *next;
         uint8_t read_buf[TAZ_CONN_READ_BUF_SIZE];
     } taz_conn_t;
 
@@ -39,6 +43,13 @@ extern "C"
     /* Passed to uv_listen as on_connect: accepts, allocates taz_conn_t,
      * sends CAPABILITY, starts reading. */
     void taz_conn_on_new_connection(uv_stream_t *server, int status);
+
+    /* Kill every detached task's process tree on every connection open on
+     * loop, without closing the connections themselves (a closing
+     * connection already killed its own). SIGTERM calls it once,
+     * synchronously, before the loop may stop, so no detached tree outlives
+     * the daemon. A no-op if no connection is open. */
+    void taz_conn_kill_all_task_trees(const uv_loop_t *loop);
 
     /* Process one frame event from the reassembly state machine.
      * Exposed for unit tests; production code uses a static wrapper.

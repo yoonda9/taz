@@ -43,6 +43,16 @@ extern "C"
                         taz_v1_ErrorCode code, const char *message,
                         const char *detail);
 
+    /* Like taz_error_send, but sets FRAME_FLAG_PRIORITY (protocol.md
+     * §10.2) on the frame - used for a detached task's CRITICAL-priority
+     * FAILED notification, delivered on the task's originating stream_id
+     * ahead of whatever else is queued for the connection. message and
+     * detail may be NULL. */
+    void taz_error_send_priority(taz_dispatch_write_fn_t write_fn, void *ctx,
+                                 uint32_t stream_id, uint16_t opcode,
+                                 taz_v1_ErrorCode code, const char *message,
+                                 const char *detail);
+
 #ifdef __cplusplus
 }
 #endif

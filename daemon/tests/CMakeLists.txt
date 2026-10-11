@@ -15,6 +15,11 @@ target_link_libraries(taz_test_sleeper PRIVATE taz_warnings libuv::uv_a)
 add_executable(taz_test_grandchild grandchild.c)
 target_link_libraries(taz_test_grandchild PRIVATE taz_warnings libuv::uv_a)
 
+# Cross-platform helper for the DETACH FAILED tests: exits immediately with
+# a caller-chosen status. Test-only, not installed.
+add_executable(taz_test_exiter exiter.c)
+target_link_libraries(taz_test_exiter PRIVATE taz_warnings)
+
 add_executable(
     taz_tests
     test_proto.cpp
@@ -27,12 +32,17 @@ add_executable(
     test_config.cpp
     test_log.cpp
     test_task_registry.cpp
+    test_task.cpp
     test_timeout.cpp
     test_run_as.cpp
     test_error.cpp
     test_response.cpp
     test_exec.cpp
     test_command.cpp
+    test_detach.cpp
+    test_task_status.cpp
+    test_task_cancel.cpp
+    test_lifetime.cpp
     test_work.cpp
     test_fsutil.cpp
     test_crc32c.cpp
@@ -53,6 +63,7 @@ target_include_directories(taz_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(
     taz_tests
     PRIVATE TAZ_TEST_SLEEPER_PATH="$<TARGET_FILE:taz_test_sleeper>"
-            TAZ_TEST_GRANDCHILD_PATH="$<TARGET_FILE:taz_test_grandchild>")
+            TAZ_TEST_GRANDCHILD_PATH="$<TARGET_FILE:taz_test_grandchild>"
+            TAZ_TEST_EXITER_PATH="$<TARGET_FILE:taz_test_exiter>")
 
 gtest_discover_tests(taz_tests)

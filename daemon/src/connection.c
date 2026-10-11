@@ -8,6 +8,7 @@
 #include "taz/frame.h"
 #include "taz/payload.h"
 #include "taz/reassembly.h"
+#include "taz/task.h"
 #include "taz/v1/common.pb.h"
 
 /* Heap-allocated write request; owns the frame data.  The uv_write_t must be
@@ -18,6 +19,38 @@ typedef struct
     taz_conn_t *conn;
     /* Frame bytes follow immediately after the struct. */
 } write_req_t;
+
+/* Every connection from uv_tcp_init until it is freed, loop thread only. */
+static taz_conn_t *g_conns = NULL;
+
+static void conn_link(taz_conn_t *conn)
+{
+    conn->prev = NULL;
+    conn->next = g_conns;
+    if (g_conns != NULL)
+    {
+        g_conns->prev = conn;
+    }
+    g_conns = conn;
+}
+
+static void conn_unlink(taz_conn_t *conn)
+{
+    if (conn->prev != NULL)
+    {
+        conn->prev->next = conn->next;
+    }
+    else
+    {
+        g_conns = conn->next;
+    }
+    if (conn->next != NULL)
+    {
+        conn->next->prev = conn->prev;
+    }
+    conn->prev = NULL;
+    conn->next = NULL;
+}
 
 static void on_write_done(uv_write_t *req, int status);
 static void on_close_cb(uv_handle_t *handle);
@@ -38,6 +71,10 @@ static void conn_unref(taz_conn_t *conn)
     conn->refcount--;
     if (conn->refcount == 0U && conn->closing)
     {
+        /* Every exec and subscription held a reference, so nothing can
+         * reach the task table any more. */
+        conn_unlink(conn);
+        taz_task_table_free(&conn->dispatch.tasks);
         free(conn);
     }
 }
@@ -336,6 +373,7 @@ void taz_conn_on_new_connection(uv_stream_t *server, int status)
         return;
     }
     conn->handle.data = conn;
+    conn_link(conn);
 
     rc = uv_accept(server, (uv_stream_t *)&conn->handle);
     if (rc != 0)
@@ -351,5 +389,16 @@ void taz_conn_on_new_connection(uv_stream_t *server, int status)
     {
         conn_close(conn);
         return;
+    }
+}
+
+void taz_conn_kill_all_task_trees(const uv_loop_t *loop)
+{
+    for (taz_conn_t *conn = g_conns; conn != NULL; conn = conn->next)
+    {
+        if (!conn->closing && conn->dispatch.loop == loop)
+        {
+            taz_task_table_abort(&conn->dispatch.tasks);
+        }
     }
 }

@@ -90,9 +90,10 @@ const char *taz_error_fs_detail(const uv_fs_t *req)
     return uv_strerror((int)req->result);
 }
 
-void taz_error_send(taz_dispatch_write_fn_t write_fn, void *ctx,
-                    uint32_t stream_id, uint16_t opcode, taz_v1_ErrorCode code,
-                    const char *message, const char *detail)
+static void error_send_with_flags(taz_dispatch_write_fn_t write_fn, void *ctx,
+                                  uint32_t stream_id, uint16_t opcode,
+                                  uint8_t flags, taz_v1_ErrorCode code,
+                                  const char *message, const char *detail)
 {
     uint8_t buf[ERROR_SEND_BUFSZ];
     uint8_t payload[TAZ_FRAME_MAX_PAYLOAD_ERROR];
@@ -106,7 +107,7 @@ void taz_error_send(taz_dispatch_write_fn_t write_fn, void *ctx,
     }
 
     h.type = (uint8_t)taz_v1_FrameType_FRAME_TYPE_ERROR;
-    h.flags = (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE;
+    h.flags = flags;
     h.opcode = opcode;
     h.length = (uint32_t)pay_len;
     h.stream_id = stream_id;
@@ -114,4 +115,23 @@ void taz_error_send(taz_dispatch_write_fn_t write_fn, void *ctx,
     (void)memcpy(buf + TAZ_FRAME_HEADER_SIZE, payload, pay_len);
 
     write_fn(buf, (size_t)(TAZ_FRAME_HEADER_SIZE + pay_len), ctx);
+}
+
+void taz_error_send(taz_dispatch_write_fn_t write_fn, void *ctx,
+                    uint32_t stream_id, uint16_t opcode, taz_v1_ErrorCode code,
+                    const char *message, const char *detail)
+{
+    error_send_with_flags(write_fn, ctx, stream_id, opcode,
+                          (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_NONE, code,
+                          message, detail);
+}
+
+void taz_error_send_priority(taz_dispatch_write_fn_t write_fn, void *ctx,
+                             uint32_t stream_id, uint16_t opcode,
+                             taz_v1_ErrorCode code, const char *message,
+                             const char *detail)
+{
+    error_send_with_flags(write_fn, ctx, stream_id, opcode,
+                          (uint8_t)taz_v1_FrameFlag_FRAME_FLAG_PRIORITY, code,
+                          message, detail);
 }

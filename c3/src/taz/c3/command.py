@@ -32,6 +32,35 @@ class CommandNamespace:
     def __init__(self, client: TazClient) -> None:
         self._client = client
 
+    def build_exec_request(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        working_dir: str | None = None,
+        timeout_ms: int = 0,
+        as_user: str = "",
+    ) -> command_pb2.CommandExecRequest:
+        """Build a ``CommandExecRequest`` from ``exec``'s own arguments.
+
+        Shared with ``client.task.detach(client.command.exec, ...)``, which
+        wraps the result in a ``DetachRequest`` instead of sending it as a
+        ``COMMAND_EXEC`` request directly.
+        """
+        req = command_pb2.CommandExecRequest(
+            command=command, timeout_ms=timeout_ms, as_user=as_user
+        )
+        if args:
+            req.args.extend(args)
+        if env:
+            for key, value in env.items():
+                kv = req.env.add()
+                kv.key = key
+                kv.value = value
+        if working_dir:
+            req.working_dir = working_dir
+        return req
+
     def exec(
         self,
         command: str,
@@ -50,18 +79,9 @@ class CommandNamespace:
         identity for this call only; the daemon answers NOT_SUPPORTED unless
         it is privileged.
         """
-        req = command_pb2.CommandExecRequest(
-            command=command, timeout_ms=timeout_ms, as_user=as_user
+        req = self.build_exec_request(
+            command, args, env, working_dir, timeout_ms, as_user
         )
-        if args:
-            req.args.extend(args)
-        if env:
-            for key, value in env.items():
-                kv = req.env.add()
-                kv.key = key
-                kv.value = value
-        if working_dir:
-            req.working_dir = working_dir
         resp = self._client._call(
             common_pb2.OPCODE_COMMAND_EXEC,
             req.SerializeToString(),

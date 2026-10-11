@@ -480,6 +480,149 @@ TEST(CommandSendExecResponse, LargeOutputSplitsAcrossFrames)
 }
 
 // ---------------------------------------------------------------------------
+// taz_command_encode_exec_response: decodes to the same CommandExecResponse
+// taz_command_send_exec_response's RESPONSE frame(s) carry, for the same
+// taz_exec_result_t.
+// ---------------------------------------------------------------------------
+
+taz_v1_CommandExecResponse decode_via_send(const taz_exec_result_t &result)
+{
+    WriteCtx wctx;
+    taz_command_send_exec_response(
+        capture_write, &wctx, 1U,
+        static_cast<uint16_t>(taz_v1_Opcode_OPCODE_COMMAND_EXEC), &result);
+
+    taz_v1_CommandExecResponse decoded = taz_v1_CommandExecResponse_init_zero;
+    std::vector<uint8_t> out_decoded;
+    std::vector<uint8_t> err_decoded;
+    decoded.stdout_data.funcs.decode = collect_bytes_cb;
+    decoded.stdout_data.arg = &out_decoded;
+    decoded.stderr_data.funcs.decode = collect_bytes_cb;
+    decoded.stderr_data.arg = &err_decoded;
+    for (const auto &frame : wctx.frames)
+    {
+        EXPECT_TRUE(decode_exec_response(frame, &decoded));
+    }
+    return decoded;
+}
+
+TEST(CommandEncodeExecResponse, MatchesSendPathForSmallOutput)
+{
+    const std::vector<uint8_t> out_data{'h', 'e', 'l', 'l', 'o'};
+    const std::vector<uint8_t> err_data{'o', 'o', 'p', 's'};
+    taz_exec_result_t result = make_result(out_data.data(), out_data.size(),
+                                           err_data.data(), err_data.size());
+    result.exit_status = 7;
+    result.timed_out = true;
+    result.truncated = true;
+
+    uint8_t *buf = nullptr;
+    size_t len = 0U;
+    ASSERT_TRUE(taz_command_encode_exec_response(&result, &buf, &len));
+    ASSERT_NE(buf, nullptr);
+
+    taz_v1_CommandExecResponse decoded = taz_v1_CommandExecResponse_init_zero;
+    std::vector<uint8_t> out_decoded;
+    std::vector<uint8_t> err_decoded;
+    decoded.stdout_data.funcs.decode = collect_bytes_cb;
+    decoded.stdout_data.arg = &out_decoded;
+    decoded.stderr_data.funcs.decode = collect_bytes_cb;
+    decoded.stderr_data.arg = &err_decoded;
+    pb_istream_t istream = pb_istream_from_buffer(buf, len);
+    ASSERT_TRUE(
+        pb_decode(&istream, taz_v1_CommandExecResponse_fields, &decoded));
+    free(buf);
+
+    // Pins timed_out=true through the encode path, not just agreement
+    // between two results that both default it to false.
+    EXPECT_TRUE(decoded.timed_out);
+    const taz_v1_CommandExecResponse sent = decode_via_send(result);
+    EXPECT_EQ(decoded.exit_code, sent.exit_code);
+    EXPECT_EQ(decoded.timed_out, sent.timed_out);
+    EXPECT_EQ(decoded.truncated, sent.truncated);
+    EXPECT_EQ(out_decoded, out_data);
+    EXPECT_EQ(err_decoded, err_data);
+}
+
+#ifndef _WIN32
+TEST(CommandEncodeExecResponse, ExitCodeIsNegatedSignalWhenSignalled)
+{
+    taz_exec_result_t result = make_result(nullptr, 0U, nullptr, 0U);
+    result.exit_status = 0;
+    result.term_signal = 9; // SIGKILL
+
+    uint8_t *buf = nullptr;
+    size_t len = 0U;
+    ASSERT_TRUE(taz_command_encode_exec_response(&result, &buf, &len));
+    ASSERT_NE(buf, nullptr);
+
+    taz_v1_CommandExecResponse decoded = taz_v1_CommandExecResponse_init_zero;
+    pb_istream_t istream = pb_istream_from_buffer(buf, len);
+    ASSERT_TRUE(
+        pb_decode(&istream, taz_v1_CommandExecResponse_fields, &decoded));
+    free(buf);
+
+    EXPECT_EQ(decoded.exit_code, -9);
+    const taz_v1_CommandExecResponse sent = decode_via_send(result);
+    EXPECT_EQ(decoded.exit_code, sent.exit_code);
+}
+#endif
+
+TEST(CommandEncodeExecResponse, EmptyResultYieldsEmptyBufferThatStillDecodes)
+{
+    taz_exec_result_t result = make_result(nullptr, 0U, nullptr, 0U);
+    result.exit_status = 0;
+
+    uint8_t *buf = reinterpret_cast<uint8_t *>(0x1); // sentinel, must be unset
+    size_t len = 123U;
+    ASSERT_TRUE(taz_command_encode_exec_response(&result, &buf, &len));
+    EXPECT_EQ(buf, nullptr);
+    EXPECT_EQ(len, 0U);
+
+    // An empty payload decodes to every field at its proto3 default, which
+    // is exactly what the send path's "EmptyOutputsOmitFieldsButStayValid"
+    // row observes for the same result.
+    taz_v1_CommandExecResponse decoded = taz_v1_CommandExecResponse_init_zero;
+    pb_istream_t istream = pb_istream_from_buffer(buf, len);
+    ASSERT_TRUE(
+        pb_decode(&istream, taz_v1_CommandExecResponse_fields, &decoded));
+    EXPECT_EQ(decoded.exit_code, 0);
+    EXPECT_FALSE(decoded.timed_out);
+    EXPECT_FALSE(decoded.truncated);
+}
+
+TEST(CommandEncodeExecResponse, MatchesSendPathForLargeOutputSplitAcrossFrames)
+{
+    static const size_t kOutSize = 300000U;
+    std::vector<uint8_t> out_data(kOutSize);
+    for (size_t i = 0U; i < kOutSize; i++)
+    {
+        out_data[i] = static_cast<uint8_t>(i % 256U);
+    }
+    taz_exec_result_t result =
+        make_result(out_data.data(), out_data.size(), nullptr, 0U);
+    result.exit_status = 0;
+
+    uint8_t *buf = nullptr;
+    size_t len = 0U;
+    ASSERT_TRUE(taz_command_encode_exec_response(&result, &buf, &len));
+    ASSERT_NE(buf, nullptr);
+
+    taz_v1_CommandExecResponse decoded = taz_v1_CommandExecResponse_init_zero;
+    std::vector<uint8_t> out_decoded;
+    decoded.stdout_data.funcs.decode = collect_bytes_cb;
+    decoded.stdout_data.arg = &out_decoded;
+    pb_istream_t istream = pb_istream_from_buffer(buf, len);
+    ASSERT_TRUE(
+        pb_decode(&istream, taz_v1_CommandExecResponse_fields, &decoded));
+    free(buf);
+
+    EXPECT_EQ(out_decoded, out_data);
+    EXPECT_EQ(decoded.exit_code, 0);
+    EXPECT_FALSE(decoded.truncated);
+}
+
+// ---------------------------------------------------------------------------
 // handle_command_exec: the effective-timeout snapshot (connection default
 // vs per-call override, taken before taz_exec_start so a later TIMEOUT_SET
 // never retargets an in-flight exec). taz_test_sleeper (built from

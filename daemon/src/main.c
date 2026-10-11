@@ -9,6 +9,7 @@
 #include "taz/log.h"
 #include "taz/platform.h"
 #include "taz/server.h"
+#include "taz/work.h"
 
 #define TAZ_PORT_MAX   65535
 #define TAZ_STRTOL_DEC 10
@@ -75,6 +76,11 @@ int main(int argc, char *argv[])
     }
 
     taz_log_init();
+
+    /* On SIGTERM, kill every connection's detached task trees before the
+     * loop is allowed to stop, so the daemon never leaves one running past
+     * its own exit. */
+    taz_work_set_shutdown_hook(taz_conn_kill_all_task_trees);
 
     rc = taz_server_start(&server, host, port, taz_conn_on_new_connection);
     if (rc != 0)

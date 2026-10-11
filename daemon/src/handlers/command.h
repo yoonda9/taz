@@ -1,6 +1,8 @@
 #ifndef TAZ_HANDLERS_COMMAND_H
 #define TAZ_HANDLERS_COMMAND_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "taz/dispatch.h"
@@ -43,6 +45,12 @@ extern "C"
                                     taz_v1_ErrorCode *error_code,
                                     const char **error_message);
 
+    /* Maps a taz_exec_start spawn-failure return (a UV_E* code) to the
+     * ErrorCode a caller sends back on its own request. Shared by
+     * handle_command_exec and handle_detach so a spawn failure answers
+     * COMMAND_EXEC and DETACH identically. */
+    taz_v1_ErrorCode taz_command_map_spawn_error(int rc);
+
     /* Encode *result as a CommandExecResponse and send it via
      * taz_response_send (splitting into several RESPONSE frames when the
      * combined output exceeds the single-frame limit; see response.c).
@@ -56,6 +64,17 @@ extern "C"
                                         void *ctx, uint32_t stream_id,
                                         uint16_t opcode,
                                         const taz_exec_result_t *result);
+
+    /* Encode *result as a CommandExecResponse (the same content
+     * taz_command_send_exec_response would send) into a newly malloc'd
+     * buffer. On success, out_buf and out_len together describe the
+     * encoding and the caller owns the returned buffer (free() it); a
+     * fully-default encoding (exit 0, no output, no flags) legitimately
+     * yields *out_buf == NULL and *out_len == 0. On failure (out of memory
+     * or an encode error) returns false and leaves *out_buf and *out_len
+     * untouched. */
+    bool taz_command_encode_exec_response(const taz_exec_result_t *result,
+                                          uint8_t **out_buf, size_t *out_len);
 
 #ifdef __cplusplus
 }
