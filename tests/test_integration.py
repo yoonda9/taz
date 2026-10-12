@@ -2042,9 +2042,6 @@ class TestProcessMonitor:
         # Abrupt teardown: close the socket with the stream still open,
         # mirroring TestProcessOps's 32-request mid-enumeration close test.
         victim.close()
-        # Sends nothing on the closed connection; only marks the iterator
-        # done, so it never warns as abandoned.
-        m.close()
 
         with TazClient("127.0.0.1", daemon.port) as other:
             start = time.monotonic()
@@ -2064,10 +2061,12 @@ class TestProcessMonitor:
         for i in range(8):
             victim = TazClient("127.0.0.1", daemon.port)
             victim.connect()
+            # Kept until the client closes: dropped any earlier, the open
+            # stream would be abandoned.
             m = victim.process.monitor(pid, _MONITOR_INTERVAL)
             time.sleep(sleeps_ms[i % len(sleeps_ms)] / 1000)
             victim.close()
-            m.close()
+            del m
         # Nothing further to assert here: the daemon fixture's teardown
         # audits the exit for sanitizer reports and a non-zero code - the
         # ASan/TSan oracle for a socket close racing a sample in flight.
@@ -2744,11 +2743,6 @@ class TestTaskLifetime:
         assert not reader.is_alive(), "reader thread hung"
         assert not errors, f"unexpected errors: {errors}"
         assert len(lost) == 2
-
-        # close() is idempotent and avoids an unclosed-StreamIterator
-        # ResourceWarning at gc time.
-        monitor.close()
-        status_stream.close()
         victim.close()
 
     def test_interleaved_synchronous_calls_succeed_while_a_task_runs(

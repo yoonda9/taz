@@ -109,6 +109,14 @@ class StreamIterator[T]:
             self._ended = True
             dispatcher.forget_stream(self.stream_id)
             raise
+        except BaseException:
+            # Anything else that leaves the connection closed (the client
+            # was closed, or an interrupt cut a read short) ends the stream
+            # too.
+            if self._client._conn.closed:
+                self._ended = True
+                dispatcher.forget_stream(self.stream_id)
+            raise
 
         if frame.type == common_pb2.FRAME_TYPE_ERROR:
             self._ended = True
@@ -166,8 +174,10 @@ class StreamIterator[T]:
 
     def __del__(self) -> None:
         # Never touches the socket: just warns if the stream was abandoned
-        # without close() and without running to its final frame.
-        if self._ended or self._closed:
+        # without close() and without running to its final frame. Closing
+        # the client ends every stream on it, so a stream whose connection
+        # is closed was not abandoned.
+        if self._ended or self._closed or self._client._conn.closed:
             return
         warnings.warn(
             f"unclosed StreamIterator for stream {self.stream_id}"

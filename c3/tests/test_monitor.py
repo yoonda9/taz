@@ -377,6 +377,31 @@ class TestMonitorIteration:
             next(it)
         assert it.ended
 
+    def test_next_after_the_client_closes_ends_the_stream(self) -> None:
+        client, _ = _connected_client_with_sock(_monitor_frame(continuation=True))
+        it = client.process.monitor(42)
+        next(it)
+        client.close()
+        with pytest.raises(RuntimeError, match="not connected"):
+            next(it)
+        assert it.ended
+        with pytest.raises(StopIteration):
+            next(it)
+
+    def test_interrupted_read_that_closes_the_connection_ends_the_stream(
+        self,
+    ) -> None:
+        client, _ = _connected_client_with_sock(_monitor_frame(continuation=True))
+        it = client.process.monitor(42)
+        next(it)
+        with (
+            patch.object(client._dispatcher, "_wait", side_effect=KeyboardInterrupt),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            next(it)
+        assert client.closed
+        assert it.ended
+
 
 # ---------------------------------------------------------------------------
 # close() / CANCEL on break
@@ -495,6 +520,20 @@ class TestMonitorResourceWarning:
             warnings.simplefilter("error")
             del it
             gc.collect()
+
+    def test_iterator_left_open_on_a_closed_client_does_not_warn(self) -> None:
+        # Closing the client ends every stream on it, so there is nothing
+        # left to cancel. __del__ is called directly: when the GC actually
+        # frees the iterator varies from run to run, and a warning raised
+        # as an error inside a finalizer is only printed, never propagated.
+        client, _ = _connected_client_with_sock(_monitor_frame(continuation=True))
+        it = client.process.monitor(42)
+        next(it)
+        client.close()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            it.__del__()
+        assert [w for w in caught if issubclass(w.category, ResourceWarning)] == []
 
 
 # ---------------------------------------------------------------------------
