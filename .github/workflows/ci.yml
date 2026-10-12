@@ -139,6 +139,9 @@ jobs:
       - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'valgrind') }}
         run: just test-valgrind
 
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'valgrind') }}
+        run: just test-py-valgrind
+
       - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'analyze') }}
         run: just build linux-analyze
 

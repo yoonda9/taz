@@ -95,6 +95,11 @@ test-sanitizers: (test-c "windows-asan")
 test-valgrind preset=preset: (build preset)
     {{ dev }} valgrind --build-dir daemon/build/{{ preset }}
 
+# Run the marked Valgrind integration subset (pytest)
+[unix]
+test-py-valgrind preset=preset: (build preset)
+    {{ dev }} valgrind-py --daemon daemon/build/{{ preset }}/tazd
+
 # Run each libFuzzer harness from its seed corpus for [seconds] seconds
 [unix]
 fuzz seconds="60": (build "linux-fuzz")

@@ -21,6 +21,7 @@ Subcommands:
     cmake-format [--check]
     proto-breaking       buf breaking against main (skips if main has no schemas)
     valgrind --build-dir DIR   run the C unit tests under Valgrind memcheck
+    valgrind-py --daemon PATH   run the marked Valgrind integration subset (pytest)
     coverage --build-dir DIR   gcovr report for a coverage-instrumented build
     doctor               report tools mise cannot provide / missing pinned tools
     clean                remove daemon build directories
@@ -34,6 +35,7 @@ import hashlib
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -71,10 +73,16 @@ IN_CI = bool(os.environ.get("CI"))
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-def run(cmd: Sequence[str | Path], *, cwd: Path = ROOT, check: bool = True) -> int:
+def run(
+    cmd: Sequence[str | Path],
+    *,
+    cwd: Path = ROOT,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> int:
     printable = " ".join(str(c) for c in cmd)
     print(f"$ {printable}", flush=True)
-    result = subprocess.run([str(c) for c in cmd], cwd=cwd, check=False)
+    result = subprocess.run([str(c) for c in cmd], cwd=cwd, check=False, env=env)
     if check and result.returncode != 0:
         sys.exit(result.returncode)
     return result.returncode
@@ -538,6 +546,37 @@ def cmd_valgrind(build_dir: Path) -> None:
     )
 
 
+def cmd_valgrind_py(daemon: Path) -> None:
+    valgrind = shutil.which("valgrind")
+    if valgrind is None:
+        message = "valgrind not found on PATH (system package; see `just doctor`)"
+        if IN_CI:
+            sys.exit(f"error: {message}")
+        print(f"warning: {message}; skipping")
+        return
+    wrapper = shlex.join(
+        [
+            valgrind,
+            "--tool=memcheck",
+            "--error-exitcode=99",
+            "--leak-check=full",
+            "--show-leak-kinds=definite,indirect",
+            "--errors-for-leak-kinds=definite,indirect",
+            "--track-origins=yes",
+            f"--suppressions={ROOT / 'daemon' / 'tests' / 'valgrind.supp'}",
+            "--trace-children=yes",
+            "--trace-children-skip=*python*",
+            # A RESTART's execv starts the traced image's error count afresh,
+            # so an error before the re-exec would never reach the exit code.
+            "--exit-on-first-error=yes",
+        ]
+    )
+    run(
+        [tool("uv"), "run", "pytest", "-m", "valgrind", "tests/test_integration.py"],
+        env={**os.environ, "TAZ_DAEMON": str(daemon), "TAZ_DAEMON_WRAPPER": wrapper},
+    )
+
+
 def cmd_coverage(build_dir: Path) -> None:
     out = ROOT / "out" / "coverage" / "c"
     out.mkdir(parents=True, exist_ok=True)
@@ -643,7 +682,7 @@ def cmd_doctor() -> None:
         mise_tools.append("cppcheck")
         system_tools = {"cc": "C compiler (gcc or clang)"}
         optional_tools = {
-            "valgrind": "valgrind (apt/dnf; for `just test-valgrind`)",
+            "valgrind": "valgrind (apt/dnf; for `test-valgrind`/`test-py-valgrind`)",
             "clang": "clang (apt/dnf; for `just test-c linux-clang-debug`)",
         }
 
@@ -844,6 +883,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub.add_parser("proto-breaking")
     p = sub.add_parser("valgrind")
     p.add_argument("--build-dir", type=Path, required=True)
+    p = sub.add_parser("valgrind-py")
+    p.add_argument("--daemon", type=Path, required=True)
     p = sub.add_parser("coverage")
     p.add_argument("--build-dir", type=Path, required=True)
     p = sub.add_parser("fuzz")
@@ -889,6 +930,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             cmd_proto_breaking()
         case "valgrind":
             cmd_valgrind(args.build_dir.resolve())
+        case "valgrind-py":
+            cmd_valgrind_py(args.daemon.resolve())
         case "coverage":
             cmd_coverage(args.build_dir.resolve())
         case "fuzz":

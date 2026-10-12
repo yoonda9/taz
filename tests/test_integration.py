@@ -275,6 +275,7 @@ def spawn_helper() -> Generator[
 
 
 class TestPing:
+    @pytest.mark.valgrind
     def test_ping_succeeds(self, taz_client: TazClient) -> None:
         taz_client.ping()
 
@@ -286,6 +287,7 @@ class TestPing:
 
 
 class TestVersion:
+    @pytest.mark.valgrind
     def test_version_matches_project_version(self, taz_client: TazClient) -> None:
         # build_info.c is generated from the CMake project version; a fallback
         # or stale value would differ.
@@ -296,6 +298,7 @@ class TestVersion:
 
 
 class TestCapabilities:
+    @pytest.mark.valgrind
     def test_capabilities_contains_expected_opcodes(
         self, taz_client: TazClient
     ) -> None:
@@ -435,6 +438,7 @@ class TestCommandExec:
         cap = taz_client.capabilities()
         assert common_pb2.OPCODE_COMMAND_EXEC in set(cap.operations)
 
+    @pytest.mark.valgrind
     def test_demo_round_trip(self, taz_client: TazClient) -> None:
         result = taz_client.command.exec(PY, args=["-c", "print('demo')"])
         assert result.exit_code == 0
@@ -539,6 +543,7 @@ class TestConnectionTimeout:
         assert result.exit_code == 0
         assert result.timed_out is False
 
+    @pytest.mark.valgrind
     def test_returns_previous_default(self, taz_client: TazClient) -> None:
         assert taz_client.timeout(500) == 0
         assert taz_client.timeout(1000) == 500
@@ -578,6 +583,30 @@ class TestRunAs:
     """``RUN_AS`` (0x0040) is POSIX-only, gated by the daemon's *real*
     privilege (not a client-side switch), and deferred entirely on
     Windows. Most of this class only runs when euid is 0."""
+
+    @pytest.mark.valgrind
+    @_UNPRIVILEGED_ONLY
+    def test_not_privileged_raw_run_as_frame_gets_not_supported_from_daemon(
+        self, taz_client: TazClient
+    ) -> None:
+        # The client refuses RUN_AS locally when it is unadvertised, so
+        # pretend it was advertised: the frame then reaches the daemon's
+        # own privilege check.
+        caps = taz_client._conn._capabilities
+        assert caps is not None
+        caps.operations.append(common_pb2.OPCODE_RUN_AS)
+        req = advanced_pb2.RunAsRequest(user="someone")
+        stream_id = taz_client._conn.send_request(
+            common_pb2.OPCODE_RUN_AS, req.SerializeToString()
+        )
+        frame = taz_client._dispatcher.recv_response(
+            stream_id, taz_client._keepalive, expected_opcode=common_pb2.OPCODE_RUN_AS
+        )
+        assert frame.type == common_pb2.FRAME_TYPE_ERROR
+        info = common_pb2.ErrorInfo()
+        info.ParseFromString(frame.payload)
+        assert info.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
+        taz_client.ping()
 
     @_UNPRIVILEGED_ONLY
     def test_not_privileged_run_as_raises_not_supported_and_sends_nothing(
@@ -759,6 +788,7 @@ class TestFileOps:
 
     _posix = sys.platform != "win32"
 
+    @pytest.mark.valgrind
     def test_create_then_stat_reports_metadata(
         self, taz_client: TazClient, tmp_path: Path
     ) -> None:
@@ -772,6 +802,7 @@ class TestFileOps:
         if self._posix:
             assert info.owner != ""
 
+    @pytest.mark.valgrind
     def test_chmod_changes_permissions(
         self, taz_client: TazClient, tmp_path: Path
     ) -> None:
@@ -787,6 +818,7 @@ class TestFileOps:
             assert taz_client.file.stat(str(path)).permissions & 0o222 == 0
             assert os.access(path, os.W_OK) is False
 
+    @pytest.mark.valgrind
     def test_delete_removes_file_and_stat_then_raises_not_found(
         self, taz_client: TazClient, tmp_path: Path
     ) -> None:
@@ -891,6 +923,7 @@ class TestFileOps:
 class TestDirectoryOps:
     """``DIR_MAKE``/``LIST``/``REMOVE`` through the typed client API."""
 
+    @pytest.mark.valgrind
     def test_make_then_stat_reports_kind_dir(
         self, taz_client: TazClient, tmp_path: Path
     ) -> None:
@@ -922,6 +955,7 @@ class TestDirectoryOps:
         for level in (tmp_path / "a", tmp_path / "a" / "b", leaf):
             assert taz_client.file.stat(str(level)).kind == Kind.DIR
 
+    @pytest.mark.valgrind
     def test_list_reports_kind_and_size_per_entry(
         self, taz_client: TazClient, tmp_path: Path
     ) -> None:
@@ -973,6 +1007,7 @@ class TestDirectoryOps:
             taz_client.directory.list(str(tmp_path / "no-such-dir"))
         assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
 
+    @pytest.mark.valgrind
     def test_remove_empty_directory(
         self, taz_client: TazClient, tmp_path: Path
     ) -> None:
@@ -1051,6 +1086,7 @@ class TestFileTransfer:
         leftover = [p.name for p in directory.iterdir() if ".taz-" in p.name]
         assert leftover == [], f"leftover temp files in {directory}: {leftover}"
 
+    @pytest.mark.valgrind
     @pytest.mark.parametrize("size", [1024, 0, 4 * 1024 * 1024 + 1])
     def test_round_trip_bytes_and_checksum_match(
         self, taz_client: TazClient, tmp_path: Path, size: int
@@ -1277,6 +1313,7 @@ class TestFileTransfer:
 
         assert downloaded.read_bytes() == data
 
+    @pytest.mark.valgrind
     def test_cancel_unknown_stream_returns_false(self, taz_client: TazClient) -> None:
         assert taz_client.cancel(0xDEAD) is False
 
@@ -1526,6 +1563,7 @@ class TestFileTransfer:
 class TestProcessOps:
     """``PROCESS_LIST``/``KILL``/``INFO`` through the typed client API."""
 
+    @pytest.mark.valgrind
     def test_list_includes_daemon_pid_with_psutil_cross_checks(
         self, taz_client: TazClient, daemon: Daemon
     ) -> None:
@@ -1585,6 +1623,7 @@ class TestProcessOps:
         else:
             assert info.open_files == []
 
+    @pytest.mark.valgrind
     def test_kill_then_info_and_kill_again_not_found(
         self,
         taz_client: TazClient,
@@ -1970,6 +2009,7 @@ class TestProcessMonitor:
         taz_client.ping()
         taz_client.version()
 
+    @pytest.mark.valgrind
     def test_demo_monitor_cpu_and_memory(
         self,
         taz_client: TazClient,
@@ -2416,6 +2456,7 @@ class TestPriority:
     """A CRITICAL-priority detached task's FAILED escalation (protocol.md
     §10.2) delivered out of band on the ``DETACH`` stream."""
 
+    @pytest.mark.valgrind
     def test_raise_policy_interrupts_discrete_call_and_connection_stays_usable(
         self, taz_client: TazClient
     ) -> None:
@@ -2472,6 +2513,7 @@ class TestTaskLifetime:
     it, running tasks don't starve other requests on the same connection,
     and the plan's demo snippet works end to end."""
 
+    @pytest.mark.valgrind
     def test_sigterm_before_any_client_connects_exits_cleanly(
         self, daemon: Daemon
     ) -> None:
@@ -2479,6 +2521,7 @@ class TestTaskLifetime:
         # connection until the first client connected, and crash.
         daemon.stop()
 
+    @pytest.mark.valgrind
     def test_sigterm_with_infly_exec_stops_gracefully(
         self, taz_client: TazClient, daemon: Daemon, tmp_path: Path
     ) -> None:
@@ -2522,6 +2565,7 @@ class TestTaskLifetime:
         assert _wait_process_gone(child_pid), f"child pid {child_pid} still exists"
         victim.close()
 
+    @pytest.mark.valgrind
     def test_sigterm_with_detached_task_stops_gracefully(
         self, taz_client: TazClient, daemon: Daemon
     ) -> None:
@@ -2786,6 +2830,7 @@ class TestTaskLifetime:
             assert status.state == TaskState.COMPLETED
         taz_client.ping()
 
+    @pytest.mark.valgrind
     def test_demo_detach_status_cancel(self, taz_client: TazClient) -> None:
         task = taz_client.task.detach(
             taz_client.command.exec, PY, args=_py("import time; time.sleep(10)")
@@ -2816,6 +2861,7 @@ class TestRestart:
         ops = set(taz_client.capabilities().operations)
         assert common_pb2.OPCODE_RESTART in ops
 
+    @pytest.mark.valgrind
     def test_restart_500ms_reconnects_on_same_port_with_matching_version(
         self, daemon: Daemon
     ) -> None:
@@ -2839,6 +2885,7 @@ class TestRestart:
         assert effective == 100
         daemon.await_restart(timeout=10 * daemon.timing_scale)
 
+    @pytest.mark.valgrind
     def test_restart_terminates_a_detached_task_and_drops_its_state(
         self, taz_client: TazClient, daemon: Daemon
     ) -> None:
@@ -3014,6 +3061,7 @@ class TestRestart:
 
 
 class TestConfigGet:
+    @pytest.mark.valgrind
     def test_config_get_all_returns_defaults(self, taz_client: TazClient) -> None:
         cfg = taz_client.config_get()
         assert cfg == {
@@ -3035,6 +3083,7 @@ class TestConfigGet:
 
 
 class TestConfigUpdate:
+    @pytest.mark.valgrind
     def test_config_update_then_get_reflects_change(
         self, taz_client: TazClient
     ) -> None:
@@ -3065,6 +3114,7 @@ class TestConfigUpdate:
 class TestLog:
     """``LOG`` (0x0042) returns ring-buffered diagnostic entries."""
 
+    @pytest.mark.valgrind
     def test_log_returns_entries_after_several_execs(
         self, taz_client: TazClient
     ) -> None:

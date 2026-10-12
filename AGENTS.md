@@ -76,6 +76,7 @@ TAZ layer.
 - `just test-py` — pytest (extra args forwarded)
 - `just test-sanitizers` — ASan+UBSan, TSan (Linux); ASan (Windows)
 - `just test-valgrind` — Valgrind memcheck
+- `just test-py-valgrind` — the marked Valgrind integration subset (Linux only)
 - `just analyze` — compiler static analyzer (GCC -fanalyzer / MSVC /analyze)
 - `just coverage` — gcov + pytest-cov, reports under `out/coverage/`
 
