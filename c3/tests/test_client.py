@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import socket
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 from taz.c3.client import TazClient
-from taz.c3.errors import TazConnectionLost, TazError
+from taz.c3.errors import TazConnectionLost, TazError, TazProtocolError
 from taz.c3.protocol.frame import Frame, pack_header
 from taz.c3.settings import Keepalive
 from taz.v1 import common_pb2, daemon_control_pb2
@@ -79,6 +81,15 @@ def _response_bytes(
         )
     )
     return header + payload
+
+
+def _restart_response_bytes(effective_delay_ms: int, stream_id: int = 1) -> bytes:
+    resp = daemon_control_pb2.RestartResponse(
+        acknowledged=True, effective_delay_ms=effective_delay_ms
+    )
+    return _response_bytes(
+        common_pb2.OPCODE_RESTART, resp.SerializeToString(), stream_id=stream_id
+    )
 
 
 def _error_bytes(
@@ -439,3 +450,124 @@ class TestPriorityPolicyPassthrough:
         err = TazPriorityError(7, 1, TazError(common_pb2.ERROR_CODE_INTERNAL, "boom"))
         client._dispatcher.priority_errors.append(err)
         assert client.priority_errors == [err]
+
+
+# ---------------------------------------------------------------------------
+# restart() / closed property
+# ---------------------------------------------------------------------------
+
+_RESTART_OPS: list[int] = [common_pb2.OPCODE_RESTART, common_pb2.OPCODE_VERSION]
+
+
+class TestRestart:
+    def test_returns_effective_delay_ms_and_closes_on_eof(self) -> None:
+        client = _connected_client(
+            _restart_response_bytes(100), operations=_RESTART_OPS
+        )
+        effective = client.restart(delay_ms=0)
+        assert effective == 100
+        assert client.closed
+
+    def test_discards_late_frame_before_eof(self) -> None:
+        client = _connected_client(
+            _restart_response_bytes(100),
+            _pong_bytes(),
+            operations=_RESTART_OPS,
+        )
+        effective = client.restart(delay_ms=500)
+        assert effective == 100
+        assert client.closed
+
+    def test_call_after_restart_raises_connection_lost(self) -> None:
+        client = _connected_client(
+            _restart_response_bytes(100), operations=_RESTART_OPS
+        )
+        client.restart()
+        with pytest.raises(TazConnectionLost):
+            client.version()
+
+    def test_busy_error_leaves_connection_open(self) -> None:
+        err = _error_bytes(
+            common_pb2.OPCODE_RESTART,
+            common_pb2.ERROR_CODE_BUSY,
+            "daemon is shutting down",
+        )
+        client = _connected_client(err, operations=_RESTART_OPS)
+        with pytest.raises(TazError) as exc_info:
+            client.restart()
+        assert exc_info.value.code == common_pb2.ERROR_CODE_BUSY
+        assert not client.closed
+
+    def test_no_eof_within_bound_raises_protocol_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_wait_readable(sock: object, timeout: float | None) -> bool:
+            # Really sleep so the deadline really elapses, same pattern as
+            # the dispatcher's own MaxWait tests.
+            time.sleep(timeout if timeout is not None else 0)
+            return False
+
+        monkeypatch.setattr("taz.c3.client.wait_readable", fake_wait_readable)
+        client = _connected_client(_restart_response_bytes(0), operations=_RESTART_OPS)
+        with pytest.raises(TazProtocolError):
+            client.restart(keepalive=Keepalive(idle=30.0, timeout=0.05))
+        assert client.closed
+
+    def test_infinite_keepalive_waits_for_eof_on_a_real_socket(self) -> None:
+        # Keepalive.OFF leaves the EOF wait unbounded. A real socket rejects
+        # an infinite timeout outright (OverflowError), which the mocked
+        # socket above cannot show, so this one talks over real TCP.
+        listener = socket.create_server(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+        def serve() -> None:
+            conn, _ = listener.accept()
+            with conn:
+                conn.settimeout(5)
+                conn.sendall(
+                    _capability_bytes(operations=_RESTART_OPS)
+                    + _restart_response_bytes(100)
+                )
+                conn.shutdown(socket.SHUT_WR)
+                # Hold the socket open until the client has closed its side.
+                while conn.recv(4096):
+                    pass
+
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        client = TazClient("127.0.0.1", port, keepalive=Keepalive.OFF)
+        try:
+            client.connect()
+            assert client.restart() == 100
+            assert client.closed
+        finally:
+            client.close()
+            server.join(timeout=5)
+            listener.close()
+        assert not server.is_alive()
+
+    def test_unadvertised_raises_not_supported_locally(self) -> None:
+        client = _connected_client(operations=[common_pb2.OPCODE_PING])
+        with pytest.raises(TazError) as exc_info:
+            client.restart()
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_SUPPORTED
+        assert not client.closed
+
+    def test_in_context_manager_exit_is_noop_after_restart(self) -> None:
+        mock_sock = _mock_sock(
+            _capability_bytes(operations=_RESTART_OPS),
+            _restart_response_bytes(100),
+        )
+        with (
+            patch(_PATCH_CC, return_value=mock_sock),
+            TazClient("127.0.0.1", 5555, keepalive=Keepalive.OFF) as client,
+        ):
+            client.restart()
+            assert client.closed
+        assert client.closed
+
+    def test_closed_property_mirrors_connection(self) -> None:
+        client = _connected_client()
+        assert client.closed is False
+        client.close()
+        assert client.closed is True

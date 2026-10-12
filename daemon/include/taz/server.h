@@ -15,6 +15,15 @@ extern "C"
         int port; /* bound port, set by taz_server_start on success */
     } taz_server_t;
 
+    /* taz_server_start retries an explicit (nonzero) requested port that is
+     * UV_EADDRINUSE every TAZ_SERVER_BIND_RETRY_STEP_MS, for up to
+     * TAZ_SERVER_BIND_RETRY_MS total, recreating the uv_tcp_t each attempt
+     * (libuv may defer a bind error into uv_listen). A RESTART successor
+     * relies on this to win the race against its predecessor's still-closing
+     * listener. port=0 (an OS-assigned ephemeral port) never retries. */
+#define TAZ_SERVER_BIND_RETRY_STEP_MS 50U
+#define TAZ_SERVER_BIND_RETRY_MS      2000U
+
     /* Set UV_THREADPOOL_SIZE to 8 (libuv's default is 4) unless the
      * environment already sets it. Call before any thread-pool use;
      * taz_server_start does. */

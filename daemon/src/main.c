@@ -8,11 +8,13 @@
 #include "taz/connection.h"
 #include "taz/log.h"
 #include "taz/platform.h"
+#include "taz/restart_args.h"
 #include "taz/server.h"
 #include "taz/shutdown.h"
 
-#define TAZ_PORT_MAX   65535
-#define TAZ_STRTOL_DEC 10
+#define TAZ_PORT_MAX      65535
+#define TAZ_STRTOL_DEC    10
+#define TAZ_EXEPATH_BUFSZ 4096U
 
 static void usage(const char *prog)
 {
@@ -29,6 +31,7 @@ int main(int argc, char *argv[])
     const char *host = "127.0.0.1";
     int port = 0;
     taz_server_t server;
+    char **restart_argv;
     int rc;
     int i;
 
@@ -91,8 +94,43 @@ int main(int argc, char *argv[])
     uv_run(&server.loop, UV_RUN_DEFAULT);
 
     rc = taz_shutdown_finish(&server);
+
+    restart_argv = NULL;
+    if (rc == 0 && taz_shutdown_mode() == TAZ_SHUTDOWN_RESTART)
+    {
+        char exepath[TAZ_EXEPATH_BUFSZ];
+        size_t exepath_size = sizeof(exepath);
+
+        rc = uv_exepath(exepath, &exepath_size);
+        if (rc == 0)
+        {
+#ifdef __linux__
+            taz_restart_exepath_strip_deleted(exepath);
+#endif
+            rc = taz_restart_args_build(argc, argv, exepath, server.port,
+                                        &restart_argv);
+        }
+        if (rc != 0)
+        {
+            taz_log(TAZ_LOG_ERROR, "restart: failed to build re-exec argv");
+            rc = -1;
+        }
+    }
+
     uv_library_shutdown();
     taz_platform_flush();
     taz_log_shutdown();
+
+    if (restart_argv != NULL)
+    {
+        if (taz_platform_reexec(restart_argv) != 0)
+        {
+            (void)fprintf(stderr, "error: restart re-exec of %s failed\n",
+                          restart_argv[0]);
+            rc = -1;
+        }
+        taz_restart_args_free(restart_argv);
+    }
+
     return (rc == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

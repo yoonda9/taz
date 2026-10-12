@@ -11,6 +11,7 @@
 #include "handlers/log.h"
 #include "handlers/process.h"
 #include "handlers/process_monitor.h"
+#include "handlers/restart.h"
 #include "handlers/run_as.h"
 #include "handlers/task_cancel.h"
 #include "handlers/task_status.h"
@@ -162,12 +163,26 @@ int taz_dispatch_cancel_stream(taz_dispatch_t *d, uint32_t target,
 
 void taz_dispatch_notify_writable(taz_dispatch_t *d)
 {
+    /* Same snapshot as taz_dispatch_cancel_all: an on_writable (RESTART's)
+     * may end its own stream synchronously, and the swap-remove would
+     * otherwise skip the stream moved into its slot. */
+    uint32_t ids[TAZ_DISPATCH_MAX_STREAMS];
+    const size_t n = d->active_count;
     size_t i;
-    for (i = 0U; i < d->active_count; ++i)
+
+    (void)memcpy(ids, d->active_streams, n * sizeof(ids[0]));
+
+    for (i = 0U; i < n; ++i)
     {
-        if (d->stream_ops[i] != NULL && d->stream_ops[i]->on_writable != NULL)
+        const size_t idx = stream_find(d, ids[i]);
+        if (idx >= d->active_count)
         {
-            d->stream_ops[i]->on_writable(d->stream_user[i]);
+            continue;
+        }
+        if (d->stream_ops[idx] != NULL &&
+            d->stream_ops[idx]->on_writable != NULL)
+        {
+            d->stream_ops[idx]->on_writable(d->stream_user[idx]);
         }
     }
 }
@@ -357,6 +372,7 @@ static const opcode_entry_t OPCODE_TABLE[] = {
      true},
     {NULL, handle_task_cancel, (uint16_t)taz_v1_Opcode_OPCODE_TASK_CANCEL,
      true},
+    {NULL, handle_restart, (uint16_t)taz_v1_Opcode_OPCODE_RESTART, true},
 };
 
 #define OPCODE_TABLE_SIZE (sizeof(OPCODE_TABLE) / sizeof(OPCODE_TABLE[0]))

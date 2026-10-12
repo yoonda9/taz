@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <windows.h>
 
@@ -48,6 +50,9 @@ void taz_platform_init_signals(uv_loop_t *loop)
     AcquireSRWLockExclusive(&g_stop_lock);
     g_stopping = 0;
     ReleaseSRWLockExclusive(&g_stop_lock);
+    /* A process created with CREATE_NEW_PROCESS_GROUP (as a RESTART
+     * successor is) starts with CTRL_C ignored; the daemon handles it. */
+    (void)SetConsoleCtrlHandler(NULL, FALSE);
     (void)SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     g_initialized = 1;
 }
@@ -80,4 +85,208 @@ void taz_platform_close_signals(void)
 void taz_platform_flush(void)
 {
     (void)_flushall();
+}
+
+/* Windows command-line quoting, per CommandLineToArgvW's own documented
+ * algorithm: a backslash is literal unless it immediately precedes a
+ * quote, in which case every pair of backslashes collapses to one literal
+ * backslash and an odd trailing backslash escapes the quote after it. */
+static int arg_needs_quoting(const char *arg)
+{
+    const char *p = arg;
+
+    if (*p == '\0')
+    {
+        return 1;
+    }
+    for (; *p != '\0'; p++)
+    {
+        if (*p == ' ' || *p == '\t' || *p == '"')
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int append_quoted(char *out, size_t out_size, size_t *pos,
+                         const char *arg)
+{
+    size_t backslashes;
+    const char *p;
+
+    if (!arg_needs_quoting(arg))
+    {
+        size_t len = strlen(arg);
+        if (*pos + len >= out_size)
+        {
+            return -1;
+        }
+        /* out is a fixed command-line buffer under construction, not a
+         * string yet at this point - build_command_line NUL-terminates it
+         * once, after every token has been appended. */
+        // NOLINTNEXTLINE(bugprone-not-null-terminated-result)
+        (void)memcpy(out + *pos, arg, len);
+        *pos += len;
+        return 0;
+    }
+
+    if (*pos + 1U >= out_size)
+    {
+        return -1;
+    }
+    out[(*pos)++] = '"';
+
+    backslashes = 0U;
+    for (p = arg; *p != '\0'; p++)
+    {
+        if (*p == '\\')
+        {
+            backslashes++;
+            continue;
+        }
+        if (*p == '"')
+        {
+            if (*pos + (backslashes * 2U) + 2U >= out_size)
+            {
+                return -1;
+            }
+            while (backslashes-- > 0U)
+            {
+                out[(*pos)++] = '\\';
+                out[(*pos)++] = '\\';
+            }
+            out[(*pos)++] = '\\';
+            out[(*pos)++] = '"';
+            backslashes = 0U;
+            continue;
+        }
+        if (backslashes > 0U)
+        {
+            if (*pos + backslashes >= out_size)
+            {
+                return -1;
+            }
+            while (backslashes-- > 0U)
+            {
+                out[(*pos)++] = '\\';
+            }
+        }
+        if (*pos + 1U >= out_size)
+        {
+            return -1;
+        }
+        out[(*pos)++] = *p;
+    }
+    if (backslashes > 0U)
+    {
+        if (*pos + (backslashes * 2U) >= out_size)
+        {
+            return -1;
+        }
+        while (backslashes-- > 0U)
+        {
+            out[(*pos)++] = '\\';
+            out[(*pos)++] = '\\';
+        }
+    }
+    if (*pos + 1U >= out_size)
+    {
+        return -1;
+    }
+    out[(*pos)++] = '"';
+    return 0;
+}
+
+static int build_command_line(char *const argv[], char *out, size_t out_size)
+{
+    size_t pos = 0U;
+    size_t i;
+
+    for (i = 0U; argv[i] != NULL; i++)
+    {
+        if (i > 0U)
+        {
+            if (pos + 1U >= out_size)
+            {
+                return -1;
+            }
+            out[pos++] = ' ';
+        }
+        if (append_quoted(out, out_size, &pos, argv[i]) != 0)
+        {
+            return -1;
+        }
+    }
+    if (pos >= out_size)
+    {
+        return -1;
+    }
+    out[pos] = '\0';
+    return 0;
+}
+
+/* Windows' own hard limit for a CreateProcess command line. */
+#define TAZ_REEXEC_CMDLINE_MAX 32768U
+
+int taz_platform_reexec(char *const argv[])
+{
+    /* Heap, not stack: TAZ_REEXEC_CMDLINE_MAX*(1+sizeof(wchar_t)) bytes
+     * would otherwise trip MSVC /analyze's C6262 large-stack-frame check
+     * (the project's -Wframe-larger-than=16384 equivalent). */
+    char *cmdline_utf8 = NULL;
+    wchar_t *cmdline_w = NULL;
+    wchar_t *exe_w = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    int ok = 0;
+
+    cmdline_utf8 = (char *)malloc(TAZ_REEXEC_CMDLINE_MAX);
+    cmdline_w = (wchar_t *)malloc(TAZ_REEXEC_CMDLINE_MAX * sizeof(wchar_t));
+    exe_w = (wchar_t *)malloc(TAZ_REEXEC_CMDLINE_MAX * sizeof(wchar_t));
+    if (cmdline_utf8 == NULL || cmdline_w == NULL || exe_w == NULL)
+    {
+        goto done;
+    }
+
+    if (build_command_line(argv, cmdline_utf8, TAZ_REEXEC_CMDLINE_MAX) != 0)
+    {
+        goto done;
+    }
+    /* Not MAX_PATH: with long paths enabled, the executable's own path
+     * can run to the same 32767-character limit as a command line. */
+    if (MultiByteToWideChar(CP_UTF8, 0, argv[0], -1, exe_w,
+                            (int)TAZ_REEXEC_CMDLINE_MAX) == 0)
+    {
+        goto done;
+    }
+    if (MultiByteToWideChar(CP_UTF8, 0, cmdline_utf8, -1, cmdline_w,
+                            (int)TAZ_REEXEC_CMDLINE_MAX) == 0)
+    {
+        goto done;
+    }
+
+    (void)memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    (void)memset(&pi, 0, sizeof(pi));
+
+    if (!CreateProcessW(exe_w, cmdline_w, NULL, NULL, TRUE,
+                        CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi))
+    {
+        goto done;
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    ok = 1;
+
+done:
+    free(cmdline_utf8);
+    free(cmdline_w);
+    free(exe_w);
+    return ok ? 0 : -1;
 }

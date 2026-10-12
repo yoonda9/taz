@@ -44,6 +44,8 @@ add_executable(
     test_task_cancel.cpp
     test_lifetime.cpp
     test_shutdown.cpp
+    test_restart.cpp
+    test_restart_args.cpp
     test_work.cpp
     test_fsutil.cpp
     test_crc32c.cpp

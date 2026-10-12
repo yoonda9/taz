@@ -52,7 +52,8 @@ extern "C"
     int taz_shutdown_in_progress(void);
 
     /* The shutdown walk: taz_work_begin_shutdown (cancels every outstanding
-     * pool-work request daemon-wide), close the listener, gracefully
+     * pool-work request daemon-wide), close the listener, close every
+     * pending RESTART delay timer (taz_restart_close_pending), gracefully
      * close every connection on server->loop (taz_conn_shutdown_all),
      * uv_unref the platform signal/console-ctrl handles (they stay
      * installed, so a repeat signal during the drain is still a no-op

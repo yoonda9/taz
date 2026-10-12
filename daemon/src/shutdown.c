@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 
+#include "handlers/restart.h"
 #include "taz/connection.h"
 #include "taz/log.h"
 #include "taz/platform.h"
@@ -78,6 +79,7 @@ void taz_server_shutdown(taz_server_t *server)
 
     taz_work_begin_shutdown();
     taz_server_close_listener(server);
+    taz_restart_close_pending();
     taz_conn_shutdown_all(&server->loop);
     taz_platform_release_signals();
 

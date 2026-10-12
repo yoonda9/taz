@@ -39,7 +39,7 @@ TEST(Payload, CapabilityRoundTrip)
 
     EXPECT_EQ(cap.protocol_major, 1U);
     EXPECT_EQ(cap.protocol_minor, 0U);
-    ASSERT_EQ(cap.operations_count, 24U);
+    ASSERT_EQ(cap.operations_count, 25U);
 
     // Collect operations into a set for order-independent verification.
     const std::set<uint32_t> ops(cap.operations,
@@ -90,6 +90,7 @@ TEST(Payload, CapabilityRoundTrip)
         ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TASK_STATUS)));
     EXPECT_TRUE(
         ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TASK_CANCEL)));
+    EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_RESTART)));
 
     ASSERT_GE(cap.compression_count, 1U);
     EXPECT_STREQ(cap.compression[0], "NONE");
@@ -114,7 +115,7 @@ TEST(Payload, CapabilityAdvertisesRunAsOnlyWhenPrivileged)
     pb_istream_t stream = pb_istream_from_buffer(buf, n);
     ASSERT_TRUE(pb_decode(&stream, taz_v1_CapabilityPayload_fields, &cap));
 
-    ASSERT_EQ(cap.operations_count, 25U);
+    ASSERT_EQ(cap.operations_count, 26U);
     const std::set<uint32_t> ops(cap.operations,
                                  cap.operations + cap.operations_count);
     EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_RUN_AS)));
@@ -123,6 +124,7 @@ TEST(Payload, CapabilityAdvertisesRunAsOnlyWhenPrivileged)
         ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TASK_STATUS)));
     EXPECT_TRUE(
         ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TASK_CANCEL)));
+    EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_RESTART)));
 }
 #endif /* !_WIN32 */
 

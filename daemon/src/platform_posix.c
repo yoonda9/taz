@@ -1,6 +1,8 @@
 #include <signal.h>
 #include <stdio.h>
 
+#include <unistd.h>
+
 #include "taz/platform.h"
 #include "taz/shutdown.h"
 
@@ -66,4 +68,10 @@ void taz_platform_flush(void)
 {
     (void)fflush(stdout);
     (void)fflush(stderr);
+}
+
+int taz_platform_reexec(char *const argv[])
+{
+    execv(argv[0], argv);
+    return -1;
 }

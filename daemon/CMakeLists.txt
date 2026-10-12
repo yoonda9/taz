@@ -275,6 +275,7 @@ add_library(
     src/exec.c
     src/server.c
     src/shutdown.c
+    src/restart_args.c
     src/work.c
     src/fsutil.c
     src/crc32c.c
@@ -295,6 +296,7 @@ add_library(
     src/handlers/detach.c
     src/handlers/task_status.c
     src/handlers/task_cancel.c
+    src/handlers/restart.c
     src/platform/process_common.c
     ${TAZ_PROCESS_SRC}
     ${TAZ_PLATFORM_SRC}

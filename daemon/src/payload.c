@@ -61,6 +61,9 @@ size_t taz_payload_capability(uint8_t *buf, size_t bufsize)
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_DETACH;
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_TASK_STATUS;
         msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_TASK_CANCEL;
+        /* Advertised unconditionally, unlike RUN_AS: restarting is never
+         * privilege-gated. */
+        msg.operations[op++] = (uint32_t)taz_v1_Opcode_OPCODE_RESTART;
         msg.operations_count = op;
     }
     msg.compression_count = 1U;

@@ -6,6 +6,7 @@ import contextlib
 import gc
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -43,7 +44,7 @@ from taz.v1 import (
     process_pb2,
 )
 
-from tests.conftest import Daemon
+from tests.conftest import Daemon, _check_exit, _launch
 
 _PROCESS_OPCODES = {
     common_pb2.OPCODE_PROCESS_LIST,
@@ -148,6 +149,23 @@ def _flood_unread_file_gets(client: TazClient, tmp_path: Path, count: int = 4) -
         assert time.monotonic() < deadline, "the daemon's writes never backed up"
         last = waiting
         time.sleep(0.2)
+
+
+def _send_restart_and_read_ack(client: TazClient, delay_ms: int) -> int:
+    """Send RESTART and read its response, leaving the connection to the
+    caller (``client.restart()`` would instead wait for the daemon's EOF)."""
+    req = daemon_control_pb2.RestartRequest(delay_ms=delay_ms)
+    stream_id = client._conn.send_request(
+        common_pb2.OPCODE_RESTART, req.SerializeToString()
+    )
+    frame = client._dispatcher.recv_response(
+        stream_id, client._keepalive, expected_opcode=common_pb2.OPCODE_RESTART
+    )
+    assert frame.type == common_pb2.FRAME_TYPE_RESPONSE
+    resp = daemon_control_pb2.RestartResponse()
+    resp.ParseFromString(frame.payload)
+    assert resp.acknowledged
+    return resp.effective_delay_ms
 
 
 _SLEEP_SNIPPET = "import os, time; print(os.getpid(), flush=True); time.sleep(60)"
@@ -2788,6 +2806,211 @@ class TestTaskLifetime:
             status = taz_client.task.status(task.task_id)
         assert status.state == TaskState.CANCELLED
         taz_client.ping()
+
+
+class TestRestart:
+    """RESTART (0x0005) through ``client.restart()``: the daemon runs its
+    graceful shutdown walk, then re-execs on the same port."""
+
+    def test_capabilities_advertise_restart(self, taz_client: TazClient) -> None:
+        ops = set(taz_client.capabilities().operations)
+        assert common_pb2.OPCODE_RESTART in ops
+
+    def test_restart_500ms_reconnects_on_same_port_with_matching_version(
+        self, daemon: Daemon
+    ) -> None:
+        # effective_delay_ms echoes the request, the client
+        # closes on the daemon's own EOF, and a fresh connection on the
+        # same port sees the same version once the successor is up.
+        client = TazClient("127.0.0.1", daemon.port)
+        client.connect()
+        effective = client.restart(delay_ms=500)
+        assert effective == 500
+        assert client.closed
+
+        daemon.await_restart(timeout=10 * daemon.timing_scale)
+
+        with TazClient("127.0.0.1", daemon.port) as reconnected:
+            assert reconnected.version().version == _project_version()
+
+    def test_restart_delay_zero_is_clamped_to_the_minimum(self, daemon: Daemon) -> None:
+        with TazClient("127.0.0.1", daemon.port) as client:
+            effective = client.restart(delay_ms=0)
+        assert effective == 100
+        daemon.await_restart(timeout=10 * daemon.timing_scale)
+
+    def test_restart_terminates_a_detached_task_and_drops_its_state(
+        self, taz_client: TazClient, daemon: Daemon
+    ) -> None:
+        # A detached 60s task's child is gone and its state
+        # does not survive the restart (NOT_FOUND from a fresh connection).
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py("import time; time.sleep(60)")
+        )
+        child_pid = task.pid
+        assert psutil.pid_exists(child_pid)
+
+        effective = taz_client.restart(delay_ms=500)
+        assert effective == 500
+
+        daemon.await_restart(timeout=10 * daemon.timing_scale)
+        assert _wait_process_gone(child_pid), f"child pid {child_pid} still exists"
+
+        with TazClient("127.0.0.1", daemon.port) as reconnected:
+            with pytest.raises(TazError) as exc_info:
+                reconnected.task.status(task.task_id)
+            assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+
+    def test_restart_twice_then_sigterm_every_exit_is_clean(
+        self, daemon: Daemon
+    ) -> None:
+        # execv inherits the signal mask and dispositions: a
+        # twice-restarted daemon must still stop cleanly on SIGTERM.
+        with TazClient("127.0.0.1", daemon.port) as client:
+            client.restart(delay_ms=100)
+        daemon.await_restart(timeout=10 * daemon.timing_scale)
+
+        with TazClient("127.0.0.1", daemon.port) as client:
+            client.restart(delay_ms=100)
+        daemon.await_restart(timeout=10 * daemon.timing_scale)
+
+        daemon.stop()
+
+    def test_restart_closes_another_connections_inflight_exec(
+        self, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        # RESTART's shutdown walk kills every other connection's exec tree
+        # too, same as a plain SIGTERM (TestTaskLifetime's rows).
+        pid_file = tmp_path / "pid.txt"
+        snippet = (
+            "import os, pathlib, time; "
+            f"pathlib.Path(r'{pid_file}').write_text(str(os.getpid())); "
+            "time.sleep(30)"
+        )
+        req = command_pb2.CommandExecRequest(command=PY, args=_py(snippet))
+
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        victim._conn.send_request(
+            common_pb2.OPCODE_COMMAND_EXEC, req.SerializeToString()
+        )
+        deadline = time.monotonic() + 10
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert pid_file.exists(), "child never started"
+        child_pid = int(pid_file.read_text())
+        assert psutil.pid_exists(child_pid)
+
+        restarter = TazClient("127.0.0.1", daemon.port)
+        restarter.connect()
+        effective = restarter.restart(delay_ms=200)
+        assert effective == 200
+
+        lost_deadline = time.monotonic() + 5 * daemon.timing_scale
+        lost = False
+        while time.monotonic() < lost_deadline:
+            try:
+                victim.ping()
+            except TazConnectionLost:
+                lost = True
+                break
+            time.sleep(0.05)
+        assert lost, "victim connection survived the restart's shutdown walk"
+        victim.close()
+
+        daemon.await_restart(timeout=10 * daemon.timing_scale)
+        assert _wait_process_gone(child_pid), f"child pid {child_pid} still exists"
+
+    def test_restart_survives_the_requester_disconnecting(self, daemon: Daemon) -> None:
+        # An acknowledged restart belongs to the daemon: the client closing
+        # its connection right after the response does not cancel it.
+        client = TazClient("127.0.0.1", daemon.port)
+        client.connect()
+        assert _send_restart_and_read_ack(client, 300) == 300
+        client.close()
+
+        daemon.await_restart(timeout=10 * daemon.timing_scale)
+        with TazClient("127.0.0.1", daemon.port) as reconnected:
+            assert reconnected.version().version == _project_version()
+
+    def test_sigterm_during_the_restart_delay_stops_instead(
+        self, daemon: Daemon
+    ) -> None:
+        # A STOP that arrives while an acknowledged restart is still waiting
+        # out its delay wins: the pending restart is dropped and the daemon
+        # exits 0 at once rather than after the delay.
+        with TazClient("127.0.0.1", daemon.port) as client:
+            assert _send_restart_and_read_ack(client, 60000) == 60000
+
+            start = time.monotonic()
+            daemon.stop()
+            elapsed = time.monotonic() - start
+
+        max_elapsed = 5.0 * daemon.timing_scale
+        assert elapsed < max_elapsed, (
+            f"stop during a 60 s restart delay took {elapsed:.2f}s,"
+            f" expected < {max_elapsed:.2f}s"
+        )
+
+    def test_stop_while_a_restart_drains_stops_for_good(
+        self, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        # A peer that never reads holds the restart's own walk open until
+        # its 1 s drain deadline; a stop signal inside that window must
+        # make the daemon exit rather than come back.
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        _flood_unread_file_gets(victim, tmp_path)
+        with TazClient("127.0.0.1", daemon.port) as restarter:
+            assert _send_restart_and_read_ack(restarter, 100) == 100
+            time.sleep(0.4)
+            assert daemon.proc.poll() is None
+            daemon.stop()
+        assert daemon.proc.returncode == 0
+        if sys.platform == "win32":
+            # A successor would be a new process; stop() alone cannot tell.
+            assert not daemon._adopt_windows_successor(timeout=2.0), (
+                "the daemon restarted despite the stop"
+            )
+        victim.close()
+
+    @pytest.mark.skipif(
+        sys.platform != "linux",
+        reason="replacing a running executable on disk (and /proc/self/exe"
+        " naming it '<path> (deleted)') is Linux behaviour",
+    )
+    def test_restart_after_the_binary_is_replaced_on_disk(
+        self, daemon_binary: Path, tmp_path: Path
+    ) -> None:
+        # An install or upgrade renames a new binary over the running one;
+        # a restart must then run what is at the path now.
+        exe = tmp_path / "tazd"
+        shutil.copy2(daemon_binary, exe)
+        d = _launch(exe)
+        try:
+            replacement = tmp_path / "tazd.new"
+            shutil.copy2(daemon_binary, replacement)
+            os.replace(replacement, exe)
+
+            with TazClient("127.0.0.1", d.port) as client:
+                client.restart(delay_ms=100)
+            d.await_restart(timeout=10 * d.timing_scale)
+
+            with TazClient("127.0.0.1", d.port) as reconnected:
+                assert reconnected.version().version == _project_version()
+        finally:
+            d.stop()
+        _check_exit(d)
+
+    def test_demo_restart_then_reconnect(self, daemon: Daemon) -> None:
+        # The documented flow: restart(delay_ms=1000), sleep, reconnect, version().
+        with TazClient("127.0.0.1", daemon.port) as client:
+            effective = client.restart(delay_ms=1000)
+            print(f"restarting in {effective}ms")
+        time.sleep(effective / 1000 + 0.5)
+        daemon.await_restart(timeout=10 * daemon.timing_scale)
+        with TazClient("127.0.0.1", daemon.port) as reconnected:
+            assert reconnected.version().version == _project_version()
 
 
 class TestConfigGet:

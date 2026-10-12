@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from types import TracebackType
 
@@ -10,12 +11,17 @@ from google.protobuf.message import Message
 from taz.c3.command import CommandNamespace
 from taz.c3.connection import Connection
 from taz.c3.directory import DirectoryNamespace
-from taz.c3.errors import TazError, TazPriorityError
+from taz.c3.errors import (
+    TazConnectionLost,
+    TazError,
+    TazPriorityError,
+    TazProtocolError,
+)
 from taz.c3.file import FileNamespace
 from taz.c3.logs import LogEntry
 from taz.c3.process import ProcessNamespace
 from taz.c3.protocol.dispatch import Dispatcher, PriorityPolicy
-from taz.c3.protocol.frame import Frame
+from taz.c3.protocol.frame import Frame, wait_readable
 from taz.c3.settings import Backlog, Keepalive
 from taz.c3.task import TaskNamespace
 from taz.v1 import advanced_pb2, common_pb2, daemon_control_pb2
@@ -87,6 +93,11 @@ class TazClient:
     def close(self) -> None:
         """Close the underlying socket."""
         self._conn.close()
+
+    @property
+    def closed(self) -> bool:
+        """Mirrors ``Connection.closed``."""
+        return self._conn.closed
 
     def __enter__(self) -> TazClient:
         self.connect()
@@ -325,3 +336,59 @@ class TazClient:
         )
         self._dispatcher.close_after_cancel(stream_id, was_already_closed)
         return resp.cancelled
+
+    def restart(self, delay_ms: int = 0, keepalive: Keepalive | None = None) -> int:
+        """Ask the daemon to restart after ``delay_ms`` and return the delay it used.
+
+        The daemon clamps ``delay_ms`` to its own minimum; the return value
+        is that ``effective_delay_ms``. The daemon closes this connection
+        once the delay elapses, so this call then discards any frames still
+        arriving and waits for that closure, bounded by
+        ``effective_delay_ms / 1000 + keepalive.timeout`` (unbounded when
+        that timeout is infinite, as with ``Keepalive.OFF``); it then closes
+        the socket itself, so later calls raise ``TazConnectionLost``, as
+        after any lost connection. Raises ``TazProtocolError`` if the daemon
+        does not close the connection within that bound, or
+        ``TazError(BUSY)`` (leaving the connection open) if a shutdown is
+        already in progress. Raises ``TazError(NOT_SUPPORTED)`` locally,
+        without sending anything, if the daemon does not advertise RESTART.
+        """
+        kv = keepalive if keepalive is not None else self._keepalive
+        req = daemon_control_pb2.RestartRequest(delay_ms=delay_ms)
+        resp = self._call(
+            common_pb2.OPCODE_RESTART,
+            req.SerializeToString(),
+            daemon_control_pb2.RestartResponse,
+            kv,
+        )
+        effective_delay_ms = resp.effective_delay_ms
+        max_wait = effective_delay_ms / 1000 + kv.timeout
+        # An infinite keepalive timeout means no bound at all; a socket
+        # timeout of inf would overflow.
+        deadline = None if max_wait == float("inf") else time.monotonic() + max_wait
+        while True:
+            remaining: float | None = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = TazProtocolError(
+                        "daemon did not close the connection within"
+                        f" {max_wait:g} s of acknowledging RESTART"
+                    )
+                    if self._conn._failure is None:
+                        self._conn._failure = failure
+                    self._conn.close()
+                    raise failure
+            sock = self._conn._sock
+            try:
+                ready = sock is not None and wait_readable(sock, remaining)
+            except TazConnectionLost:
+                break
+            if ready:
+                try:
+                    self._conn.recv_frame()
+                except TazConnectionLost:
+                    break
+        self._conn._failure = TazConnectionLost("connection closed by daemon restart")
+        self._conn.close()
+        return effective_delay_ms
