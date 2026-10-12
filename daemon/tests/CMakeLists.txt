@@ -43,6 +43,7 @@ add_executable(
     test_task_status.cpp
     test_task_cancel.cpp
     test_lifetime.cpp
+    test_shutdown.cpp
     test_work.cpp
     test_fsutil.cpp
     test_crc32c.cpp

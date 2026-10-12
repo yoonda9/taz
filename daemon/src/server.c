@@ -96,8 +96,7 @@ int taz_server_start(taz_server_t *server, const char *host, int port,
         goto cleanup;
     }
 
-    (void)printf("LISTENING port=%d\n", bound_port(&actual_addr));
-    (void)fflush(stdout);
+    server->port = bound_port(&actual_addr);
     return 0;
 
 cleanup:
@@ -105,4 +104,18 @@ cleanup:
     uv_run(&server->loop, UV_RUN_DEFAULT);
     (void)uv_loop_close(&server->loop);
     return rc;
+}
+
+void taz_server_announce(const taz_server_t *server)
+{
+    (void)printf("LISTENING port=%d\n", server->port);
+    (void)fflush(stdout);
+}
+
+void taz_server_close_listener(taz_server_t *server)
+{
+    if (!uv_is_closing((uv_handle_t *)&server->handle))
+    {
+        uv_close((uv_handle_t *)&server->handle, NULL);
+    }
 }

@@ -238,8 +238,8 @@ static void put_send_pending_fail(put_ctx_t *pctx)
 
 static void put_submit_cleanup(put_ctx_t *pctx)
 {
-    if (taz_work_submit_step(pctx->d, put_cleanup_work, put_cleanup_done,
-                             pctx) != 0)
+    if (taz_work_submit_cleanup(pctx->d, put_cleanup_work, put_cleanup_done,
+                                pctx) != 0)
     {
         /* The pool is unavailable, so the unlink this depended on can never
          * run; there is nothing left to order the ERROR after, so send it
@@ -1041,8 +1041,8 @@ static void get_close_done(void *user, int closing)
 static void get_submit_close(get_ctx_t *gctx)
 {
     gctx->state = GET_STATE_CLOSING;
-    if (taz_work_submit_step(gctx->d, get_close_work, get_close_done, gctx) !=
-        0)
+    if (taz_work_submit_cleanup(gctx->d, get_close_work, get_close_done,
+                                gctx) != 0)
     {
         /* Nothing more we can safely do on the pool; release now rather
          * than touch gctx again (best effort: the fd may leak). */

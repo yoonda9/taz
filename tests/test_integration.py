@@ -7,6 +7,7 @@ import gc
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -107,6 +108,46 @@ def _process_gone(pid: int) -> bool:
         return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return True
+
+
+def _wait_process_gone(pid: int, timeout: float = 5.0) -> bool:
+    """Poll :func:`_process_gone` until it holds or ``timeout`` elapses: a
+    SIGKILL (or a job-object kill) lands asynchronously, so a killed tree
+    can outlive the call that killed it by a moment."""
+    deadline = time.monotonic() + timeout
+    while not _process_gone(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+_UNREAD_GET_SIZE = 64 << 20
+_PEEK_MAX = 64 << 20
+
+
+def _flood_unread_file_gets(client: TazClient, tmp_path: Path, count: int = 4) -> None:
+    """Queue ``count`` FILE_GETs of a 64 MiB file and never read a chunk,
+    then wait until the bytes waiting in ``client``'s socket stop growing:
+    the daemon's writes to it are then backed up, so a graceful
+    ``uv_shutdown`` of that connection cannot complete."""
+    src = tmp_path / "unread.bin"
+    with src.open("wb") as f:
+        f.truncate(_UNREAD_GET_SIZE)
+    req = file_pb2.FileGetRequest(src=str(src))
+    for _ in range(count):
+        client._conn.send_request(common_pb2.OPCODE_FILE_GET, req.SerializeToString())
+    sock = client._conn._sock
+    assert sock is not None
+    deadline = time.monotonic() + 10
+    last = -1
+    while True:
+        waiting = len(sock.recv(_PEEK_MAX, socket.MSG_PEEK))
+        if waiting >= 64 * 1024 and waiting == last:
+            return
+        assert time.monotonic() < deadline, "the daemon's writes never backed up"
+        last = waiting
+        time.sleep(0.2)
 
 
 _SLEEP_SNIPPET = "import os, time; print(os.getpid(), flush=True); time.sleep(60)"
@@ -1943,12 +1984,16 @@ class TestProcessMonitor:
         # Abrupt teardown: close the socket with the stream still open,
         # mirroring TestProcessOps's 32-request mid-enumeration close test.
         victim.close()
+        # Sends nothing on the closed connection; only marks the iterator
+        # done, so it never warns as abandoned.
+        m.close()
 
         with TazClient("127.0.0.1", daemon.port) as other:
             start = time.monotonic()
             other.version()
             assert time.monotonic() - start < 2.0
-            next(other.process.monitor(pid, _MONITOR_INTERVAL))
+            with other.process.monitor(pid, _MONITOR_INTERVAL) as again:
+                next(again)
 
     def test_closing_socket_mid_sample_eight_victims_exit_audit_passes(
         self,
@@ -1961,9 +2006,10 @@ class TestProcessMonitor:
         for i in range(8):
             victim = TazClient("127.0.0.1", daemon.port)
             victim.connect()
-            victim.process.monitor(pid, _MONITOR_INTERVAL)
+            m = victim.process.monitor(pid, _MONITOR_INTERVAL)
             time.sleep(sleeps_ms[i % len(sleeps_ms)] / 1000)
             victim.close()
+            m.close()
         # Nothing further to assert here: the daemon fixture's teardown
         # audits the exit for sanitizer reports and a non-zero code - the
         # ASan/TSan oracle for a socket close racing a sample in flight.
@@ -2414,8 +2460,234 @@ class TestTaskLifetime:
         # The SIGTERM tree kill used to mistake the listening socket for a
         # connection until the first client connected, and crash.
         daemon.stop()
-        if sys.platform != "win32":
-            assert daemon.proc.returncode == 0 or "LeakSanitizer" in daemon.stderr
+
+    def test_sigterm_with_infly_exec_stops_gracefully(
+        self, taz_client: TazClient, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        # SIGTERM with an in-flight 30s exec terminates the child and the
+        # daemon within 2s * timing_scale. The child pid is
+        # captured before stop(), and we verify it's gone after.
+        pid_file = tmp_path / "pid.txt"
+        snippet = (
+            "import os, pathlib, time; "
+            f"pathlib.Path(r'{pid_file}').write_text(str(os.getpid())); "
+            "time.sleep(30)"
+        )
+        req = command_pb2.CommandExecRequest(command=PY, args=_py(snippet))
+
+        # Send the COMMAND_EXEC and wait for the child to start
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        victim._conn.send_request(
+            common_pb2.OPCODE_COMMAND_EXEC, req.SerializeToString()
+        )
+
+        deadline = time.monotonic() + 10
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert pid_file.exists(), "child never started"
+        child_pid = int(pid_file.read_text())
+        assert psutil.pid_exists(child_pid)
+
+        # Measure time from SIGTERM to stop completion
+        start = time.monotonic()
+        daemon.stop()
+        elapsed = time.monotonic() - start
+
+        # Must complete within 2s * timing_scale
+        max_elapsed = 2.0 * daemon.timing_scale
+        assert elapsed < max_elapsed, (
+            f"daemon.stop() took {elapsed:.2f}s, expected < {max_elapsed:.2f}s"
+        )
+
+        # Child must be gone
+        assert _wait_process_gone(child_pid), f"child pid {child_pid} still exists"
+        victim.close()
+
+    def test_sigterm_with_detached_task_stops_gracefully(
+        self, taz_client: TazClient, daemon: Daemon
+    ) -> None:
+        # SIGTERM with a detached 30s task terminates the child and the
+        # daemon within 2s * timing_scale.
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py("import time; time.sleep(30)")
+        )
+        child_pid = task.pid
+        assert psutil.pid_exists(child_pid)
+
+        # Measure time from SIGTERM to stop completion
+        start = time.monotonic()
+        daemon.stop()
+        elapsed = time.monotonic() - start
+
+        # Must complete within 2s * timing_scale
+        max_elapsed = 2.0 * daemon.timing_scale
+        assert elapsed < max_elapsed, (
+            f"daemon.stop() took {elapsed:.2f}s, expected < {max_elapsed:.2f}s"
+        )
+
+        # Child must be gone
+        assert _wait_process_gone(child_pid), f"child pid {child_pid} still exists"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="SIGINT is POSIX-only; Windows exercises the same walk via"
+        " CTRL_BREAK_EVENT in the other SIGTERM-equivalent rows",
+    )
+    def test_sigint_with_detached_task_stops_gracefully(
+        self, taz_client: TazClient, daemon: Daemon
+    ) -> None:
+        # SIGINT takes the same shutdown walk as SIGTERM: a detached
+        # 30s task's child and the daemon both stop within 2s * timing_scale.
+        task = taz_client.task.detach(
+            taz_client.command.exec, PY, args=_py("import time; time.sleep(30)")
+        )
+        child_pid = task.pid
+        assert psutil.pid_exists(child_pid)
+
+        start = time.monotonic()
+        os.kill(daemon.pid, signal.SIGINT)
+        daemon.proc.wait(timeout=10)
+        elapsed = time.monotonic() - start
+
+        max_elapsed = 2.0 * daemon.timing_scale
+        assert elapsed < max_elapsed, (
+            f"daemon took {elapsed:.2f}s to stop after SIGINT, expected"
+            f" < {max_elapsed:.2f}s"
+        )
+        assert _wait_process_gone(child_pid), f"child pid {child_pid} still exists"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="a repeat POSIX signal mid-drain; on Windows the same walk"
+        " keeps its console-control handler installed until the loop has"
+        " drained, and a second CTRL_BREAK cannot be aimed at a single"
+        " process from here",
+    )
+    def test_repeat_signal_during_shutdown_is_a_no_op(
+        self, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        # A peer that never reads holds the walk's drain open until its 1 s
+        # deadline; a second signal inside that window must reach the
+        # daemon's own (no-op) handler, not the default action, which
+        # would kill it with the walk half done.
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        _flood_unread_file_gets(victim, tmp_path)
+
+        os.kill(daemon.pid, signal.SIGTERM)
+        time.sleep(0.3)
+        assert daemon.proc.poll() is None, "the drain ended before the repeat"
+        os.kill(daemon.pid, signal.SIGINT)
+        daemon.proc.wait(timeout=10 * daemon.timing_scale)
+        assert daemon.proc.returncode == 0
+        victim.close()
+
+    def test_sigterm_with_an_unread_peer_force_closes_at_the_drain_deadline(
+        self, daemon: Daemon, tmp_path: Path
+    ) -> None:
+        # A peer that never reads keeps the daemon's writes to it queued, so
+        # the walk's graceful uv_shutdown cannot complete: the connection
+        # is force-closed at the 1 s drain deadline and the exit is still 0.
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+        _flood_unread_file_gets(victim, tmp_path)
+
+        start = time.monotonic()
+        daemon.stop()
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= 0.8, (
+            f"stop took {elapsed:.2f}s: the drain never waited, so the"
+            " deadline path did not run"
+        )
+        max_elapsed = 5.0 * daemon.timing_scale
+        assert elapsed < max_elapsed, (
+            f"daemon.stop() with an unread peer took {elapsed:.2f}s, "
+            f"expected < {max_elapsed:.2f}s"
+        )
+        victim.close()
+
+    def test_sigterm_with_monitor_and_status_streams_closes_cleanly(
+        self,
+        daemon: Daemon,
+        spawn_helper: Callable[..., tuple[subprocess.Popen[bytes], int]],
+    ) -> None:
+        # Open a PROCESS_MONITOR stream and a subscribed TASK_STATUS stream.
+        # SIGTERM closes the daemon and all open streams cleanly (without crashes).
+        victim = TazClient("127.0.0.1", daemon.port)
+        victim.connect()
+
+        # Start a process to monitor
+        _, pid = spawn_helper(_SLEEP_SNIPPET)
+
+        # Open monitor stream and status stream (don't wait for updates)
+        monitor = victim.process.monitor(pid, _MONITOR_INTERVAL)
+        task = victim.task.detach(
+            victim.command.exec, PY, args=_py("import time; time.sleep(30)")
+        )
+        status_stream = victim.task.status(
+            task.task_id, subscribe=True, interval_ms=_MONITOR_INTERVAL
+        )
+
+        # Both streams share one TazClient connection/socket, so a single
+        # reader must multiplex them: the dispatcher buffers frames for
+        # whichever stream isn't the one currently awaited (see
+        # Dispatcher._next_frame), which only holds if one thread at a time
+        # calls recv_response() on this connection. Two threads each
+        # blocked in their own next() would race Connection.recv_frame()
+        # on the same socket and could corrupt frames.
+        errors: list[BaseException] = []
+        lost: list[str] = []
+        # Local completion flags rather than `.ended`, so a stream that
+        # fails in some unexpected way is still read only once more.
+        monitor_done = False
+        status_done = False
+
+        def _drain_one(stream: StreamIterator[Any]) -> bool:
+            # A caught exception here must not stop read_both() from still
+            # draining the other stream. Returns True once this stream is
+            # done (cleanly ended or failed) and should not be read again.
+            try:
+                next(stream)
+            except TazConnectionLost:
+                # The only way either stream may end: the daemon closed the
+                # connection under it.
+                lost.append(type(stream).__name__)
+                return True
+            except BaseException as e:
+                errors.append(e)
+                return True
+            return False
+
+        def read_both() -> None:
+            nonlocal monitor_done, status_done
+            while not monitor_done or not status_done:
+                if not monitor_done:
+                    monitor_done = _drain_one(monitor)
+                if not status_done:
+                    status_done = _drain_one(status_stream)
+
+        reader = threading.Thread(target=read_both)
+        reader.start()
+
+        # Let the reader start reading
+        time.sleep(0.1)
+
+        # SIGTERM closes the daemon and both streams
+        daemon.stop()
+
+        # Wait for the reader to finish
+        reader.join(timeout=5)
+        assert not reader.is_alive(), "reader thread hung"
+        assert not errors, f"unexpected errors: {errors}"
+        assert len(lost) == 2
+
+        # close() is idempotent and avoids an unclosed-StreamIterator
+        # ResourceWarning at gc time.
+        monitor.close()
+        status_stream.close()
+        victim.close()
 
     def test_interleaved_synchronous_calls_succeed_while_a_task_runs(
         self, taz_client: TazClient

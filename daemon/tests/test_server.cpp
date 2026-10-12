@@ -58,10 +58,16 @@ TEST(Server, ListensOnIpv4LiteralAndPrintsPort)
     taz_server_t server{};
     testing::internal::CaptureStdout();
     const int rc = taz_server_start(&server, "127.0.0.1", 0, on_connect);
-    const std::string out = testing::internal::GetCapturedStdout();
+    // taz_server_start itself prints nothing; main announces the port only
+    // once its signal handlers are in place.
+    EXPECT_EQ(testing::internal::GetCapturedStdout(), "");
     ASSERT_EQ(rc, 0) << uv_strerror(rc);
-    EXPECT_EQ(out.rfind("LISTENING port=", 0), 0U) << out;
-    EXPECT_NE(out, "LISTENING port=0\n");
+    EXPECT_NE(server.port, 0);
+
+    testing::internal::CaptureStdout();
+    taz_server_announce(&server);
+    const std::string out = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(out, "LISTENING port=" + std::to_string(server.port) + "\n");
     stop(&server);
 }
 
@@ -76,8 +82,8 @@ TEST(Server, ListensOnIpv6Literal)
         GTEST_SKIP() << "no IPv6 loopback on this host: " << uv_strerror(rc);
     }
     ASSERT_EQ(rc, 0) << uv_strerror(rc);
-    EXPECT_EQ(out.rfind("LISTENING port=", 0), 0U) << out;
-    EXPECT_NE(out, "LISTENING port=0\n");
+    EXPECT_EQ(out, "");
+    EXPECT_NE(server.port, 0);
     stop(&server);
 }
 

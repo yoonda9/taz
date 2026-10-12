@@ -44,12 +44,26 @@ extern "C"
      * sends CAPABILITY, starts reading. */
     void taz_conn_on_new_connection(uv_stream_t *server, int status);
 
-    /* Kill every detached task's process tree on every connection open on
-     * loop, without closing the connections themselves (a closing
-     * connection already killed its own). SIGTERM calls it once,
-     * synchronously, before the loop may stop, so no detached tree outlives
-     * the daemon. A no-op if no connection is open. */
-    void taz_conn_kill_all_task_trees(const uv_loop_t *loop);
+    /* Gracefully close every connection open on loop that is not already
+     * closing: mark it closing, stop reads, cancel every in-flight exec
+     * and detached task tree and abort every active stream
+     * (taz_dispatch_cancel_all), then uv_shutdown (FIN) followed by
+     * uv_close once that completes (or immediately, on a synchronous
+     * uv_shutdown error). Part of the shutdown walk; a no-op if no
+     * connection is open on loop. */
+    void taz_conn_shutdown_all(const uv_loop_t *loop);
+
+    /* Force-close every connection open on loop that has not finished
+     * closing yet (uv_is_closing false): a peer that never drains its read
+     * side can leave taz_conn_shutdown_all's uv_shutdown pending forever,
+     * so the shutdown walk's drain deadline calls this to bound the wait.
+     * Pending writes complete with UV_ECANCELED, same as any cancelled
+     * write. A no-op if every connection is already closing. */
+    void taz_conn_force_close_all(const uv_loop_t *loop);
+
+    /* Number of connections open on loop (in g_conns, whether closing or
+     * not): tests only. */
+    size_t taz_conn_open_count(const uv_loop_t *loop);
 
     /* Process one frame event from the reassembly state machine.
      * Exposed for unit tests; production code uses a static wrapper.

@@ -56,6 +56,7 @@ static void on_write_done(uv_write_t *req, int status);
 static void on_close_cb(uv_handle_t *handle);
 static void alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf);
 static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
+static void on_shutdown_done(uv_shutdown_t *req, int status);
 
 /* -------------------------------------------------------------------------
  * Reference counting
@@ -162,6 +163,53 @@ static void conn_close(taz_conn_t *conn)
     uv_close((uv_handle_t *)&conn->handle, on_close_cb);
 }
 
+/* Graceful counterpart to conn_close: FIN first (uv_shutdown), then
+ * uv_close once that completes, so a peer reading to EOF sees every byte
+ * already written rather than a reset. Idempotent; must be called from the
+ * loop thread. No extra ref is needed across the async uv_shutdown
+ * request: closing is already 1, and nothing but this function's own
+ * eventual uv_close/on_close_cb ever releases the connection's base
+ * reference, so it cannot be freed out from under the pending request. */
+static void conn_shutdown(taz_conn_t *conn)
+{
+    uv_shutdown_t *req;
+    int rc;
+
+    if (conn->closing)
+    {
+        return;
+    }
+    conn->closing = 1;
+    uv_read_stop((uv_stream_t *)&conn->handle);
+    taz_dispatch_cancel_all(&conn->dispatch);
+
+    req = (uv_shutdown_t *)malloc(sizeof(*req));
+    if (req == NULL)
+    {
+        /* No memory for the graceful path: close now rather than leak. */
+        uv_close((uv_handle_t *)&conn->handle, on_close_cb);
+        return;
+    }
+    req->data = conn;
+    rc = uv_shutdown(req, (uv_stream_t *)&conn->handle, on_shutdown_done);
+    if (rc != 0)
+    {
+        free(req);
+        uv_close((uv_handle_t *)&conn->handle, on_close_cb);
+    }
+}
+
+static void on_shutdown_done(uv_shutdown_t *req, int status)
+{
+    taz_conn_t *conn = (taz_conn_t *)req->data;
+    (void)status; /* UV_ECANCELED when a force-close raced this request */
+    free(req);
+    if (!uv_is_closing((uv_handle_t *)&conn->handle))
+    {
+        uv_close((uv_handle_t *)&conn->handle, on_close_cb);
+    }
+}
+
 /* -------------------------------------------------------------------------
  * Write primitive
  * ------------------------------------------------------------------------- */
@@ -251,6 +299,14 @@ static void on_frame_cb(const taz_frame_header_t *header,
 {
     taz_conn_t *conn = (taz_conn_t *)ctx;
     int should_close = 0;
+
+    if (conn->closing)
+    {
+        /* A close began earlier in this same read (e.g. the shutdown walk
+         * ran between two frames in one TCP segment): drop it silently,
+         * same as any frame arriving after conn_close. */
+        return;
+    }
 
     taz_conn_handle_frame(&conn->dispatch, header, payload, verdict,
                           conn_write_fn, conn, &should_close);
@@ -392,13 +448,44 @@ void taz_conn_on_new_connection(uv_stream_t *server, int status)
     }
 }
 
-void taz_conn_kill_all_task_trees(const uv_loop_t *loop)
+void taz_conn_shutdown_all(const uv_loop_t *loop)
 {
-    for (taz_conn_t *conn = g_conns; conn != NULL; conn = conn->next)
+    taz_conn_t *conn = g_conns;
+    while (conn != NULL)
     {
-        if (!conn->closing && conn->dispatch.loop == loop)
+        taz_conn_t *next = conn->next;
+        if (conn->dispatch.loop == loop)
         {
-            taz_task_table_abort(&conn->dispatch.tasks);
+            conn_shutdown(conn);
+        }
+        conn = next;
+    }
+}
+
+void taz_conn_force_close_all(const uv_loop_t *loop)
+{
+    taz_conn_t *conn = g_conns;
+    while (conn != NULL)
+    {
+        taz_conn_t *next = conn->next;
+        if (conn->dispatch.loop == loop &&
+            !uv_is_closing((uv_handle_t *)&conn->handle))
+        {
+            uv_close((uv_handle_t *)&conn->handle, on_close_cb);
+        }
+        conn = next;
+    }
+}
+
+size_t taz_conn_open_count(const uv_loop_t *loop)
+{
+    size_t count = 0U;
+    for (const taz_conn_t *conn = g_conns; conn != NULL; conn = conn->next)
+    {
+        if (conn->dispatch.loop == loop)
+        {
+            count++;
         }
     }
+    return count;
 }

@@ -322,7 +322,7 @@ TEST_F(FileHandlerTest, ProcessListShutdownRequestedWhileInFlightSendsNothing)
 {
     DispatchRequest(taz_v1_Opcode_OPCODE_PROCESS_LIST,
                     encode_process_list_request(""), 8U,
-                    [this]() { RequestShutdown(); });
+                    []() { RequestShutdown(); });
 
     EXPECT_EQ(Frames().size(), 0U);
     EXPECT_EQ(ActiveStreamCount(), 0U);
@@ -897,7 +897,7 @@ TEST_F(FileHandlerTest, ProcessInfoShutdownRequestedWhileInFlightSendsNothing)
 {
     DispatchRequest(taz_v1_Opcode_OPCODE_PROCESS_INFO,
                     encode_process_info_request(SelfPid()), 25U,
-                    [this]() { RequestShutdown(); });
+                    []() { RequestShutdown(); });
 
     EXPECT_EQ(Frames().size(), 0U);
     EXPECT_EQ(ActiveStreamCount(), 0U);

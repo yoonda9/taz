@@ -1,6 +1,7 @@
 #ifndef TAZ_WORK_H
 #define TAZ_WORK_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "taz/dispatch.h"
@@ -35,40 +36,43 @@ extern "C"
     /* Like taz_work_submit, but the stream is NOT released afterwards: one
      * step of a multi-step stream whose owner calls taz_dispatch_stream_done
      * itself. Still pins the connection, still counted by
-     * taz_work_request_shutdown. */
+     * taz_work_outstanding and cancellable by taz_work_begin_shutdown. */
     int taz_work_submit_step(taz_dispatch_t *d, taz_work_fn_t work,
                              taz_work_done_fn_t done, void *user);
 
-    /* 1 once taz_work_request_shutdown has been called (whether or not
-     * uv_stop has fired). */
+    /* Like taz_work_submit_step, but taz_work_begin_shutdown never cancels
+     * it: for cleanup steps (closing an fd, removing a temp file) whose
+     * work must actually run even when the daemon is stopping. */
+    int taz_work_submit_cleanup(taz_dispatch_t *d, taz_work_fn_t work,
+                                taz_work_done_fn_t done, void *user);
+
+    /* 1 once taz_work_begin_shutdown has been called. Sticky: stays 1 until
+     * taz_work_reset_for_tests. */
     int taz_work_shutdown_requested(void);
 
-    /* Reset the shutdown_requested flag to 0. Unit tests only: allows tests
-     * to run in sequence without the sticky flag from a prior shutdown test
-     * breaking subsequent tests. */
+    /* Number of taz_work_submit/taz_work_submit_step calls that have not
+     * yet reached the end of on_after_work. Unit tests only. */
+    size_t taz_work_outstanding(void);
+
+    /* Reset the shutdown_requested flag to 0 and forget every outstanding
+     * wrapper the module was tracking. Unit tests only: allows tests to
+     * run in sequence without the sticky flag (or a stale list entry) from
+     * a prior shutdown test breaking subsequent tests. */
     void taz_work_reset_for_tests(void);
 
-    /* Call from a signal/console-ctrl handler running on loop's own thread
-     * instead of uv_stop(loop) directly. uv_stop() halts the loop on the
-     * next iteration regardless of outstanding uv_queue_work items; since
-     * those run on a separate pool thread and post their completion back
-     * into *loop once done, stopping (and the caller returning from
-     * uv_run, then tearing down loop) while one is still in flight leaves
-     * the pool thread to post into freed/invalid memory. This defers the
-     * actual uv_stop() until every taz_work_submit call still outstanding
-     * has reached its on-loop-thread completion, or issues it immediately
-     * if none are outstanding. Idempotent; safe to call more than once. */
-    void taz_work_request_shutdown(uv_loop_t *loop);
-
-    /* A hook invoked once, synchronously, at the very start of
-     * taz_work_request_shutdown - strictly before its outstanding-count
-     * check and before uv_stop can be issued - so it always runs on the
-     * loop thread while the loop is still executing. main.c uses this to
-     * reach connection.c's taz_conn_kill_all_task_trees without work.c
-     * needing to know what a connection is; NULL (the default, and what
-     * taz_work_reset_for_tests restores) means no hook runs. */
-    typedef void (*taz_work_shutdown_hook_fn_t)(const uv_loop_t *loop);
-    void taz_work_set_shutdown_hook(taz_work_shutdown_hook_fn_t hook);
+    /* Call from a signal/console-ctrl handler, or the shutdown walk,
+     * running on loop's own thread. Sets the sticky shutdown_requested
+     * flag, then uv_cancels every taz_work_submit/taz_work_submit_step
+     * call still outstanding (never a taz_work_submit_cleanup one): a call that
+     * has not yet started on a pool thread is cancelled (its done callback runs
+     * with closing=1 on the loop thread, as if it had completed); a call
+     * already running on a pool thread gets UV_EBUSY from uv_cancel and simply
+     * keeps going to completion, done(user, 1) still running once it does.
+     * Never calls uv_stop: the loop is left to exit on its own once every
+     * handle and request - including any still-running pool work, whose
+     * uv_work_t keeps the loop alive - is gone. Idempotent; safe to call more
+     * than once. */
+    void taz_work_begin_shutdown(void);
 
 #ifdef __cplusplus
 }

@@ -240,13 +240,25 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/build_info.c.in
 # Core logic library (frame pack/unpack/validate; shared by daemon and tests)
 # ---------------------------------------------------------------------------
 # Process enumeration/inspection/kill lives behind taz/process.h, split by
-# platform the same way TAZ_PLATFORM_SRC splits signal handling below, but
-# built into taz_core (not just tazd) so the unit tests can link it.
+# platform the same way TAZ_PLATFORM_SRC below splits signal handling, both
+# built into taz_core (not just tazd) so the unit tests can link them.
 set(TAZ_PROCESS_SRC "")
 if(WIN32)
     set(TAZ_PROCESS_SRC src/platform/process_win32.c)
 else()
     set(TAZ_PROCESS_SRC src/platform/process_linux.c)
+endif()
+
+# Signal (POSIX) / console-ctrl (Windows) handling lives behind
+# taz/platform.h, split by platform the same way; built into taz_core (not
+# just tazd) so test_shutdown.cpp can drive taz_platform_init_signals and
+# taz_platform_close_signals on a real loop. Win32 and POSIX code are never
+# compiled together.
+set(TAZ_PLATFORM_SRC "")
+if(WIN32)
+    set(TAZ_PLATFORM_SRC src/platform_win32.c)
+else()
+    set(TAZ_PLATFORM_SRC src/platform_posix.c)
 endif()
 
 add_library(
@@ -262,6 +274,7 @@ add_library(
     src/response.c
     src/exec.c
     src/server.c
+    src/shutdown.c
     src/work.c
     src/fsutil.c
     src/crc32c.c
@@ -284,6 +297,7 @@ add_library(
     src/handlers/task_cancel.c
     src/platform/process_common.c
     ${TAZ_PROCESS_SRC}
+    ${TAZ_PLATFORM_SRC}
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
 # Stop <windows.h> from including the old <winsock.h>, which clashes with the
@@ -305,15 +319,7 @@ target_link_libraries(
 # ---------------------------------------------------------------------------
 # Daemon executable
 # ---------------------------------------------------------------------------
-# Platform-specific signal handling and I/O flushing live in separate files so
-# Win32 and POSIX code are never compiled together.
-if(WIN32)
-    set(TAZ_PLATFORM_SRC src/platform_win32.c)
-else()
-    set(TAZ_PLATFORM_SRC src/platform_posix.c)
-endif()
-
-add_executable(tazd src/main.c ${TAZ_PLATFORM_SRC})
+add_executable(tazd src/main.c)
 # include/, _GNU_SOURCE, taz::proto, and libuv::uv_a come in transitively.
 target_link_libraries(tazd PRIVATE taz_warnings taz_core)
 

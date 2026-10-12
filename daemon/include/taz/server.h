@@ -12,6 +12,7 @@ extern "C"
     {
         uv_loop_t loop;
         uv_tcp_t handle;
+        int port; /* bound port, set by taz_server_start on success */
     } taz_server_t;
 
     /* Set UV_THREADPOOL_SIZE to 8 (libuv's default is 4) unless the
@@ -21,13 +22,24 @@ extern "C"
 
     /* Initialise server, bind to host:port, start listening. host is an IPv4
      * or IPv6 literal ("127.0.0.1", "::1", "0.0.0.0", "::"); names are not
-     * resolved. Pass port=0 for an OS-assigned ephemeral port.
-     * Prints "LISTENING port=<N>" to stdout and flushes on success so that
-     * a test fixture can parse the actual port even when using --port 0.
+     * resolved. Pass port=0 for an OS-assigned ephemeral port; server->port
+     * holds the bound port on success. Prints nothing: see
+     * taz_server_announce.
      * on_connect is forwarded to uv_listen and must not be NULL.
      * Returns 0 on success, a negative libuv error code on failure. */
     int taz_server_start(taz_server_t *server, const char *host, int port,
                          uv_connection_cb on_connect);
+
+    /* Print "LISTENING port=<N>" to stdout and flush, so that a test
+     * fixture can parse the actual port even when using --port 0. main
+     * calls it only once the signal handlers are installed: whoever reads
+     * the line may stop the daemon at once, and a SIGTERM before then
+     * would take the OS default action instead of the graceful walk. */
+    void taz_server_announce(const taz_server_t *server);
+
+    /* Close the listening socket (uv_is_closing guard: a no-op if already
+     * closing). Part of the shutdown walk; also usable on its own. */
+    void taz_server_close_listener(taz_server_t *server);
 
 #ifdef __cplusplus
 }

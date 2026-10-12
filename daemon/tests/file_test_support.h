@@ -587,15 +587,17 @@ class FileHandlerTest : public ::testing::Test
         taz_dispatch_cancel_all(&d_);
     }
 
-    // Mirrors a SIGTERM/SIGINT handler: requests the deferred shutdown that
-    // makes outstanding taz_work_submit_step work finish (closing == 1 in
-    // its done callback) before the loop is allowed to stop. Sticky across
-    // the whole test binary process - callers must pair this with
-    // taz_work_reset_for_tests() before returning (mem: a forgotten reset
-    // broke 49/288 later FileHandlerTest cases under just test-valgrind).
-    void RequestShutdown()
+    // Mirrors a SIGTERM/SIGINT handler: sets the sticky shutdown flag and
+    // cancels every outstanding taz_work_submit/taz_work_submit_step call
+    // (closing == 1 in its done callback once it reaches on_after_work,
+    // whether cancelled while queued or finishing because it was already
+    // running). Sticky across the whole test binary process - callers must
+    // pair this with taz_work_reset_for_tests() before returning (mem: a
+    // forgotten reset broke 49/288 later FileHandlerTest cases under just
+    // test-valgrind).
+    static void RequestShutdown()
     {
-        taz_work_request_shutdown(&loop_);
+        taz_work_begin_shutdown();
     }
 
     // Notifies every stream registered with on_writable that a write just

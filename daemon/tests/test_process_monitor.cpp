@@ -1446,10 +1446,10 @@ TEST_F(FileHandlerTest,
 }
 
 // ---------------------------------------------------------------------------
-// Shutdown (SIGTERM via taz_work_request_shutdown)
+// Shutdown (SIGTERM via taz_work_begin_shutdown)
 // ---------------------------------------------------------------------------
 
-TEST_F(FileHandlerTest, MonitorShutdownWhileSampleInFlightStopsLoopThenDrains)
+TEST_F(FileHandlerTest, MonitorShutdownCancelsInFlightSampleThenLoopDrains)
 {
     uv_process_t process{};
     SpawnOutcome outcome;
@@ -1463,28 +1463,30 @@ TEST_F(FileHandlerTest, MonitorShutdownWhileSampleInFlightStopsLoopThenDrains)
 
     RequestShutdown();
     const size_t before = Frames().size();
-    // Not the fixture's strict RunLoop(): the sleeper is still alive, and
-    // uv_run only needs to drain the one outstanding sample, not every
-    // handle, before taz_work_request_shutdown's own uv_stop takes effect.
-    EXPECT_GE(uv_run(Loop(), UV_RUN_DEFAULT), 0);
-    EXPECT_EQ(Frames().size(),
-              before); // no frame after shutdown was requested.
 
+    // No uv_stop anywhere: taz_work_begin_shutdown only cancelled or
+    // flagged the in-flight sample. The sleeper process is a handle this
+    // test owns, not one shutdown touches, so it is killed and closed
+    // before the loop is asked to drain to completion - otherwise it would
+    // keep running for the length of the sleep.
     ASSERT_EQ(uv_process_kill(&process, SIGKILL), 0);
     RunLoopUntil(Loop(), [&]() { return outcome.called; }, 5000);
-    CloseConnectionAndCancelAll(); // safety net: idempotent if already torn
-                                   // down by the shutdown drain above.
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+
+    // The sample's done callback (cancelled or finished, either way with
+    // closing=1) tears the monitor's own timer and poll down; nothing else
+    // is left once that and the process handle above are gone.
     RunLoop();
 
+    EXPECT_EQ(Frames().size(),
+              before); // no frame sent after shutdown was requested.
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());
 
-    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
-    RunLoop();
     taz_work_reset_for_tests();
 }
 
-TEST_F(FileHandlerTest, MonitorShutdownWhileIdleStopsLoopImmediatelyThenDrains)
+TEST_F(FileHandlerTest, MonitorShutdownWhileIdleLeavesTimerForConnCloseToAbort)
 {
     uv_process_t process{};
     SpawnOutcome outcome;
@@ -1496,22 +1498,25 @@ TEST_F(FileHandlerTest, MonitorShutdownWhileIdleStopsLoopImmediatelyThenDrains)
     RunLoopUntil(Loop(), [&]() { return !Frames().empty(); }, 1000);
     const size_t before = Frames().size();
 
-    // No sample in flight: taz_work_request_shutdown calls uv_stop
-    // synchronously, before this uv_run call even starts - it runs zero
-    // iterations (the timer never fires again).
+    // No sample in flight: on_tick sees taz_work_shutdown_requested() and
+    // skips submitting another one, but work.c has no connection to close
+    // and does not touch the monitor's own timer/poll - that is
+    // connection.c's taz_dispatch_cancel_all (monitor_abort), landing in
+    // the next task's shutdown walk. Drive it here the same way conn_close
+    // already does, so the monitor's handles still close deterministically
+    // and this test does not depend on that later task.
     RequestShutdown();
-    EXPECT_GE(uv_run(Loop(), UV_RUN_DEFAULT), 0);
-    EXPECT_EQ(Frames().size(), before);
+    CloseConnectionAndCancelAll();
 
     ASSERT_EQ(uv_process_kill(&process, SIGKILL), 0);
     RunLoopUntil(Loop(), [&]() { return outcome.called; }, 5000);
-    CloseConnectionAndCancelAll();
+    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
+
     RunLoop();
 
+    EXPECT_EQ(Frames().size(), before);
     EXPECT_EQ(ActiveStreamCount(), 0U);
     EXPECT_EQ(RefCount(), UnrefCount());
 
-    uv_close(reinterpret_cast<uv_handle_t *>(&process), nullptr);
-    RunLoop();
     taz_work_reset_for_tests();
 }

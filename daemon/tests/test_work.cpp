@@ -3,6 +3,8 @@
 // behind conn_closing, a single pre-populated active stream) stands in for
 // connection.c.
 
+#include <vector>
+
 #include <gtest/gtest.h>
 #include <uv.h>
 
@@ -197,134 +199,226 @@ TEST(Work, CloseWhileInFlightStillDeliversDoneWithClosingTrue)
     uv_sem_destroy(&w.release);
 }
 
-namespace
+TEST(Work, ShutdownRequestedStaysStickyUntilReset)
 {
+    ASSERT_EQ(taz_work_shutdown_requested(), 0);
 
-// A hook set via taz_work_set_shutdown_hook runs synchronously inside
-// taz_work_request_shutdown itself, strictly before the outstanding-count
-// check decides whether uv_stop fires immediately or is deferred - main.c
-// relies on this ordering to kill every connection's detached task trees
-// while the loop is still guaranteed to be running.
-int g_hook_calls = 0;
-const uv_loop_t *g_hook_loop = nullptr;
+    taz_work_begin_shutdown();
+    EXPECT_EQ(taz_work_shutdown_requested(), 1);
 
-void CountingHook(const uv_loop_t *loop)
-{
-    g_hook_calls++;
-    g_hook_loop = loop;
-}
-
-} // namespace
-
-TEST(Work, RequestShutdownInvokesHookBeforeStoppingImmediately)
-{
-    uv_loop_t loop;
-    ASSERT_EQ(uv_loop_init(&loop), 0);
-    g_hook_calls = 0;
-    g_hook_loop = nullptr;
-
-    taz_work_set_shutdown_hook(CountingHook);
-    taz_work_request_shutdown(&loop);
-
-    EXPECT_EQ(g_hook_calls, 1);
-    EXPECT_EQ(g_hook_loop, &loop);
-
-    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
-    ASSERT_EQ(uv_loop_close(&loop), 0);
+    // Idempotent: nothing outstanding, calling it again must not crash and
+    // must not change the flag.
+    taz_work_begin_shutdown();
+    EXPECT_EQ(taz_work_shutdown_requested(), 1);
 
     taz_work_reset_for_tests();
+    EXPECT_EQ(taz_work_shutdown_requested(), 0);
 }
 
-TEST(Work, NoHookSetIsANoop)
+TEST(Work, SubmitAfterShutdownBeganIsStillAcceptedWithClosingTrue)
 {
     uv_loop_t loop;
     ASSERT_EQ(uv_loop_init(&loop), 0);
-
-    uv_timer_t never_fires;
-    ASSERT_EQ(uv_timer_init(&loop, &never_fires), 0);
-    ASSERT_EQ(uv_timer_start(&never_fires, [](uv_timer_t *) {}, 2000U, 0U), 0);
-
-    // No taz_work_set_shutdown_hook call this time: must not crash, and
-    // shutdown proceeds exactly as before the hook mechanism existed -
-    // stopping the loop promptly despite the still-active timer.
-    taz_work_request_shutdown(&loop);
-    EXPECT_NE(uv_run(&loop, UV_RUN_DEFAULT), 0);
-
-    uv_close(reinterpret_cast<uv_handle_t *>(&never_fires), nullptr);
-    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
-    ASSERT_EQ(uv_loop_close(&loop), 0);
-    taz_work_reset_for_tests();
-}
-
-TEST(Work, RequestShutdownStopsImmediatelyWhenNothingOutstanding)
-{
-    uv_loop_t loop;
-    ASSERT_EQ(uv_loop_init(&loop), 0);
-
-    // A handle that stays active on its own, so that without a stop
-    // request UV_RUN_DEFAULT would block on it instead of returning.
-    uv_timer_t never_fires;
-    ASSERT_EQ(uv_timer_init(&loop, &never_fires), 0);
-    ASSERT_EQ(uv_timer_start(&never_fires, [](uv_timer_t *) {}, 2000U, 0U), 0);
-
-    taz_work_request_shutdown(&loop);
-
-    // Returns promptly despite the still-active timer: nothing was
-    // outstanding, so the stop was issued immediately.
-    EXPECT_NE(uv_run(&loop, UV_RUN_DEFAULT), 0);
-
-    uv_close(reinterpret_cast<uv_handle_t *>(&never_fires), nullptr);
-    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
-    ASSERT_EQ(uv_loop_close(&loop), 0);
-}
-
-TEST(Work, RequestShutdownWaitsForOutstandingWorkBeforeStopping)
-{
-    // Regression test: a signal handler that called uv_stop() directly
-    // raced a still-running uv_queue_work item posting its completion back
-    // into the loop/connection the handler's caller was about to tear
-    // down, segfaulting on a pool thread. taz_work_request_shutdown must
-    // let the work finish (and its done callback run) before the loop is
-    // allowed to stop.
-    uv_loop_t loop;
-    ASSERT_EQ(uv_loop_init(&loop), 0);
-
-    uv_timer_t never_fires;
-    ASSERT_EQ(uv_timer_init(&loop, &never_fires), 0);
-    ASSERT_EQ(uv_timer_start(&never_fires, [](uv_timer_t *) {}, 2000U, 0U), 0);
 
     FakeConn conn;
     taz_dispatch_t d;
     InitFakeDispatch(&d, &loop, &conn);
-    d.active_streams[0] = 9U;
+    d.active_streams[0] = 3U;
     d.active_count = 1U;
 
-    BlockingWorkCtx w;
+    // A cleanup step must still be able to run after shutdown has begun:
+    // taz_work_submit itself never refuses.
+    taz_work_begin_shutdown();
+
+    WorkCtx w;
     w.d = &d;
     w.conn = &conn;
-    ASSERT_EQ(uv_sem_init(&w.started, 0U), 0);
-    ASSERT_EQ(uv_sem_init(&w.release, 0U), 0);
+    ASSERT_EQ(taz_work_submit(&d, 3U, CaptureWork, CaptureDone, &w), 0);
 
-    ASSERT_EQ(taz_work_submit(&d, 9U, BlockingWork, BlockingDone, &w), 0);
-    ASSERT_NE(uv_run(&loop, UV_RUN_NOWAIT), 0);
-    uv_sem_wait(&w.started);
-
-    taz_work_request_shutdown(&loop);
-    // Still running on the pool thread: must not have stopped yet.
-    EXPECT_EQ(w.done_calls, 0);
-
-    uv_sem_post(&w.release);
-    // Returns promptly despite the still-active timer: the deferred stop
-    // fired as soon as the work's done callback ran.
-    EXPECT_NE(uv_run(&loop, UV_RUN_DEFAULT), 0);
-    EXPECT_EQ(w.done_calls, 1);
-
-    uv_close(reinterpret_cast<uv_handle_t *>(&never_fires), nullptr);
     ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
     ASSERT_EQ(uv_loop_close(&loop), 0);
 
-    uv_sem_destroy(&w.started);
-    uv_sem_destroy(&w.release);
+    EXPECT_EQ(w.done_calls, 1);
+    EXPECT_EQ(w.done_closing, 1);
+
+    taz_work_reset_for_tests();
+}
+
+TEST(Work, ResetForTestsClearsFlagAndOutstandingCount)
+{
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    FakeConn conn;
+    taz_dispatch_t d;
+    InitFakeDispatch(&d, &loop, &conn);
+    d.active_streams[0] = 4U;
+    d.active_count = 1U;
+
+    WorkCtx w;
+    w.d = &d;
+    w.conn = &conn;
+
+    EXPECT_EQ(taz_work_outstanding(), 0U);
+    ASSERT_EQ(taz_work_submit(&d, 4U, CaptureWork, CaptureDone, &w), 0);
+    EXPECT_EQ(taz_work_outstanding(), 1U);
+
+    taz_work_begin_shutdown();
+    EXPECT_EQ(taz_work_shutdown_requested(), 1);
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+    EXPECT_EQ(taz_work_outstanding(), 0U);
+
+    taz_work_reset_for_tests();
+    EXPECT_EQ(taz_work_shutdown_requested(), 0);
+    EXPECT_EQ(taz_work_outstanding(), 0U);
+}
+
+namespace
+{
+
+// A work item that proves whether it ever actually ran, for the
+// cancel-while-queued row below: the regular CaptureWork/BlockingWork
+// helpers above only prove a done callback fired, not that the work
+// callback was skipped.
+struct CancelTargetCtx
+{
+    const taz_dispatch_t *d = nullptr;
+    const FakeConn *conn = nullptr;
+    bool ran = false;
+    int done_calls = 0;
+    int done_closing = -1;
+};
+
+void CancelTargetWork(void *user)
+{
+    static_cast<CancelTargetCtx *>(user)->ran = true;
+}
+
+void CancelTargetDone(void *user, int closing)
+{
+    auto *w = static_cast<CancelTargetCtx *>(user);
+    w->done_calls++;
+    w->done_closing = closing;
+}
+
+} // namespace
+
+TEST(Work, BeginShutdownCancelsQueuedWorkBeforeItEverRuns)
+{
+    // libuv's thread-pool work queue is strict FIFO: an item can only be
+    // dequeued once every item ahead of it has been popped. Saturate the
+    // pool with more permanently-blocked jobs than it could possibly have
+    // worker threads for (this project configures at most 8), so every
+    // worker is guaranteed busy on one of those and the item submitted
+    // after them is still sitting on the queue - cancellable - no matter
+    // how the pool threads happen to get scheduled.
+    constexpr unsigned kSaturateCount = 16U;
+
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    FakeConn conn;
+    taz_dispatch_t d;
+    InitFakeDispatch(&d, &loop, &conn);
+    d.active_streams[0] = 55U;
+    d.active_count = 1U;
+
+    std::vector<BlockingWorkCtx> saturators(kSaturateCount);
+    for (auto &s : saturators)
+    {
+        s.d = &d;
+        s.conn = &conn;
+        ASSERT_EQ(uv_sem_init(&s.started, 0U), 0);
+        ASSERT_EQ(uv_sem_init(&s.release, 0U), 0);
+        // submit_step: never touches active_streams, so it cannot disturb
+        // the target's stream slot below.
+        ASSERT_EQ(taz_work_submit_step(&d, BlockingWork, BlockingDone, &s), 0);
+    }
+
+    CancelTargetCtx target;
+    target.d = &d;
+    target.conn = &conn;
+    ASSERT_EQ(
+        taz_work_submit(&d, 55U, CancelTargetWork, CancelTargetDone, &target),
+        0);
+
+    taz_work_begin_shutdown();
+    EXPECT_EQ(taz_work_shutdown_requested(), 1);
+
+    for (auto &s : saturators)
+    {
+        uv_sem_post(&s.release);
+    }
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    EXPECT_FALSE(target.ran);
+    EXPECT_EQ(target.done_calls, 1);
+    EXPECT_EQ(target.done_closing, 1);
+    EXPECT_EQ(d.active_count, 0U); // stream released despite the cancel.
+
+    for (auto &s : saturators)
+    {
+        uv_sem_destroy(&s.started);
+        uv_sem_destroy(&s.release);
+    }
+
+    taz_work_reset_for_tests();
+}
+
+TEST(Work, BeginShutdownNeverCancelsQueuedCleanupWork)
+{
+    // Same saturated pool as above, but the queued item is a cleanup step
+    // (closing an fd, removing a temp file): it must still run.
+    constexpr unsigned kSaturateCount = 16U;
+
+    uv_loop_t loop;
+    ASSERT_EQ(uv_loop_init(&loop), 0);
+
+    FakeConn conn;
+    taz_dispatch_t d;
+    InitFakeDispatch(&d, &loop, &conn);
+
+    std::vector<BlockingWorkCtx> saturators(kSaturateCount);
+    for (auto &s : saturators)
+    {
+        s.d = &d;
+        s.conn = &conn;
+        ASSERT_EQ(uv_sem_init(&s.started, 0U), 0);
+        ASSERT_EQ(uv_sem_init(&s.release, 0U), 0);
+        ASSERT_EQ(taz_work_submit_step(&d, BlockingWork, BlockingDone, &s), 0);
+    }
+
+    CancelTargetCtx target;
+    target.d = &d;
+    target.conn = &conn;
+    ASSERT_EQ(taz_work_submit_cleanup(&d, CancelTargetWork, CancelTargetDone,
+                                      &target),
+              0);
+
+    taz_work_begin_shutdown();
+
+    for (auto &s : saturators)
+    {
+        uv_sem_post(&s.release);
+    }
+
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
+    EXPECT_TRUE(target.ran);
+    EXPECT_EQ(target.done_calls, 1);
+    EXPECT_EQ(target.done_closing, 1);
+    EXPECT_EQ(conn.ref_count, conn.unref_count);
+
+    for (auto &s : saturators)
+    {
+        uv_sem_destroy(&s.started);
+        uv_sem_destroy(&s.release);
+    }
 
     taz_work_reset_for_tests();
 }
@@ -458,14 +552,10 @@ void ShutdownStepDone(void *user, int closing)
 
 } // namespace
 
-TEST(Work, RequestShutdownOnStepWaitsAndReportsClosing)
+TEST(Work, BeginShutdownLetsRunningStepFinishThenLoopExitsOnItsOwn)
 {
     uv_loop_t loop;
     ASSERT_EQ(uv_loop_init(&loop), 0);
-
-    uv_timer_t never_fires;
-    ASSERT_EQ(uv_timer_init(&loop, &never_fires), 0);
-    ASSERT_EQ(uv_timer_start(&never_fires, [](uv_timer_t *) {}, 2000U, 0U), 0);
 
     FakeConn conn;
     taz_dispatch_t d;
@@ -483,27 +573,25 @@ TEST(Work, RequestShutdownOnStepWaitsAndReportsClosing)
     ASSERT_EQ(taz_work_submit_step(&d, BlockingStepWork, ShutdownStepDone, &w),
               0);
     ASSERT_NE(uv_run(&loop, UV_RUN_NOWAIT), 0);
-    uv_sem_wait(&w.started);
+    uv_sem_wait(&w.started); // now actually running on a pool thread.
 
-    taz_work_request_shutdown(&loop);
+    taz_work_begin_shutdown();
     EXPECT_EQ(taz_work_shutdown_requested(), 1);
-    // Still running on the pool thread: must not have stopped yet.
+    // uv_cancel on work already running returns UV_EBUSY: it keeps going.
     EXPECT_EQ(w.done_calls, 0);
 
     uv_sem_post(&w.release);
-    // Returns promptly despite the still-active timer: the deferred stop
-    // fired as soon as the work's done callback ran.
-    EXPECT_NE(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    // No uv_stop anywhere: the loop exits on its own once the only
+    // outstanding request (this one) completes.
+    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
+    ASSERT_EQ(uv_loop_close(&loop), 0);
+
     EXPECT_EQ(w.done_calls, 1);
     // The step's done should see closing=1 due to shutdown.
     EXPECT_EQ(w.done_closing, 1);
     // Stream should still be active: steps don't release.
     EXPECT_EQ(w.active_count_at_done, 1U);
     EXPECT_EQ(w.unref_count_at_done, 0);
-
-    uv_close(reinterpret_cast<uv_handle_t *>(&never_fires), nullptr);
-    ASSERT_EQ(uv_run(&loop, UV_RUN_DEFAULT), 0);
-    ASSERT_EQ(uv_loop_close(&loop), 0);
 
     uv_sem_destroy(&w.started);
     uv_sem_destroy(&w.release);

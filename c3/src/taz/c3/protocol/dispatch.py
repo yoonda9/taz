@@ -423,6 +423,9 @@ class Dispatcher:
         Called immediately after Connection._send_ping(); the caller already
         sent the PING so the keepalive.timeout is the only relevant wait.
         """
+        # A connection lost earlier (perhaps while reading for another
+        # stream) re-raises that loss, not a bare "not connected".
+        self._conn._check_failure()
         sock = self._conn._sock
         if sock is None:
             raise RuntimeError("not connected")
@@ -533,6 +536,9 @@ class Dispatcher:
         if buffered is not None:
             return buffered
 
+        # A connection lost earlier (perhaps while reading for another
+        # stream) re-raises that loss, not a bare "not connected".
+        self._conn._check_failure()
         sock = self._conn._sock
         if sock is None:
             raise RuntimeError("not connected")

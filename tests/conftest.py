@@ -7,27 +7,55 @@ silently pass as a skipped run.
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import os
 import re
+import shlex
+import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 
 import pytest
 from taz.c3 import TazClient
 from taz.c3.settings import Backlog, Keepalive
 
-# Sanitizer reports that fail a test even though the daemon may keep running:
-# UBSan recovers from "runtime error" by default, and ASan/TSan reports would
-# otherwise only surface as a lost connection.
+# Sanitizer/leak reports that fail a test even though the daemon may keep
+# running: UBSan recovers from "runtime error" by default, and ASan/TSan/LSan
+# reports would otherwise only surface as a lost connection. Graceful shutdown
+# closes every handle, so a stopped daemon must never print any of these.
 _SANITIZER_ERRORS = (
     "ERROR: AddressSanitizer",
     "WARNING: ThreadSanitizer",
     "runtime error:",
+    "LeakSanitizer",
 )
+
+_PR_SET_PDEATHSIG = 1
+
+# Resolved here, at import, never in the forked child: a dlopen/dlsym there
+# could deadlock on a loader lock another thread held at fork time.
+_prctl = ctypes.CDLL(None, use_errno=True).prctl if sys.platform == "linux" else None
+
+
+def _pdeathsig_preexec(parent_pid: int) -> Callable[[], None]:
+    """A ``preexec_fn`` that makes the daemon child get SIGTERM if the
+    thread that forked it dies first, even if an outer pytest timeout kills
+    the test before fixture teardown runs (two tazd from a prior run were
+    once found still running 11 hours later). ``_launch`` runs on pytest's
+    main thread, so that thread's death is pytest's own."""
+
+    def _apply() -> None:
+        assert _prctl is not None
+        _prctl(_PR_SET_PDEATHSIG, signal.SIGTERM)
+        # The parent died between fork and prctl: no signal will ever come.
+        if os.getppid() != parent_pid:
+            os._exit(1)
+
+    return _apply
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -66,7 +94,17 @@ class Daemon:
 
     proc: subprocess.Popen[bytes]
     port: int
+    # The pid ``stop()`` signals. Equal to ``proc.pid`` at launch; a restart
+    # test repoints this to the successor's pid on Windows, where the
+    # restarted daemon is a new process that ``proc`` no longer refers to.
+    pid: int = 0
     stderr: str = ""
+    # > 1 under a slow wrapper (e.g. Valgrind): timing assertions multiply
+    # their deadline by this.
+    timing_scale: float = 1.0
+    # Set when stop() had to fall back to a forced kill: a graceful stop
+    # must never need it, so it fails the strict-exit check on its own.
+    _killed: bool = dataclasses.field(default=False, repr=False, compare=False)
     _stderr_chunks: list[bytes] = dataclasses.field(
         default_factory=list, repr=False, compare=False
     )
@@ -86,12 +124,23 @@ class Daemon:
         self._stderr_thread.start()
 
     def stop(self) -> None:
-        """Terminate the daemon and collect its stderr; idempotent."""
+        """Stop the daemon gracefully and collect its stderr; idempotent.
+
+        A new process group ignores CTRL_C, so Windows asks for a graceful
+        stop with CTRL_BREAK_EVENT instead of ``Popen.terminate()`` (which
+        is ``TerminateProcess`` on Windows and would never exercise the
+        daemon's console-control handler at all).
+        """
         if self.proc.returncode is None:
-            self.proc.terminate()
+            # send_signal is a no-op once the process has already exited.
+            if sys.platform == "win32":
+                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                self.proc.terminate()
             try:
                 self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
+                self._killed = True
                 self.proc.kill()
                 self.proc.wait(timeout=5)
         if self._stderr_thread is not None:
@@ -110,17 +159,37 @@ class Daemon:
 
 
 def _launch(binary: Path, env: dict[str, str] | None = None) -> Daemon:
-    proc = subprocess.Popen(
-        [str(binary), "--port", "0"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={**os.environ, **env} if env else None,
-    )
+    # TAZ_DAEMON_WRAPPER (e.g. a Valgrind invocation) is prepended to argv;
+    # under a wrapper the daemon is much slower to start and to stop, so
+    # timing assertions must scale their deadlines too.
+    wrapper_env = os.environ.get("TAZ_DAEMON_WRAPPER")
+    wrapper = shlex.split(wrapper_env) if wrapper_env else []
+    argv = [*wrapper, str(binary), "--port", "0"]
+    merged_env = {**os.environ, **env} if env else None
+    if sys.platform == "win32":
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=merged_env,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    else:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=merged_env,
+            preexec_fn=(
+                _pdeathsig_preexec(os.getpid()) if sys.platform == "linux" else None
+            ),
+        )
     assert proc.stdout is not None
-    daemon = Daemon(proc, 0)
+    daemon = Daemon(proc, 0, pid=proc.pid, timing_scale=5.0 if wrapper else 1.0)
     daemon._start_stderr_reader()
-    # The daemon flushes this line right after binding, so readline() returns
-    # promptly; EOF means it died before listening.
+    # The daemon flushes this line once it is bound and its signal handlers
+    # are installed, so readline() returns promptly and stop() may follow at
+    # once; EOF means it died before listening.
     line = proc.stdout.readline()
     m = re.search(rb"LISTENING port=(\d+)", line)
     if m is None:
@@ -134,19 +203,19 @@ def _launch(binary: Path, env: dict[str, str] | None = None) -> Daemon:
 
 
 def _check_exit(daemon: Daemon) -> None:
+    """Every stopped daemon must exit 0 with no sanitizer/leak output, on
+    every platform; a forced-kill fallback is itself a failure."""
     err = daemon.stderr
     if any(marker in err for marker in _SANITIZER_ERRORS):
         pytest.fail(f"daemon reported a sanitizer error:\n{err}")
-    # SIGTERM stops the loop without closing its handles, so an ASan build
-    # exits 1 with a LeakSanitizer report; that is the only non-zero exit
-    # tolerated. TerminateProcess on Windows always yields 1.
-    if (
-        sys.platform != "win32"
-        and daemon.proc.returncode != 0
-        and "LeakSanitizer" not in err
-    ):
+    if daemon._killed:
         pytest.fail(
-            f"daemon exited with {daemon.proc.returncode} after SIGTERM; stderr:\n{err}"
+            f"daemon did not stop within the timeout and had to be"
+            f" force-killed; stderr:\n{err}"
+        )
+    if daemon.proc.returncode != 0:
+        pytest.fail(
+            f"daemon exited with {daemon.proc.returncode} after stop(); stderr:\n{err}"
         )
 
 

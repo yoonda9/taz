@@ -8,10 +8,11 @@
 //     connection.c on connection close) now calls it too, so a closing
 //     connection's detached tasks die along with everything else it was
 //     running.
-//   - connection.c's taz_conn_kill_all_task_trees walks its list of live
-//     connections on a loop and does the same, for the SIGTERM path (wired
-//     through work.c's shutdown hook in src/main.c; that wiring is tested
-//     separately in test_work.cpp, since it needs no connection at all).
+//   - connection.c's taz_conn_shutdown_all walks its list of live
+//     connections on a loop and gracefully closes each one (which takes
+//     every detached task and in-flight exec down with it, via the same
+//     taz_dispatch_cancel_all path); it is part of the shutdown walk
+//     exercised end-to-end in test_shutdown.cpp.
 
 #include <cstdint>
 #include <cstring>
@@ -54,6 +55,11 @@ struct ExecDone
     bool cancelled = false;
     taz_task_table_t *table = nullptr;
     uint32_t task_id = 0U;
+    // Set only by tests that run this exec against a real taz_conn_t (not
+    // FileHandlerTest's fake dispatch): pins the connection so
+    // taz_conn_shutdown_all can never free it (and the task table *table
+    // points into) while this exec is still running.
+    taz_dispatch_t *d = nullptr;
 };
 
 void OnExecDone(const taz_exec_result_t *result, void *arg)
@@ -64,6 +70,10 @@ void OnExecDone(const taz_exec_result_t *result, void *arg)
     if (ed->table != nullptr)
     {
         taz_task_set_exec(ed->table, ed->task_id, nullptr);
+    }
+    if (ed->d != nullptr)
+    {
+        taz_dispatch_conn_unref(ed->d);
     }
 }
 
@@ -274,7 +284,7 @@ TEST_F(FileHandlerTest, SubscriberStreamCloseRaceWithARealRunningTaskIsSafe)
 }
 
 // ---------------------------------------------------------------------------
-// [LIFETIME] taz_conn_kill_all_task_trees: the SIGTERM path. A real
+// [LIFETIME] taz_conn_shutdown_all: the shutdown-walk path. A real
 // taz_conn_t (created via the production accept path, not a fake
 // dispatch) with a real running task; the listening socket itself must
 // never be mistaken for one (it carries a taz_server_t *, not a
@@ -310,7 +320,7 @@ void OnTestConnect(uv_connect_t *req, int status)
 
 } // namespace
 
-TEST(ConnectionLifetime, KillAllTaskTreesReachesConnectionsSkipsListener)
+TEST(ConnectionLifetime, ShutdownAllReachesConnectionsSkipsListener)
 {
     taz_server_t server{};
     testing::internal::CaptureStdout();
@@ -359,20 +369,26 @@ TEST(ConnectionLifetime, KillAllTaskTreesReachesConnectionsSkipsListener)
     ASSERT_NE(task_id, 0U);
     ed.table = &conn->dispatch.tasks;
     ed.task_id = task_id;
+    ed.d = &conn->dispatch;
     taz_task_set_exec(&conn->dispatch.tasks, task_id, exec);
     taz_task_set_state(&conn->dispatch.tasks, task_id,
                        taz_v1_TaskState_TASK_STATE_RUNNING);
+    // Pin the connection, like handlers/detach.c's real exec does: a
+    // closing connection's own uv_shutdown/uv_close race the killed exec's
+    // async teardown, and without this ref taz_conn_shutdown_all can free
+    // conn (and the task table ed.table points into) before OnExecDone
+    // above ever touches it.
+    taz_dispatch_conn_ref(&conn->dispatch);
 
-    taz_conn_kill_all_task_trees(&server.loop);
+    taz_conn_shutdown_all(&server.loop);
     RunLoopUntil(&server.loop, [&]() { return ed.done; }, 1000);
 
     EXPECT_TRUE(ed.cancelled);
 
-    // Teardown: close every handle this test owns itself (the listening
-    // socket included - once the accepted connection above closes, on its
-    // own close path, nothing else would ever make a bare UV_RUN_ONCE
-    // return: the still-open listener would just block waiting for a next
-    // connection that never arrives) and drain to completion with a
+    // Teardown: the accepted connection above is already gracefully
+    // closing (taz_conn_shutdown_all started it); close every handle this
+    // test owns itself (the client socket and the listener - neither is
+    // touched by taz_conn_shutdown_all) and drain to completion with a
     // single UV_RUN_DEFAULT.
     uv_close(reinterpret_cast<uv_handle_t *>(&client), nullptr);
     uv_close(reinterpret_cast<uv_handle_t *>(&server.handle), nullptr);
@@ -382,7 +398,7 @@ TEST(ConnectionLifetime, KillAllTaskTreesReachesConnectionsSkipsListener)
 
 // The listener carries a taz_server_t * in .data. A SIGTERM before any
 // client has connected must not treat it as a connection.
-TEST(ConnectionLifetime, KillAllTaskTreesBeforeAnyConnectionIsANoOp)
+TEST(ConnectionLifetime, ShutdownAllBeforeAnyConnectionIsANoOp)
 {
     taz_server_t server{};
     testing::internal::CaptureStdout();
@@ -391,7 +407,7 @@ TEST(ConnectionLifetime, KillAllTaskTreesBeforeAnyConnectionIsANoOp)
         0);
     (void)testing::internal::GetCapturedStdout();
 
-    taz_conn_kill_all_task_trees(&server.loop);
+    taz_conn_shutdown_all(&server.loop);
 
     uv_close(reinterpret_cast<uv_handle_t *>(&server.handle), nullptr);
     ASSERT_EQ(uv_run(&server.loop, UV_RUN_DEFAULT), 0);

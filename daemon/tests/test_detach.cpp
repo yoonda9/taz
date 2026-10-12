@@ -629,7 +629,7 @@ TEST_F(FileHandlerTest, DetachKilledProcessRecordsItsSignalNotExitZero)
 
 TEST_F(FileHandlerTest, DetachDuringShutdownIsBusyAndCreatesNoTask)
 {
-    taz_work_request_shutdown(Loop());
+    taz_work_begin_shutdown();
     const auto payload = DetachExecRequestBytes(TAZ_TEST_EXITER_PATH, {"0"});
     DispatchRequestNoRun(taz_v1_Opcode_OPCODE_DETACH, payload, 76U);
     taz_work_reset_for_tests();

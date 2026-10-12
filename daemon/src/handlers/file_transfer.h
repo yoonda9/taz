@@ -28,8 +28,8 @@ extern "C"
      * atomic rename into dest and FilePutResponse{confirm{bytes_written,
      * checksum}}; any failure sends ERROR, unlinks the temp, and leaves
      * dest untouched. Every blocking call runs via taz_work_submit_step, so
-     * taz_work_request_shutdown waits for an in-flight upload. Closes the
-     * stream itself. */
+     * taz_work_begin_shutdown lets an in-flight upload finish before its
+     * done callback sees closing. Closes the stream itself. */
     void handle_file_put(taz_dispatch_t *d, const taz_frame_header_t *header,
                          const uint8_t *payload,
                          taz_dispatch_write_fn_t write_fn, void *ctx);
@@ -50,8 +50,9 @@ extern "C"
      * INTERNAL. CANCEL is accepted while scanning or sending: no further
      * reads are issued (a read already in flight finishes but its chunk is
      * never sent), the fd is closed, then cancelled=true. Every blocking
-     * call runs via taz_work_submit_step, so taz_work_request_shutdown
-     * waits for an in-flight download. Closes the stream itself. */
+     * call runs via taz_work_submit_step, so taz_work_begin_shutdown lets
+     * an in-flight download finish before its done callback sees closing.
+     * Closes the stream itself. */
     void handle_file_get(taz_dispatch_t *d, const taz_frame_header_t *header,
                          const uint8_t *payload,
                          taz_dispatch_write_fn_t write_fn, void *ctx);
