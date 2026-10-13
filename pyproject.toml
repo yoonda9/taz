@@ -100,7 +100,7 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "A", "SIM", "S", "RUF"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["c3/src", "c3/tests", "tests", "tools"]
+files = ["c3/src", "c3/tests", "conftest.py", "tests", "tools"]
 exclude = ["c3/src/taz/v1/"]
 # Local stubs for dependencies whose types do not reach mypy.
 mypy_path = "typings"
