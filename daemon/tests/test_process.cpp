@@ -393,7 +393,8 @@ TEST(ProcessListSend, ThreeHundredEntriesSpanAtLeastThreeFramesInOrder)
     for (size_t i = 0U; i < decoded.size(); i++)
     {
         char expected[16];
-        (void)std::snprintf(expected, sizeof(expected), "p%04zu", i + 1U);
+        (void)std::snprintf(expected, sizeof(expected), "p%04u",
+                            static_cast<uint32_t>(i + 1U));
         EXPECT_STREQ(decoded[i].name, expected) << "entry " << i;
         EXPECT_EQ(decoded[i].pid, static_cast<uint32_t>(i + 1U))
             << "entry " << i;

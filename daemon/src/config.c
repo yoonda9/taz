@@ -177,8 +177,7 @@ static void append_applied(taz_v1_ConfigurationUpdateResponse *out,
         return;
     }
     char *dst = out->applied[out->applied_count];
-    (void)strncpy(dst, key, sizeof(out->applied[0]) - 1U);
-    dst[sizeof(out->applied[0]) - 1U] = '\0';
+    (void)snprintf(dst, sizeof(out->applied[0]), "%s", key);
     out->applied_count++;
 }
 
@@ -191,10 +190,8 @@ static void append_rejected(taz_v1_ConfigurationUpdateResponse *out,
         return;
     }
     taz_v1_RejectedKey *rk = &out->rejected[out->rejected_count];
-    (void)strncpy(rk->key, key, sizeof(rk->key) - 1U);
-    rk->key[sizeof(rk->key) - 1U] = '\0';
-    (void)strncpy(rk->reason, reason, sizeof(rk->reason) - 1U);
-    rk->reason[sizeof(rk->reason) - 1U] = '\0';
+    (void)snprintf(rk->key, sizeof(rk->key), "%s", key);
+    (void)snprintf(rk->reason, sizeof(rk->reason), "%s", reason);
     out->rejected_count++;
 }
 

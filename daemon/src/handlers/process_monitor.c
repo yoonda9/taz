@@ -1,6 +1,7 @@
 #include "process_monitor.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -143,12 +144,9 @@ static void monitor_copy_info(taz_v1_ProcessInfo *dst,
 {
     (void)memset(dst, 0, sizeof(*dst));
     dst->pid = src->pid;
-    (void)strncpy(dst->name, src->name, sizeof(dst->name) - 1U);
-    dst->name[sizeof(dst->name) - 1U] = '\0';
-    (void)strncpy(dst->user, src->user, sizeof(dst->user) - 1U);
-    dst->user[sizeof(dst->user) - 1U] = '\0';
-    (void)strncpy(dst->state, src->state, sizeof(dst->state) - 1U);
-    dst->state[sizeof(dst->state) - 1U] = '\0';
+    (void)snprintf(dst->name, sizeof(dst->name), "%s", src->name);
+    (void)snprintf(dst->user, sizeof(dst->user), "%s", src->user);
+    (void)snprintf(dst->state, sizeof(dst->state), "%s", src->state);
     dst->cpu_percent = cpu_percent;
     dst->memory_bytes = src->memory_bytes;
 }
