@@ -7,11 +7,13 @@ read identically on Linux, macOS and Windows.
 
 Subcommands:
     conan-profiles       create the detected Conan base profiles (default, clang)
+    musl-toolchain [--print] [--print-key]   fetch/verify the pinned Bootlin
+                         musl toolchain used by linux-musl-release
     deps PRESET          conan install (preset's profiles, daemon/conan.lock)
     lock-deps PRESET     re-resolve daemon/conan.lock to the newest Conan revisions
     configure PRESET     deps + cmake --preset
     conan-cache-key PRESET   CI cache key for the Conan packages a preset needs
-    conan-cache-trim     drop what a restored CI package cache never uses
+    conan-cache-trim [PRESET]   drop what a restored CI package cache never uses
     cmake ARGS...        run cmake; on Windows, load the MSVC environment first
     ctest ARGS...        run ctest; same MSVC environment handling
     proto [--check]      regenerate Python + C protobuf code (or verify no diff)
@@ -25,7 +27,11 @@ Subcommands:
     coverage --build-dir DIR   gcovr report for a coverage-instrumented build
     doctor               report tools mise cannot provide / missing pinned tools
     clean                remove daemon build directories
-    verify-static BINARY check a built daemon has no unexpected dynamic deps
+    verify-static PRESET check a preset's already-built daemon binary is
+                         fully static (ELF/dumpbin checks, NSS source guard,
+                         and on Linux a FROM-scratch docker smoke run)
+    release-bundle PRESET   copy a release preset's binary, sha256 file,
+                         LICENSE and THIRD_PARTY_NOTICES into out/release/
 """
 
 from __future__ import annotations
@@ -35,12 +41,15 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
+import urllib.request
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -115,6 +124,154 @@ def tool(name: str) -> str:
             "or see `just doctor`."
         )
     return path
+
+
+# ---------------------------------------------------------------------------
+# musl toolchain (Bootlin, for linux-musl-release)
+# ---------------------------------------------------------------------------
+# Pinned exactly like cppcheck on Windows (mise.toml's conda:cppcheck version,
+# ci.yml's CPPCHECK_VERSION/CPPCHECK_SHA256): one place in the repo holds the
+# URL and hash (see AGENTS.md's "Pinned versions" table), and this module
+# downloads, verifies and caches it. Never re-host the tarball: Bootlin's
+# server is its only source, and mirroring a GPL toolchain would make this
+# repo a distributor of it.
+MUSL_TOOLCHAIN_NAME = "x86-64--musl--stable-2026.08-1"
+MUSL_TOOLCHAIN_URL = (
+    "https://toolchains.bootlin.com/downloads/releases/toolchains/x86-64/"
+    f"tarballs/{MUSL_TOOLCHAIN_NAME}.tar.xz"
+)
+MUSL_TOOLCHAIN_SHA256 = (
+    "78d3a4683d6ac47b5ee73bd5bce210b55eb93dff1b137c61298af97eb0d2b5a6"
+)
+
+
+def cache_root() -> Path:
+    """Root for caches that must live outside the repo and outside /tmp.
+
+    /tmp on some hosts (including CI) is a tmpfs with a per-user quota far
+    smaller than a toolchain or a from-source Conan cache. CI sets
+    TAZ_CACHE_DIR to the `~/...` path its cache steps save, so both agree.
+    """
+    env = os.environ.get("TAZ_CACHE_DIR")
+    if env:
+        root = Path(env).expanduser()
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME")
+        root = Path(xdg) / "taz" if xdg else Path.home() / ".cache" / "taz"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def musl_toolchain_dir() -> Path:
+    return cache_root() / "toolchains" / MUSL_TOOLCHAIN_NAME
+
+
+def _musl_toolchain_stamp(directory: Path) -> Path:
+    return directory / ".taz-sha256"
+
+
+def _musl_toolchain_valid(directory: Path) -> bool:
+    stamp = _musl_toolchain_stamp(directory)
+    gcc = directory / "bin" / "x86_64-linux-gcc"
+    return (
+        stamp.is_file()
+        and stamp.read_text().strip() == MUSL_TOOLCHAIN_SHA256
+        and gcc.exists()
+    )
+
+
+def _download_musl_toolchain(directory: Path, *, quiet: bool = False) -> None:
+    """Download, verify and unpack the pinned toolchain into `directory`.
+
+    Streams to a `.part` file of its own next to it (never under /tmp),
+    verifies the sha256 before extracting, extracts into a sibling temp dir
+    with `filter="data"` (no symlinks escaping the tree), points a Buildroot
+    `relocate-sdk.sh` (if the tarball carries one) at `directory`, then
+    renames the tree into place and stamps it. A concurrent fetch that
+    finished first is kept as it is.
+    """
+    root = directory.parent
+    root.mkdir(parents=True, exist_ok=True)
+    fd, part_name = tempfile.mkstemp(
+        dir=root, prefix=f"{MUSL_TOOLCHAIN_NAME}.", suffix=".tar.xz.part"
+    )
+    part = Path(part_name)
+    tmp: Path | None = None
+    try:
+        if not quiet:
+            print(f"downloading {MUSL_TOOLCHAIN_URL}")
+        digest = hashlib.sha256()
+        # MUSL_TOOLCHAIN_URL is the constant pinned above, never user input.
+        # The timeout bounds each socket operation: a stalled server fails the
+        # fetch instead of hanging until the CI job's own timeout.
+        with (
+            os.fdopen(fd, "wb") as out,
+            urllib.request.urlopen(MUSL_TOOLCHAIN_URL, timeout=60) as response,  # noqa: S310
+        ):
+            while chunk := response.read(1024 * 1024):
+                out.write(chunk)
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != MUSL_TOOLCHAIN_SHA256:
+            sys.exit(
+                f"error: {MUSL_TOOLCHAIN_NAME} checksum mismatch: "
+                f"expected {MUSL_TOOLCHAIN_SHA256}, got {actual}. Nothing installed."
+            )
+        tmp = Path(tempfile.mkdtemp(dir=root, prefix=f"{MUSL_TOOLCHAIN_NAME}."))
+        if not quiet:
+            print(f"extracting to {directory}")
+        with tarfile.open(part) as tar:
+            tar.extractall(tmp, filter="data")
+        entries = list(tmp.iterdir())
+        extracted = entries[0] if len(entries) == 1 and entries[0].is_dir() else tmp
+        relocate = extracted / "relocate-sdk.sh"
+        if relocate.exists():
+            # Rewrites the build-time prefix in the SDK's text files to the
+            # final location (its "set location without moving" mode).
+            result = subprocess.run(
+                [str(relocate), str(directory)],
+                cwd=extracted,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                sys.exit(
+                    f"error: {relocate.name} failed (exit {result.returncode}): "
+                    f"{result.stdout}{result.stderr}"
+                )
+        if _musl_toolchain_valid(directory):
+            return
+        if directory.exists():
+            shutil.rmtree(directory)
+        extracted.rename(directory)
+        _musl_toolchain_stamp(directory).write_text(MUSL_TOOLCHAIN_SHA256 + "\n")
+    finally:
+        part.unlink(missing_ok=True)
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def ensure_musl_toolchain(*, quiet: bool = False) -> Path:
+    """Return the pinned toolchain's directory, fetching it if necessary."""
+    directory = musl_toolchain_dir()
+    if _musl_toolchain_valid(directory):
+        return directory
+    _download_musl_toolchain(directory, quiet=quiet)
+    if not _musl_toolchain_valid(directory):
+        sys.exit(
+            f"error: {directory} invalid after fetch "
+            "(missing bin/x86_64-linux-gcc or a matching stamp)"
+        )
+    return directory
+
+
+def cmd_musl_toolchain(*, print_only: bool, print_key: bool) -> None:
+    if print_key:
+        print(f"musl-toolchain-{MUSL_TOOLCHAIN_SHA256}")
+        return
+    directory = ensure_musl_toolchain(quiet=print_only)
+    print(directory)
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +378,15 @@ def cmd_conan_profiles() -> None:
         )
 
 
+def is_musl_preset(preset: str) -> bool:
+    return preset.startswith("linux-musl")
+
+
 def host_profiles_for(preset: str) -> list[str]:
     """Host profile chain for a preset: detected base first, then our partials."""
+    if is_musl_preset(preset):
+        # Complete profile: the Bootlin toolchain is unknown to `default`.
+        return [str(PROFILES_DIR / "linux-musl")]
     if preset.startswith("windows-"):
         return ["default", str(PROFILES_DIR / "windows-static")]
     if preset.startswith("linux-fuzz") or preset.startswith("linux-clang"):
@@ -232,6 +396,45 @@ def host_profiles_for(preset: str) -> list[str]:
             str(PROFILES_DIR / "linux-clang"),
         ]
     return ["default", str(PROFILES_DIR / "linux-static")]
+
+
+def conan_env(preset: str) -> dict[str, str]:
+    """Environment for a Conan invocation on `preset`.
+
+    Identity for every preset except musl, which gets its own Conan home
+    (so its from-source packages never collide with the glibc ones in
+    ~/.conan2 — package ids cover neither the libc nor [conf] keys such as
+    compiler_executables) and TAZ_MUSL_TOOLCHAIN for the profile's jinja
+    template to read the toolchain's compiler paths from.
+    """
+    if not is_musl_preset(preset):
+        return dict(os.environ)
+    return {
+        **os.environ,
+        "CONAN_HOME": str(cache_root() / "conan-musl"),
+        "TAZ_MUSL_TOOLCHAIN": str(musl_toolchain_dir()),
+    }
+
+
+def ensure_musl_conan_home(env: dict[str, str]) -> None:
+    """Detect a `default` build profile in the musl preset's own Conan home.
+
+    `--profile:build` defaults to `default`, resolved inside whatever
+    CONAN_HOME is active; `just setup`'s `conan-profiles` only ever
+    populates the main one. Its output goes to stderr: conan-cache-key's
+    stdout must be the key alone (CI captures it into a step output).
+    """
+    profile = Path(env["CONAN_HOME"]) / "profiles" / "default"
+    if profile.is_file():
+        return
+    cmd = [tool("conan"), "profile", "detect", "--exist-ok"]
+    print(f"$ {' '.join(cmd)}", file=sys.stderr, flush=True)
+    result = subprocess.run(
+        cmd, cwd=ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    sys.stderr.write(result.stdout + result.stderr)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
 
 
 def conan_profile_args(preset: str) -> list[str]:
@@ -245,6 +448,10 @@ def conan_profile_args(preset: str) -> list[str]:
 
 def cmd_deps(preset: str) -> None:
     ensure_msvc_env()
+    env = conan_env(preset)
+    if is_musl_preset(preset):
+        ensure_musl_toolchain()
+        ensure_musl_conan_home(env)
     cached = os.environ.get(CI_CONAN_PRESET_VAR)
     if cached and conan_profile_args(preset) != conan_profile_args(cached):
         sys.exit(
@@ -261,7 +468,8 @@ def cmd_deps(preset: str) -> None:
             f"--lockfile={CONAN_LOCKFILE}",
             "--build=missing",
             *conan_profile_args(preset),
-        ]
+        ],
+        env=env,
     )
 
 
@@ -271,6 +479,10 @@ def cmd_lock_deps(preset: str) -> None:
     The recipes' requirements do not depend on the platform, so any one
     preset's profiles resolve the graph for every preset.
     """
+    env = conan_env(preset)
+    if is_musl_preset(preset):
+        ensure_musl_toolchain()
+        ensure_musl_conan_home(env)
     run(
         [
             tool("conan"),
@@ -281,7 +493,8 @@ def cmd_lock_deps(preset: str) -> None:
             "--update",
             f"--lockfile-out={CONAN_LOCKFILE}",
             *conan_profile_args(preset),
-        ]
+        ],
+        env=env,
     )
 
 
@@ -295,14 +508,19 @@ def cmd_conan_cache_key(preset: str) -> None:
 
     The digest covers everything that decides those binaries: the Conan
     version, the resolved host and build profiles (so a runner image with a
-    new compiler starts a fresh cache), conanfile.py and conan.lock. CI
-    restores exact matches only: package ids ignore [conf] such as
-    compiler_executables, so a cache filled under other profiles can satisfy
-    `conan install` with binaries the current profiles would not produce.
+    new compiler starts a fresh cache), conanfile.py and conan.lock, and (for
+    musl presets) the pinned toolchain hash, so a toolchain bump starts a
+    fresh cache too. CI restores exact matches only: package ids ignore
+    [conf] such as compiler_executables, so a cache filled under other
+    profiles can satisfy `conan install` with binaries the current profiles
+    would not produce.
     """
     conan = tool("conan")
+    env = conan_env(preset)
+    if is_musl_preset(preset):
+        ensure_musl_conan_home(env)
     version = subprocess.run(
-        [conan, "--version"], capture_output=True, text=True, check=True
+        [conan, "--version"], capture_output=True, text=True, check=True, env=env
     ).stdout
     profiles = subprocess.run(
         [conan, "profile", "show", *conan_profile_args(preset), "--format=json"],
@@ -310,21 +528,25 @@ def cmd_conan_cache_key(preset: str) -> None:
         capture_output=True,
         text=True,
         check=True,
+        env=env,
     ).stdout
     digest = hashlib.sha256()
-    for part in (
+    parts = [
         version,
         profiles,
         (ROOT / "daemon" / "conanfile.py").read_text(),
         CONAN_LOCKFILE.read_text(),
-    ):
+    ]
+    if is_musl_preset(preset):
+        parts.append(MUSL_TOOLCHAIN_SHA256)
+    for part in parts:
         digest.update(part.encode())
     host = json.loads(profiles)["host"]["settings"]
     fields = ("os", "compiler", "compiler.version", "build_type")
     print("-".join(["conan", *(host[f] for f in fields), digest.hexdigest()[:16]]))
 
 
-def cmd_conan_cache_trim() -> None:
+def cmd_conan_cache_trim(preset: str) -> None:
     """Shrink the Conan package cache before CI saves it.
 
     Build, source and download folders are never reused, and the CMake tool
@@ -333,8 +555,9 @@ def cmd_conan_cache_trim() -> None:
     offline.
     """
     conan = tool("conan")
-    run([conan, "cache", "clean"])
-    run([conan, "remove", "cmake/*:*", "--confirm"])
+    env = conan_env(preset)
+    run([conan, "cache", "clean"], env=env)
+    run([conan, "remove", "cmake/*:*", "--confirm"], env=env)
 
 
 def cmd_passthrough(program: str, args: Sequence[str]) -> None:
@@ -741,6 +964,15 @@ def cmd_doctor() -> None:
                 print(f"  missing  -fsanitize={flag}  <- {hint}")
                 warnings.append(flag)
 
+    if not IS_WINDOWS:
+        print("musl toolchain (optional, for `just build linux-musl-release`):")
+        toolchain_dir = musl_toolchain_dir()
+        if _musl_toolchain_valid(toolchain_dir):
+            print(f"  ok       {toolchain_dir}")
+        else:
+            print(f"  missing  {toolchain_dir}  <- run `just musl-toolchain`")
+            warnings.append("musl-toolchain")
+
     submodules = [ROOT / "daemon" / "third_party" / "nanopb" / "pb.h"]
     print("submodules:")
     for path in submodules:
@@ -810,48 +1042,253 @@ def cmd_clean() -> None:
         print(f"removed {build_dir.relative_to(ROOT)}")
 
 
-def cmd_verify_static(binary: Path) -> None:
-    if not binary.exists():
-        sys.exit(f"error: {binary} not found")
-    if IS_WINDOWS:
-        ensure_msvc_env()  # dumpbin ships with MSVC
-        allowed = {
-            "kernel32.dll",
-            "ntdll.dll",
-            "advapi32.dll",
-            "ws2_32.dll",
-            "psapi.dll",
-            "iphlpapi.dll",
-            "userenv.dll",
-            "shell32.dll",
-            "dbghelp.dll",
-            "ole32.dll",
-            "user32.dll",
-        }
-        out = subprocess.run(
-            [tool("dumpbin"), "/dependents", str(binary)],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        deps = {
-            line.strip().lower()
-            for line in out.splitlines()
-            if line.strip().lower().endswith(".dll")
-        }
-        unexpected = deps - allowed
-        print(f"dependencies: {sorted(deps)}")
-        if unexpected:
-            sys.exit(f"error: unexpected DLL dependencies: {sorted(unexpected)}")
-    else:
-        ldd = subprocess.run(
-            ["ldd", str(binary)], capture_output=True, text=True, check=False
+def daemon_binary(preset: str) -> Path:
+    name = "tazd.exe" if IS_WINDOWS else "tazd"
+    return ROOT / "daemon" / "build" / preset / name
+
+
+# Source-level NSS guard: identifiers that read /etc/passwd, /etc/group or
+# resolve names through the system's Name Service Switch, which a static
+# binary cannot use (no dlopen of NSS modules). Any use in code counts (a
+# call, split across lines or not, or taking the function's address), but
+# not a symbol-table grep: libuv's core.c links getpwuid_r and friends into
+# every build even though the daemon never calls them, and a symbol grep
+# would flag that for nothing.
+_NSS_IDENT_RE = re.compile(
+    r"\b(?:getpw\w*|[se]etpwent|getgr(?:nam|gid|ent|ouplist)\w*|[se]etgrent"
+    r"|initgroups|getspnam\w*|getaddrinfo|getnameinfo|gethostby\w*"
+    r"|getservby\w*|getprotoby\w*|getnetby\w*|uv_os_get_passwd\w*"
+    r"|uv_os_get_group|uv_os_homedir|uv_getaddrinfo|uv_getnameinfo)\b"
+)
+
+
+def _strip_c_comments(text: str) -> str:
+    """Blank out `//` and `/* */` comments and string/char literals.
+
+    Replaces their contents with spaces (newlines kept as-is) so line numbers
+    in the caller's output still match the original file, and an identifier
+    spelled inside a comment or a string literal never looks like code. A
+    literal ends at an unescaped newline, as in C, so a stray quote (an
+    apostrophe in `#if 0` prose) cannot hide the code after it.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            quote = c
+            out.append(" ")
+            i += 1
+            while i < n and text[i] not in (quote, "\n"):
+                if text[i] == "\\" and i + 1 < n:
+                    out.append(" " if text[i] != "\n" else "\n")
+                    out.append(" " if text[i + 1] != "\n" else "\n")
+                    i += 2
+                    continue
+                out.append(" ")
+                i += 1
+            if i < n and text[i] == quote:
+                out.append(" ")
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            out.append("  ")
+            i += 2
+            while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
+                out.append(" " if text[i] != "\n" else "\n")
+                i += 1
+            if i < n:
+                out.append("  ")
+                i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def nss_calls(dirs: Iterable[Path]) -> list[str]:
+    """Return `path:line` for every line using an NSS-backed function."""
+    hits: list[str] = []
+    for path in files_under(dirs, (".c", ".h")):
+        # Explicitly UTF-8: Windows' locale default (cp1252) cannot decode
+        # every UTF-8 comment.
+        code = _strip_c_comments(path.read_text(encoding="utf-8"))
+        lines = (
+            code.count("\n", 0, match.start()) + 1
+            for match in _NSS_IDENT_RE.finditer(code)
         )
-        text = (ldd.stdout + ldd.stderr).strip()
-        print(text)
-        if "not a dynamic executable" not in text and "statically linked" not in text:
-            sys.exit("error: binary is dynamically linked")
+        hits += [f"{path}:{lineno}" for lineno in dict.fromkeys(lines)]
+    return hits
+
+
+def elf_has_interp(program_headers: str) -> bool:
+    """Parse `readelf -lW` output for an INTERP program header."""
+    return any(line.split()[:1] == ["INTERP"] for line in program_headers.splitlines())
+
+
+def elf_needed(dynamic_section: str) -> list[str]:
+    """Parse `readelf -d` output for NEEDED (shared library) entries."""
+    needed = []
+    for line in dynamic_section.splitlines():
+        if "(NEEDED)" not in line:
+            continue
+        match = re.search(r"\[(.*?)\]", line)
+        if match:
+            needed.append(match.group(1))
+    return needed
+
+
+def _verify_static_linux(binary: Path) -> None:
+    readelf = tool("readelf")
+    headers = subprocess.run(
+        [readelf, "-lW", str(binary)], capture_output=True, text=True, check=True
+    ).stdout
+    print(headers)
+    if elf_has_interp(headers):
+        sys.exit(f"error: {binary} has an INTERP program header (not static)")
+
+    dynamic = subprocess.run(
+        [readelf, "-d", str(binary)], capture_output=True, text=True, check=True
+    ).stdout
+    print(dynamic)
+    needed = elf_needed(dynamic)
+    if needed:
+        sys.exit(f"error: {binary} has NEEDED entries: {needed}")
+
+    _verify_static_smoke(binary)
+
+
+def _verify_static_smoke(binary: Path) -> None:
+    """Run `/tazd --version` inside a throwaway `FROM scratch` image.
+
+    Proves the binary needs nothing from a base image: no libc, no /etc, no
+    dynamic loader. A missing docker fails the check under CI and only warns
+    (skipping this smoke run alone) for a local developer.
+    """
+    docker = shutil.which("docker")
+    if docker is None:
+        message = "docker not found on PATH; cannot run the FROM-scratch smoke test"
+        if IN_CI:
+            sys.exit(f"error: {message}")
+        print(f"warning: {message}; skipping")
+        return
+
+    tag = f"taz-verify-static-{os.getpid()}"
+    with tempfile.TemporaryDirectory(dir=binary.parent) as tmp:
+        tmp_dir = Path(tmp)
+        shutil.copy2(binary, tmp_dir / binary.name)
+        (tmp_dir / "Dockerfile").write_text(f"FROM scratch\nCOPY {binary.name} /tazd\n")
+        try:
+            run([docker, "build", "-q", "-t", tag, str(tmp_dir)])
+            result = subprocess.run(
+                [docker, "run", "--rm", tag, "/tazd", "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            print(result.stdout, end="")
+            if result.returncode != 0 or not result.stdout.startswith("tazd "):
+                sys.exit(
+                    f"error: `docker run {tag} /tazd --version` failed "
+                    f"(exit {result.returncode}): {result.stdout}{result.stderr}"
+                )
+        finally:
+            subprocess.run([docker, "rmi", "-f", tag], check=False)
+
+
+def _verify_static_windows(binary: Path) -> None:
+    ensure_msvc_env()  # dumpbin ships with MSVC
+    allowed = {
+        "kernel32.dll",
+        "ntdll.dll",
+        "advapi32.dll",
+        "ws2_32.dll",
+        "psapi.dll",
+        "iphlpapi.dll",
+        "userenv.dll",
+        "shell32.dll",
+        "dbghelp.dll",
+        "ole32.dll",
+        "user32.dll",
+    }
+    out = subprocess.run(
+        [tool("dumpbin"), "/dependents", str(binary)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    deps = {
+        line.strip().lower()
+        for line in out.splitlines()
+        if line.strip().lower().endswith(".dll")
+    }
+    unexpected = deps - allowed
+    print(f"dependencies: {sorted(deps)}")
+    if unexpected:
+        sys.exit(f"error: unexpected DLL dependencies: {sorted(unexpected)}")
+
+
+def cmd_verify_static(preset: str) -> None:
+    binary = daemon_binary(preset)
+    if not binary.exists():
+        sys.exit(f"error: {binary} not found (run `just build {preset}` first)")
+
+    # Source-level: runs on every OS, independent of how this binary links.
+    hits = nss_calls(DAEMON_C_DIRS)
+    if hits:
+        sys.exit(
+            "error: daemon sources call NSS-backed functions a static binary "
+            "cannot resolve:\n  " + "\n  ".join(hits)
+        )
+
+    if IS_WINDOWS:
+        _verify_static_windows(binary)
+    else:
+        _verify_static_linux(binary)
     print("static link verified")
+
+
+# ---------------------------------------------------------------------------
+# release-bundle
+# ---------------------------------------------------------------------------
+RELEASE_ARTIFACTS = {
+    "linux-musl-release": "taz-linux-x64",
+    "windows-release": "taz-windows-x64",
+}
+
+
+def cmd_release_bundle(preset: str) -> None:
+    artifact = RELEASE_ARTIFACTS.get(preset)
+    if artifact is None:
+        sys.exit(
+            f"error: {preset} is not a release preset "
+            f"(expected one of {sorted(RELEASE_ARTIFACTS)})"
+        )
+
+    binary = daemon_binary(preset)
+    if not binary.exists():
+        sys.exit(f"error: {binary} not found (run `just build {preset}` first)")
+
+    out_dir = ROOT / "out" / "release" / artifact
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
+
+    shutil.copy2(binary, out_dir / binary.name)
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    # Bytes, not text: on Windows text mode would write CRLF, which older
+    # `sha256sum -c` (coreutils 8.x) rejects.
+    (out_dir / f"{binary.name}.sha256").write_bytes(
+        f"{digest}  {binary.name}\n".encode()
+    )
+    shutil.copy2(ROOT / "LICENSE", out_dir / "LICENSE")
+    shutil.copy2(ROOT / "THIRD_PARTY_NOTICES", out_dir / "THIRD_PARTY_NOTICES")
+    print(f"wrote {out_dir.relative_to(ROOT)}")
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +1299,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub.add_parser("cmake", help="run cmake ARGS... (handled before argparse)")
     sub.add_parser("ctest", help="run ctest ARGS... (handled before argparse)")
     sub.add_parser("conan-profiles")
+    p = sub.add_parser("musl-toolchain")
+    p.add_argument("--print", dest="print_only", action="store_true")
+    p.add_argument("--print-key", dest="print_key", action="store_true")
     p = sub.add_parser("deps")
     p.add_argument("preset")
     p = sub.add_parser("lock-deps")
@@ -870,7 +1310,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("preset")
     p = sub.add_parser("conan-cache-key")
     p.add_argument("preset")
-    sub.add_parser("conan-cache-trim")
+    p = sub.add_parser("conan-cache-trim")
+    p.add_argument("preset", nargs="?", default="linux-debug")
     p = sub.add_parser("proto")
     p.add_argument("--check", action="store_true")
     p = sub.add_parser("clang-format")
@@ -893,7 +1334,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub.add_parser("doctor")
     sub.add_parser("clean")
     p = sub.add_parser("verify-static")
-    p.add_argument("binary", type=Path)
+    p.add_argument("preset")
+    p = sub.add_parser("release-bundle")
+    p.add_argument("preset")
 
     raw = list(sys.argv[1:] if argv is None else argv)
     # `cmake` forwards everything verbatim; argparse's REMAINDER would swallow
@@ -906,6 +1349,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     match args.command:
         case "conan-profiles":
             cmd_conan_profiles()
+        case "musl-toolchain":
+            cmd_musl_toolchain(print_only=args.print_only, print_key=args.print_key)
         case "deps":
             cmd_deps(args.preset)
         case "lock-deps":
@@ -915,7 +1360,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         case "conan-cache-key":
             cmd_conan_cache_key(args.preset)
         case "conan-cache-trim":
-            cmd_conan_cache_trim()
+            cmd_conan_cache_trim(args.preset)
         case "proto":
             cmd_proto(args.check)
         case "clang-format":
@@ -941,7 +1386,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         case "clean":
             cmd_clean()
         case "verify-static":
-            cmd_verify_static(args.binary.resolve())
+            cmd_verify_static(args.preset)
+        case "release-bundle":
+            cmd_release_bundle(args.preset)
 
 
 if __name__ == "__main__":

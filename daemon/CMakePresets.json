@@ -49,13 +49,20 @@
     {
       "name": "linux-clang-debug",
       "displayName": "Linux Debug (Clang)",
-      "description": "Second compiler: different diagnostics, and the toolchain libFuzzer and the musl (zig cc) release build use.",
+      "description": "Second compiler: different diagnostics, and the toolchain the libFuzzer build uses.",
       "inherits": "linux-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++"
       }
+    },
+    {
+      "name": "linux-musl-release",
+      "displayName": "Linux Release (musl, static)",
+      "description": "Bootlin musl toolchain via `just configure`; fully static tazd (no INTERP, no NEEDED).",
+      "inherits": "linux-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
       "name": "linux-analyze",
@@ -145,6 +152,7 @@
     { "name": "linux-debug", "configurePreset": "linux-debug" },
     { "name": "linux-release", "configurePreset": "linux-release" },
     { "name": "linux-clang-debug", "configurePreset": "linux-clang-debug" },
+    { "name": "linux-musl-release", "configurePreset": "linux-musl-release" },
     { "name": "linux-analyze", "configurePreset": "linux-analyze" },
     { "name": "linux-coverage", "configurePreset": "linux-coverage" },
     { "name": "windows-analyze", "configurePreset": "windows-analyze" },
@@ -169,6 +177,11 @@
     {
       "name": "linux-clang-debug",
       "configurePreset": "linux-clang-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-musl-release",
+      "configurePreset": "linux-musl-release",
       "output": { "outputOnFailure": true }
     },
     {

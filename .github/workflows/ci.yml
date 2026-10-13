@@ -11,6 +11,10 @@ name: CI
 #
 # Every version here is exact and bumped by hand ("Pinned versions" in
 # AGENTS.md): actions by commit SHA, mise by release, tools via mise.toml.
+#
+# The `release` check builds the static release preset (musl on Linux, /MT on
+# Windows), runs the full test suite against that binary, verifies it is
+# fully static and uploads it as a workflow artifact on every push.
 on:
   push:
   workflow_dispatch:
@@ -51,10 +55,21 @@ jobs:
             packages: clang libclang-rt-dev
             conan-preset: linux-clang-debug
             mise-tools: uv just prek cmake ninja
+          - name: Linux release (musl static tazd)
+            checks: [release]
+            conan-preset: linux-musl-release
+            mise-tools: uv just prek cmake ninja
+            # linux-musl-release has its own Conan home (own package set,
+            # never shared with the glibc presets' ~/.conan2), under
+            # TAZ_CACHE_DIR.
+            conan-cache-path: ~/.cache/taz/conan-musl/p
     env:
       # Every preset an entry builds must need the same Conan packages as this
       # one; `just deps` enforces it (see the Conan cache steps).
       TAZ_CI_CONAN_PRESET: ${{ matrix.conan-preset }}
+      # tools/dev.py's cache root (musl toolchain, musl Conan home), set so it
+      # always matches the paths the cache steps save.
+      TAZ_CACHE_DIR: ~/.cache/taz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,6 +94,36 @@ jobs:
       - if: contains(matrix.checks, 'main')
         run: just doctor
 
+      # The musl toolchain must be on disk before `just deps` runs (the
+      # linux-musl profile's compiler_executables point into it); its own
+      # cache, keyed on the pinned tarball hash, needs no network on a hit.
+      # Saved right after the fetch, so a red job never downloads it again.
+      - name: Toolchain cache key
+        id: toolchain-key
+        if: contains(matrix.checks, 'release')
+        run: |
+          key=$(uv run python tools/dev.py musl-toolchain --print-key)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore musl toolchain
+        id: toolchain-cache
+        if: contains(matrix.checks, 'release')
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/taz/toolchains
+          key: ${{ steps.toolchain-key.outputs.key }}
+
+      - name: Fetch musl toolchain
+        if: contains(matrix.checks, 'release')
+        run: just musl-toolchain
+
+      - name: Save musl toolchain
+        if: contains(matrix.checks, 'release') && steps.toolchain-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/taz/toolchains
+          key: ${{ steps.toolchain-key.outputs.key }}
+
       # The Conan package cache is restored only on an exact key match: the key
       # digests every input that decides the package binaries, and package ids
       # alone do not (tools/dev.py conan-cache-key).
@@ -92,7 +137,7 @@ jobs:
         id: conan-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.conan2/p
+          path: ${{ matrix.conan-cache-path || '~/.conan2/p' }}
           key: ${{ steps.conan-key.outputs.key }}
 
       - id: deps
@@ -100,13 +145,13 @@ jobs:
 
       - name: Trim Conan packages
         if: steps.conan-cache.outputs.cache-hit != 'true'
-        run: uv run python tools/dev.py conan-cache-trim
+        run: uv run python tools/dev.py conan-cache-trim ${{ matrix.conan-preset }}
 
       - name: Save Conan packages
         if: steps.conan-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.conan2/p
+          path: ${{ matrix.conan-cache-path || '~/.conan2/p' }}
           key: ${{ steps.conan-key.outputs.key }}
 
       - if: contains(matrix.checks, 'main')
@@ -165,6 +210,32 @@ jobs:
           name: coverage-report
           path: out/coverage
 
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
+        run: just build linux-musl-release
+
+      - id: release-test-c
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
+        run: just test-c linux-musl-release
+
+      - id: release-test-py
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
+        run: just test-py --daemon daemon/build/linux-musl-release/tazd
+
+      - id: release-verify
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
+        run: just verify-static linux-musl-release
+
+      # Only a binary that passed every check above is published.
+      - id: release-bundle
+        if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' }}
+        run: just release-bundle linux-musl-release
+
+      - if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: taz-linux-x64
+          path: out/release/taz-linux-x64
+
   windows:
     name: ${{ matrix.name }}
     runs-on: windows-2025
@@ -179,6 +250,10 @@ jobs:
           - name: Windows (asan, analyze)
             checks: [asan, analyze]
             conan-preset: windows-asan
+            mise-tools: uv just prek cmake ninja
+          - name: Windows release (static tazd.exe)
+            checks: [release]
+            conan-preset: windows-release
             mise-tools: uv just prek cmake ninja
     env:
       TAZ_CI_CONAN_PRESET: ${{ matrix.conan-preset }}
@@ -240,7 +315,7 @@ jobs:
 
       - name: Trim Conan packages
         if: steps.conan-cache.outputs.cache-hit != 'true'
-        run: uv run python tools/dev.py conan-cache-trim
+        run: uv run python tools/dev.py conan-cache-trim ${{ matrix.conan-preset }}
 
       - name: Save Conan packages
         if: steps.conan-cache.outputs.cache-hit != 'true'
@@ -269,3 +344,29 @@ jobs:
 
       - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'analyze') }}
         run: just build windows-analyze
+
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
+        run: just build windows-release
+
+      - id: release-test-c
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
+        run: just test-c windows-release
+
+      - id: release-test-py
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
+        run: just test-py --daemon daemon/build/windows-release/tazd.exe
+
+      - id: release-verify
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
+        run: just verify-static windows-release
+
+      # Only a binary that passed every check above is published.
+      - id: release-bundle
+        if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' }}
+        run: just release-bundle windows-release
+
+      - if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: taz-windows-x64
+          path: out/release/taz-windows-x64

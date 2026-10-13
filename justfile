@@ -11,6 +11,7 @@
 set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
 preset := if os() == "windows" { "windows-debug" } else { "linux-debug" }
+release := if os() == "windows" { "windows-release" } else { "linux-musl-release" }
 dev := "uv run python tools/dev.py"
 win := "uv run python tools/win.py"
 
@@ -44,6 +45,12 @@ proto-check:
 
 # --- daemon build -----------------------------------------------------------
 
+# Fetch (or verify the cache of) the pinned Bootlin musl toolchain used by
+# linux-musl-release; a no-op once it is cached
+[unix]
+musl-toolchain:
+    {{ dev }} musl-toolchain
+
 # Install the preset's Conan dependencies (the first half of `configure`)
 deps preset=preset:
     {{ dev }} deps {{ preset }}
@@ -65,9 +72,18 @@ build preset=preset: (configure preset)
 clean:
     {{ dev }} clean
 
-# Check that a built daemon binary has no unexpected dynamic dependencies
-verify-static preset="linux-release":
-    {{ dev }} verify-static daemon/build/{{ preset }}/tazd
+# Build preset, then prove its binary is fully static: no dynamic deps
+# (readelf on Linux, dumpbin on Windows), no NSS calls in daemon sources, and
+# (Linux) runs from a FROM-scratch image. `just verify-static linux-release`
+# fails by design: that preset still links glibc dynamically.
+verify-static preset=release: (build preset)
+    {{ dev }} verify-static {{ preset }}
+
+# Build preset, then copy its binary, a matching .sha256, LICENSE and
+# THIRD_PARTY_NOTICES into out/release/<artifact> (wiping any stale copy).
+# Fails on a non-release preset.
+release-bundle preset=release: (build preset)
+    {{ dev }} release-bundle {{ preset }}
 
 # --- tests ------------------------------------------------------------------
 
