@@ -67,24 +67,37 @@ def test_cache_root_falls_back_to_home(
 # --- valid install present -> no network -------------------------------------
 
 
+def _x86_64_toolchain() -> Any:
+    return dev.MUSL_TOOLCHAINS[dev.DEFAULT_MUSL_ARCH]
+
+
+def _patch_x86_64_toolchain(monkeypatch: pytest.MonkeyPatch, **changes: str) -> Any:
+    """Replace the x86_64 table entry with one carrying `changes` applied."""
+    patched = _x86_64_toolchain()._replace(**changes)
+    monkeypatch.setitem(dev.MUSL_TOOLCHAINS, dev.DEFAULT_MUSL_ARCH, patched)
+    return patched
+
+
 def test_ensure_musl_toolchain_fast_path_needs_no_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    toolchain = _x86_64_toolchain()
     directory = tmp_path / "toolchain"
     (directory / "bin").mkdir(parents=True)
-    (directory / "bin" / "x86_64-linux-gcc").write_text("#!/bin/sh\n")
-    (directory / ".taz-sha256").write_text(dev.MUSL_TOOLCHAIN_SHA256)
+    (directory / "bin" / f"{toolchain.bin_prefix}-gcc").write_text("#!/bin/sh\n")
+    (directory / ".taz-sha256").write_text(toolchain.sha256)
 
-    monkeypatch.setattr(dev, "musl_toolchain_dir", lambda: directory)
+    monkeypatch.setattr(dev, "musl_toolchain_dir", lambda arch=None: directory)
     monkeypatch.setattr(dev.urllib.request, "urlopen", _no_network)
 
     assert dev.ensure_musl_toolchain() == directory
 
 
 def test_ensure_musl_toolchain_stale_stamp_is_not_valid(tmp_path: Path) -> None:
+    toolchain = _x86_64_toolchain()
     directory = tmp_path / "toolchain"
     (directory / "bin").mkdir(parents=True)
-    (directory / "bin" / "x86_64-linux-gcc").write_text("#!/bin/sh\n")
+    (directory / "bin" / f"{toolchain.bin_prefix}-gcc").write_text("#!/bin/sh\n")
     (directory / ".taz-sha256").write_text("stale")
 
     assert dev._musl_toolchain_valid(directory) is False
@@ -108,8 +121,9 @@ def test_download_musl_toolchain_hash_mismatch_installs_nothing(
     _make_tarball(tarball, b"not the real toolchain")
 
     wrong_sha = "0" * 64
-    monkeypatch.setattr(dev, "MUSL_TOOLCHAIN_URL", tarball.resolve().as_uri())
-    monkeypatch.setattr(dev, "MUSL_TOOLCHAIN_SHA256", wrong_sha)
+    _patch_x86_64_toolchain(
+        monkeypatch, url=tarball.resolve().as_uri(), sha256=wrong_sha
+    )
 
     directory = tmp_path / "install" / "toolchain"
 
@@ -123,12 +137,13 @@ def test_download_musl_toolchain_hash_mismatch_installs_nothing(
     assert list(directory.parent.iterdir()) == []
 
 
-def _make_toolchain_tarball(path: Path) -> bytes:
+def _make_toolchain_tarball(path: Path, toolchain: Any) -> bytes:
     """A tarball shaped like Bootlin's: one top-level directory holding
-    bin/x86_64-linux-gcc and relocate-sdk.sh. Returns its bytes."""
-    top = dev.MUSL_TOOLCHAIN_NAME
+    bin/<prefix>-gcc and relocate-sdk.sh. Returns its bytes."""
+    top = toolchain.name
     with tarfile.open(path, "w:xz") as tar:
-        for name in (f"{top}/bin/x86_64-linux-gcc", f"{top}/relocate-sdk.sh"):
+        names = (f"{top}/bin/{toolchain.bin_prefix}-gcc", f"{top}/relocate-sdk.sh")
+        for name in names:
             info = tarfile.TarInfo(name)
             info.size = 0
             info.mode = 0o755
@@ -141,9 +156,12 @@ def test_download_musl_toolchain_installs_relocates_and_stamps(
 ) -> None:
     tarball = tmp_path / "src" / "toolchain.tar.xz"
     tarball.parent.mkdir()
-    data = _make_toolchain_tarball(tarball)
-    monkeypatch.setattr(dev, "MUSL_TOOLCHAIN_URL", tarball.resolve().as_uri())
-    monkeypatch.setattr(dev, "MUSL_TOOLCHAIN_SHA256", hashlib.sha256(data).hexdigest())
+    data = _make_toolchain_tarball(tarball, _x86_64_toolchain())
+    toolchain = _patch_x86_64_toolchain(
+        monkeypatch,
+        url=tarball.resolve().as_uri(),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
     relocations: list[list[str]] = []
 
     def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -151,7 +169,7 @@ def test_download_musl_toolchain_installs_relocates_and_stamps(
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(dev.subprocess, "run", fake_run)
-    directory = tmp_path / "install" / dev.MUSL_TOOLCHAIN_NAME
+    directory = tmp_path / "install" / toolchain.name
 
     dev._download_musl_toolchain(directory, quiet=True)
 
@@ -171,9 +189,12 @@ def test_download_musl_toolchain_keeps_a_concurrently_installed_tree(
 ) -> None:
     tarball = tmp_path / "src" / "toolchain.tar.xz"
     tarball.parent.mkdir()
-    data = _make_toolchain_tarball(tarball)
-    monkeypatch.setattr(dev, "MUSL_TOOLCHAIN_URL", tarball.resolve().as_uri())
-    monkeypatch.setattr(dev, "MUSL_TOOLCHAIN_SHA256", hashlib.sha256(data).hexdigest())
+    data = _make_toolchain_tarball(tarball, _x86_64_toolchain())
+    toolchain = _patch_x86_64_toolchain(
+        monkeypatch,
+        url=tarball.resolve().as_uri(),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
     monkeypatch.setattr(
         dev.subprocess,
         "run",
@@ -181,10 +202,10 @@ def test_download_musl_toolchain_keeps_a_concurrently_installed_tree(
             cmd, 0, stdout="", stderr=""
         ),
     )
-    directory = tmp_path / "install" / dev.MUSL_TOOLCHAIN_NAME
+    directory = tmp_path / "install" / toolchain.name
     (directory / "bin").mkdir(parents=True)
-    (directory / "bin" / "x86_64-linux-gcc").write_text("")
-    (directory / ".taz-sha256").write_text(dev.MUSL_TOOLCHAIN_SHA256)
+    (directory / "bin" / f"{toolchain.bin_prefix}-gcc").write_text("")
+    (directory / ".taz-sha256").write_text(toolchain.sha256)
     marker = directory / "in-use"
     marker.write_text("")
 
@@ -201,7 +222,7 @@ def test_musl_toolchain_print_key_format(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fake_sha = "ab" * 32
-    monkeypatch.setattr(dev, "MUSL_TOOLCHAIN_SHA256", fake_sha)
+    _patch_x86_64_toolchain(monkeypatch, sha256=fake_sha)
     monkeypatch.setattr(dev.urllib.request, "urlopen", _no_network)
 
     dev.cmd_musl_toolchain(print_only=False, print_key=True)
@@ -254,6 +275,10 @@ def test_is_musl_preset() -> None:
     assert dev.is_musl_preset("linux-debug") is False
 
 
+def test_musl_arch_for_preset_defaults_to_x86_64() -> None:
+    assert dev.musl_arch_for_preset("linux-musl-release") == "x86_64"
+
+
 # --- conan_env: musl gets its own Conan home ---------------------------------
 
 
@@ -269,7 +294,7 @@ def test_conan_env_sets_own_conan_home_and_toolchain_for_musl(
 ) -> None:
     toolchain = tmp_path / "toolchains" / "x"
     monkeypatch.setattr(dev, "cache_root", lambda: tmp_path)
-    monkeypatch.setattr(dev, "musl_toolchain_dir", lambda: toolchain)
+    monkeypatch.setattr(dev, "musl_toolchain_dir", lambda arch=None: toolchain)
 
     env = dev.conan_env("linux-musl-release")
 
@@ -320,9 +345,9 @@ def test_conan_cache_key_digest_includes_musl_sha_only_for_musl_preset(
         return out.strip()
 
     glibc_key = key_for("linux-release")
-    monkeypatch.setattr(dev, "MUSL_TOOLCHAIN_SHA256", "a" * 64)
+    _patch_x86_64_toolchain(monkeypatch, sha256="a" * 64)
     musl_key_a = key_for("linux-musl-release")
-    monkeypatch.setattr(dev, "MUSL_TOOLCHAIN_SHA256", "b" * 64)
+    _patch_x86_64_toolchain(monkeypatch, sha256="b" * 64)
     musl_key_b = key_for("linux-musl-release")
 
     for key in (glibc_key, musl_key_a, musl_key_b):

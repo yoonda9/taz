@@ -45,11 +45,11 @@ proto-check:
 
 # --- daemon build -----------------------------------------------------------
 
-# Fetch (or verify the cache of) the pinned Bootlin musl toolchain used by
-# linux-musl-release; a no-op once it is cached
+# Fetch (or verify the cache of) the pinned Bootlin musl toolchain for ARCH
+# (default x86_64, used by linux-musl-release); a no-op once it is cached
 [unix]
-musl-toolchain:
-    {{ dev }} musl-toolchain
+musl-toolchain arch="x86_64":
+    {{ dev }} musl-toolchain {{ arch }}
 
 # Install the preset's Conan dependencies (the first half of `configure`)
 deps preset=preset:

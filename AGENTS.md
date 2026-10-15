@@ -135,10 +135,11 @@ Every version is exact and bumped by hand (no update bot). Where each lives:
 | GitHub Actions                | `ci.yml` `uses:` commit SHA + `# vX.Y.Z`                      | replace both                             |
 | cppcheck on Windows           | `ci.yml` `CPPCHECK_VERSION` + `CPPCHECK_SHA256`               | same version as `mise.toml`              |
 | nanopb                        | submodule commit                                              | check out a tag in it, then `just proto` |
-| musl toolchain (Bootlin)      | `tools/dev.py` `MUSL_TOOLCHAIN_NAME` + `_SHA256`              | edit both (see below)                    |
+| musl toolchain (Bootlin)      | `tools/dev.py` `MUSL_TOOLCHAINS[<arch>]` `name` + `sha256`    | edit each arch's row (see below)         |
 
-A musl toolchain bump also updates `compiler.version` in
-`daemon/profiles/linux-musl` and the musl section of `THIRD_PARTY_NOTICES`.
+A musl toolchain bump also updates `compiler.version` in all three
+`daemon/profiles/linux-musl{,-i686,-aarch64}` profiles and the musl section of
+`THIRD_PARTY_NOTICES`.
 
 Not pinned by the repo: runner images and their apt packages (Ubuntu 24.04,
 Windows Server 2025; compilers, clang, valgrind on Linux), the dependencies

@@ -7,8 +7,8 @@ read identically on Linux, macOS and Windows.
 
 Subcommands:
     conan-profiles       create the detected Conan base profiles (default, clang)
-    musl-toolchain [--print] [--print-key]   fetch/verify the pinned Bootlin
-                         musl toolchain used by linux-musl-release
+    musl-toolchain [--print] [--print-key] [ARCH]   fetch/verify the pinned
+                         Bootlin musl toolchain for ARCH (default x86_64)
     deps PRESET          conan install (preset's profiles, daemon/conan.lock)
     lock-deps PRESET     re-resolve daemon/conan.lock to the newest Conan revisions
     configure PRESET     deps + cmake --preset
@@ -53,6 +53,7 @@ import urllib.request
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent.parent
 RPC_DIR = ROOT / "rpc"
@@ -127,7 +128,7 @@ def tool(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# musl toolchain (Bootlin, for linux-musl-release)
+# musl toolchains (Bootlin, for linux-musl-release and friends)
 # ---------------------------------------------------------------------------
 # Pinned exactly like cppcheck on Windows (mise.toml's conda:cppcheck version,
 # ci.yml's CPPCHECK_VERSION/CPPCHECK_SHA256): one place in the repo holds the
@@ -135,14 +136,38 @@ def tool(name: str) -> str:
 # downloads, verifies and caches it. Never re-host the tarball: Bootlin's
 # server is its only source, and mirroring a GPL toolchain would make this
 # repo a distributor of it.
-MUSL_TOOLCHAIN_NAME = "x86-64--musl--stable-2026.08-1"
-MUSL_TOOLCHAIN_URL = (
-    "https://toolchains.bootlin.com/downloads/releases/toolchains/x86-64/"
-    f"tarballs/{MUSL_TOOLCHAIN_NAME}.tar.xz"
-)
-MUSL_TOOLCHAIN_SHA256 = (
-    "78d3a4683d6ac47b5ee73bd5bce210b55eb93dff1b137c61298af97eb0d2b5a6"
-)
+class MuslToolchain(NamedTuple):
+    name: str
+    url: str
+    sha256: str
+    bin_prefix: str  # e.g. "x86_64-linux", the `bin/<prefix>-gcc` executable
+
+
+def _bootlin_toolchain(
+    bootlin_arch: str, name: str, sha256: str, bin_prefix: str
+) -> MuslToolchain:
+    return MuslToolchain(
+        name=name,
+        url=(
+            "https://toolchains.bootlin.com/downloads/releases/toolchains/"
+            f"{bootlin_arch}/tarballs/{name}.tar.xz"
+        ),
+        sha256=sha256,
+        bin_prefix=bin_prefix,
+    )
+
+
+# Keyed by the arch name `just`/dev.py subcommands take (not Bootlin's own
+# per-arch URL segment, which is passed separately above).
+MUSL_TOOLCHAINS: dict[str, MuslToolchain] = {
+    "x86_64": _bootlin_toolchain(
+        "x86-64",
+        "x86-64--musl--stable-2026.08-1",
+        "78d3a4683d6ac47b5ee73bd5bce210b55eb93dff1b137c61298af97eb0d2b5a6",
+        "x86_64-linux",
+    ),
+}
+DEFAULT_MUSL_ARCH = "x86_64"
 
 
 def cache_root() -> Path:
@@ -162,25 +187,28 @@ def cache_root() -> Path:
     return root
 
 
-def musl_toolchain_dir() -> Path:
-    return cache_root() / "toolchains" / MUSL_TOOLCHAIN_NAME
+def musl_toolchain_dir(arch: str = DEFAULT_MUSL_ARCH) -> Path:
+    return cache_root() / "toolchains" / MUSL_TOOLCHAINS[arch].name
 
 
 def _musl_toolchain_stamp(directory: Path) -> Path:
     return directory / ".taz-sha256"
 
 
-def _musl_toolchain_valid(directory: Path) -> bool:
+def _musl_toolchain_valid(directory: Path, arch: str = DEFAULT_MUSL_ARCH) -> bool:
+    toolchain = MUSL_TOOLCHAINS[arch]
     stamp = _musl_toolchain_stamp(directory)
-    gcc = directory / "bin" / "x86_64-linux-gcc"
+    gcc = directory / "bin" / f"{toolchain.bin_prefix}-gcc"
     return (
         stamp.is_file()
-        and stamp.read_text().strip() == MUSL_TOOLCHAIN_SHA256
+        and stamp.read_text().strip() == toolchain.sha256
         and gcc.exists()
     )
 
 
-def _download_musl_toolchain(directory: Path, *, quiet: bool = False) -> None:
+def _download_musl_toolchain(
+    directory: Path, arch: str = DEFAULT_MUSL_ARCH, *, quiet: bool = False
+) -> None:
     """Download, verify and unpack the pinned toolchain into `directory`.
 
     Streams to a `.part` file of its own next to it (never under /tmp),
@@ -190,34 +218,35 @@ def _download_musl_toolchain(directory: Path, *, quiet: bool = False) -> None:
     renames the tree into place and stamps it. A concurrent fetch that
     finished first is kept as it is.
     """
+    toolchain = MUSL_TOOLCHAINS[arch]
     root = directory.parent
     root.mkdir(parents=True, exist_ok=True)
     fd, part_name = tempfile.mkstemp(
-        dir=root, prefix=f"{MUSL_TOOLCHAIN_NAME}.", suffix=".tar.xz.part"
+        dir=root, prefix=f"{toolchain.name}.", suffix=".tar.xz.part"
     )
     part = Path(part_name)
     tmp: Path | None = None
     try:
         if not quiet:
-            print(f"downloading {MUSL_TOOLCHAIN_URL}")
+            print(f"downloading {toolchain.url}")
         digest = hashlib.sha256()
-        # MUSL_TOOLCHAIN_URL is the constant pinned above, never user input.
+        # toolchain.url comes from the pinned table above, never user input.
         # The timeout bounds each socket operation: a stalled server fails the
         # fetch instead of hanging until the CI job's own timeout.
         with (
             os.fdopen(fd, "wb") as out,
-            urllib.request.urlopen(MUSL_TOOLCHAIN_URL, timeout=60) as response,  # noqa: S310
+            urllib.request.urlopen(toolchain.url, timeout=60) as response,  # noqa: S310
         ):
             while chunk := response.read(1024 * 1024):
                 out.write(chunk)
                 digest.update(chunk)
         actual = digest.hexdigest()
-        if actual != MUSL_TOOLCHAIN_SHA256:
+        if actual != toolchain.sha256:
             sys.exit(
-                f"error: {MUSL_TOOLCHAIN_NAME} checksum mismatch: "
-                f"expected {MUSL_TOOLCHAIN_SHA256}, got {actual}. Nothing installed."
+                f"error: {toolchain.name} checksum mismatch: "
+                f"expected {toolchain.sha256}, got {actual}. Nothing installed."
             )
-        tmp = Path(tempfile.mkdtemp(dir=root, prefix=f"{MUSL_TOOLCHAIN_NAME}."))
+        tmp = Path(tempfile.mkdtemp(dir=root, prefix=f"{toolchain.name}."))
         if not quiet:
             print(f"extracting to {directory}")
         with tarfile.open(part) as tar:
@@ -240,37 +269,42 @@ def _download_musl_toolchain(directory: Path, *, quiet: bool = False) -> None:
                     f"error: {relocate.name} failed (exit {result.returncode}): "
                     f"{result.stdout}{result.stderr}"
                 )
-        if _musl_toolchain_valid(directory):
+        if _musl_toolchain_valid(directory, arch):
             return
         if directory.exists():
             shutil.rmtree(directory)
         extracted.rename(directory)
-        _musl_toolchain_stamp(directory).write_text(MUSL_TOOLCHAIN_SHA256 + "\n")
+        _musl_toolchain_stamp(directory).write_text(toolchain.sha256 + "\n")
     finally:
         part.unlink(missing_ok=True)
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-def ensure_musl_toolchain(*, quiet: bool = False) -> Path:
+def ensure_musl_toolchain(
+    arch: str = DEFAULT_MUSL_ARCH, *, quiet: bool = False
+) -> Path:
     """Return the pinned toolchain's directory, fetching it if necessary."""
-    directory = musl_toolchain_dir()
-    if _musl_toolchain_valid(directory):
+    directory = musl_toolchain_dir(arch)
+    if _musl_toolchain_valid(directory, arch):
         return directory
-    _download_musl_toolchain(directory, quiet=quiet)
-    if not _musl_toolchain_valid(directory):
+    _download_musl_toolchain(directory, arch, quiet=quiet)
+    if not _musl_toolchain_valid(directory, arch):
+        bin_prefix = MUSL_TOOLCHAINS[arch].bin_prefix
         sys.exit(
             f"error: {directory} invalid after fetch "
-            "(missing bin/x86_64-linux-gcc or a matching stamp)"
+            f"(missing bin/{bin_prefix}-gcc or a matching stamp)"
         )
     return directory
 
 
-def cmd_musl_toolchain(*, print_only: bool, print_key: bool) -> None:
+def cmd_musl_toolchain(
+    *, arch: str = DEFAULT_MUSL_ARCH, print_only: bool, print_key: bool
+) -> None:
     if print_key:
-        print(f"musl-toolchain-{MUSL_TOOLCHAIN_SHA256}")
+        print(f"musl-toolchain-{MUSL_TOOLCHAINS[arch].sha256}")
         return
-    directory = ensure_musl_toolchain(quiet=print_only)
+    directory = ensure_musl_toolchain(arch, quiet=print_only)
     print(directory)
 
 
@@ -382,6 +416,16 @@ def is_musl_preset(preset: str) -> bool:
     return preset.startswith("linux-musl")
 
 
+def musl_arch_for_preset(preset: str) -> str:
+    """Which `MUSL_TOOLCHAINS` entry a musl preset builds against.
+
+    Only one musl preset exists today (`linux-musl-release` -> x86_64);
+    per-arch musl presets land in Project C2 alongside their table entries.
+    Callers only reach this for a preset already known to be musl.
+    """
+    return DEFAULT_MUSL_ARCH
+
+
 def host_profiles_for(preset: str) -> list[str]:
     """Host profile chain for a preset: detected base first, then our partials."""
     if is_musl_preset(preset):
@@ -412,7 +456,7 @@ def conan_env(preset: str) -> dict[str, str]:
     return {
         **os.environ,
         "CONAN_HOME": str(cache_root() / "conan-musl"),
-        "TAZ_MUSL_TOOLCHAIN": str(musl_toolchain_dir()),
+        "TAZ_MUSL_TOOLCHAIN": str(musl_toolchain_dir(musl_arch_for_preset(preset))),
     }
 
 
@@ -450,7 +494,7 @@ def cmd_deps(preset: str) -> None:
     ensure_msvc_env()
     env = conan_env(preset)
     if is_musl_preset(preset):
-        ensure_musl_toolchain()
+        ensure_musl_toolchain(musl_arch_for_preset(preset))
         ensure_musl_conan_home(env)
     cached = os.environ.get(CI_CONAN_PRESET_VAR)
     if cached and conan_profile_args(preset) != conan_profile_args(cached):
@@ -481,7 +525,7 @@ def cmd_lock_deps(preset: str) -> None:
     """
     env = conan_env(preset)
     if is_musl_preset(preset):
-        ensure_musl_toolchain()
+        ensure_musl_toolchain(musl_arch_for_preset(preset))
         ensure_musl_conan_home(env)
     run(
         [
@@ -538,7 +582,7 @@ def cmd_conan_cache_key(preset: str) -> None:
         CONAN_LOCKFILE.read_text(),
     ]
     if is_musl_preset(preset):
-        parts.append(MUSL_TOOLCHAIN_SHA256)
+        parts.append(MUSL_TOOLCHAINS[musl_arch_for_preset(preset)].sha256)
     for part in parts:
         digest.update(part.encode())
     host = json.loads(profiles)["host"]["settings"]
@@ -965,13 +1009,17 @@ def cmd_doctor() -> None:
                 warnings.append(flag)
 
     if not IS_WINDOWS:
-        print("musl toolchain (optional, for `just build linux-musl-release`):")
-        toolchain_dir = musl_toolchain_dir()
-        if _musl_toolchain_valid(toolchain_dir):
-            print(f"  ok       {toolchain_dir}")
-        else:
-            print(f"  missing  {toolchain_dir}  <- run `just musl-toolchain`")
-            warnings.append("musl-toolchain")
+        print("musl toolchains (optional, for `just build linux-musl-release`):")
+        for arch in MUSL_TOOLCHAINS:
+            toolchain_dir = musl_toolchain_dir(arch)
+            if _musl_toolchain_valid(toolchain_dir, arch):
+                print(f"  ok       {arch}: {toolchain_dir}")
+            else:
+                print(
+                    f"  missing  {arch}: {toolchain_dir}"
+                    f"  <- run `just musl-toolchain {arch}`"
+                )
+                warnings.append(f"musl-toolchain-{arch}")
 
     submodules = [ROOT / "daemon" / "third_party" / "nanopb" / "pb.h"]
     print("submodules:")
@@ -1302,6 +1350,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     p = sub.add_parser("musl-toolchain")
     p.add_argument("--print", dest="print_only", action="store_true")
     p.add_argument("--print-key", dest="print_key", action="store_true")
+    p.add_argument(
+        "arch", nargs="?", default=DEFAULT_MUSL_ARCH, choices=sorted(MUSL_TOOLCHAINS)
+    )
     p = sub.add_parser("deps")
     p.add_argument("preset")
     p = sub.add_parser("lock-deps")
@@ -1350,7 +1401,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         case "conan-profiles":
             cmd_conan_profiles()
         case "musl-toolchain":
-            cmd_musl_toolchain(print_only=args.print_only, print_key=args.print_key)
+            cmd_musl_toolchain(
+                arch=args.arch, print_only=args.print_only, print_key=args.print_key
+            )
         case "deps":
             cmd_deps(args.preset)
         case "lock-deps":
