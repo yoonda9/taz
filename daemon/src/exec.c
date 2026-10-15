@@ -745,6 +745,64 @@ static int wide_env_entry_to_utf8(const WCHAR *entry, char **out,
     return 0;
 }
 
+/* CreateEnvironmentBlock composes its machine-wide half from
+ * HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment, which
+ * on every host observed so far carries windir but not SystemRoot - yet the
+ * loader looks for SystemRoot specifically while starting a process with a
+ * custom environment block, and a child silently dying with
+ * STATUS_DLL_NOT_FOUND right after CreateProcessAsUserW otherwise succeeds
+ * is the documented symptom. SystemRoot is machine-wide, not per-user, so
+ * the daemon's own value is always the right one to borrow. */
+static int ensure_system_root(char ***envp_ptr)
+{
+    if (find_env_value(*envp_ptr, "SystemRoot") != NULL)
+    {
+        return 0;
+    }
+
+    wchar_t value_w[MAX_PATH];
+    DWORD len = GetEnvironmentVariableW(
+        L"SystemRoot", value_w, (DWORD)(sizeof(value_w) / sizeof(value_w[0])));
+    if (len == 0U || len >= (sizeof(value_w) / sizeof(value_w[0])))
+    {
+        return 0; /* Nothing to borrow; leave it to the OS to cope. */
+    }
+
+    int needed =
+        WideCharToMultiByte(CP_UTF8, 0, value_w, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0)
+    {
+        return 0;
+    }
+
+    static const char prefix[] = "SystemRoot=";
+    char *entry = (char *)malloc(sizeof(prefix) - 1U + (size_t)needed);
+    if (entry == NULL)
+    {
+        return UV_ENOMEM;
+    }
+    (void)memcpy(entry, prefix, sizeof(prefix) - 1U);
+    (void)WideCharToMultiByte(CP_UTF8, 0, value_w, -1,
+                              entry + (sizeof(prefix) - 1U), needed, NULL,
+                              NULL);
+
+    char **envp = *envp_ptr;
+    size_t count = 0U;
+    for (; envp[count] != NULL; count++)
+    {
+    }
+    char **grown = (char **)realloc(envp, (count + 2U) * sizeof(*grown));
+    if (grown == NULL)
+    {
+        free(entry);
+        return UV_ENOMEM;
+    }
+    grown[count] = entry;
+    grown[count + 1U] = NULL;
+    *envp_ptr = grown;
+    return 0;
+}
+
 /* The target's own environment (table S2): CreateEnvironmentBlock(token,
  * FALSE) - never the daemon's own uv_os_environ - with no USER/LOGNAME/
  * HOME trio (those are POSIX-only; the target's own profile sets its
@@ -814,6 +872,15 @@ static int build_env_from_token(void *token, const taz_v1_KeyValue *extra,
     if (rc == 0)
     {
         rc = merge_env(pairs, n, NULL, NULL, 0U, extra, extra_count, out_env);
+    }
+    if (rc == 0)
+    {
+        rc = ensure_system_root(out_env);
+        if (rc != 0)
+        {
+            taz_exec_free_env(*out_env);
+            *out_env = NULL;
+        }
     }
 
     for (size_t i = 0U; i < n; i++)

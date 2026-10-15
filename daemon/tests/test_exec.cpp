@@ -411,6 +411,11 @@ TEST_F(ExecBuildEnvTokenTest, BaseComesFromTheTokensOwnEnvironmentBlock)
     EXPECT_TRUE(EnvValues(env, "USER").empty());
     EXPECT_TRUE(EnvValues(env, "LOGNAME").empty());
     EXPECT_TRUE(EnvValues(env, "HOME").empty());
+    // CreateEnvironmentBlock's machine-wide half doesn't carry SystemRoot on
+    // every host; ensure_system_root backfills it (CreateProcessAsUserW's
+    // child otherwise dies immediately with STATUS_DLL_NOT_FOUND).
+    EXPECT_EQ(EnvValues(env, "SystemRoot"),
+              std::vector<std::string>{OwnEnvVarUtf8(L"SystemRoot")});
     taz_exec_free_env(env);
 }
 
