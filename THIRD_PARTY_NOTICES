@@ -146,10 +146,15 @@ redistribute it freely, subject to the following restrictions:
 musl 1.2.6 -- MIT License -- COPYRIGHT (Linux binary only)
 ==============================================================================
 
-NOTE: the pinned Bootlin x86-64--musl--stable-2026.08-1 toolchain tarball
-does not ship musl's own COPYRIGHT file. The text below is reproduced
-verbatim from upstream musl's COPYRIGHT file at tag v1.2.6 (the version
-built into this toolchain):
+NOTE: the pinned Bootlin toolchain tarballs used to build the Linux release
+binaries do not ship musl's own COPYRIGHT file:
+
+  - x86-64--musl--stable-2026.08-1 (x86_64)
+  - x86-i686--musl--stable-2026.08-1 (i686)
+  - aarch64--musl--stable-2026.08-1 (aarch64)
+
+The text below is reproduced verbatim from upstream musl's COPYRIGHT file at
+tag v1.2.6 (the version built into all three toolchains):
 https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.6
 
 musl as a whole is licensed under the following standard MIT license:

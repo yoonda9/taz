@@ -658,3 +658,14 @@ def test_release_bundle_names_windows_artifacts_tazd_exe(
     # LF even when written on Windows: coreutils 8.x `sha256sum -c` rejects CRLF.
     sha_line = f"{expected_digest}  tazd.exe\n".encode()
     assert (out_dir / "tazd.exe.sha256").read_bytes() == sha_line
+
+
+# --- THIRD_PARTY_NOTICES covers every musl toolchain -------------------------
+
+
+def test_third_party_notices_mentions_every_musl_toolchain() -> None:
+    notices = (dev.ROOT / "THIRD_PARTY_NOTICES").read_text()
+    for toolchain in dev.MUSL_TOOLCHAINS.values():
+        assert toolchain.name in notices, (
+            f"{toolchain.name} missing from THIRD_PARTY_NOTICES"
+        )
