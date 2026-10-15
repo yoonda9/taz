@@ -588,6 +588,15 @@ static void free_env(char **env)
     {
         return;
     }
+    /* False positive: when merge_env's base/identity/extra counts are all 0
+     * (an empty token block, no request env), its one-element calloc'd
+     * terminator-only array is exactly what env points at here, but
+     * clang-analyzer's ArrayBound checker loses that binding crossing back
+     * out through the out-param chain (taz_exec_build_env/
+     * build_env_from_token) and assumes env[0] could be a real entry, then
+     * flags the next index as past the one-element allocation. Walking a
+     * NULL-terminated envp is this file's whole convention. */
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
     for (size_t i = 0U; env[i] != NULL; i++)
     {
         /* Free through a copy: MSVC /analyze treats every env[i] as one
@@ -711,6 +720,10 @@ static int merge_env(const env_pair_t *base, size_t base_count,
 static const char *find_env_value(char *const *envp, const char *name)
 {
     size_t len = strlen(name);
+    /* False positive, same root cause as free_env's guard above: the
+     * terminator-only array merge_env produces when every count is 0 loses
+     * its NULL binding for this checker across the out-param chain. */
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
     for (size_t i = 0U; envp[i] != NULL; i++)
     {
         if ((_strnicmp(envp[i], name, len) == 0) && (envp[i][len] == '='))
@@ -804,6 +817,8 @@ static int ensure_system_root(char ***envp_ptr)
 
     char **envp = *envp_ptr;
     size_t count = 0U;
+    /* False positive, same root cause as free_env's guard above. */
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
     for (; envp[count] != NULL; count++)
     {
     }
@@ -1058,6 +1073,8 @@ static wchar_t *utf8_to_wide(const char *s, int *out_rc)
 static int build_wide_env_block(char *const *envp, wchar_t **out_block)
 {
     size_t count = 0U;
+    /* False positive, same root cause as free_env's guard above. */
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
     for (; envp[count] != NULL; count++)
     {
     }
