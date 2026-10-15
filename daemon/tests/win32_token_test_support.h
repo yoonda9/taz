@@ -119,10 +119,14 @@ inline ScopedHandle OwnPrimaryToken(std::string *reason)
     }
     ScopedHandle token(raw);
 
+    // Not SE_INCREASE_QUOTA_NAME & co.: those expand through TEXT(), which
+    // is the narrow (const char *) form unless UNICODE/_UNICODE is defined
+    // for this translation unit, but LookupPrivilegeValueW always wants a
+    // wide string.
     static const PrivilegeSpec kPrivileges[] = {
-        {SE_INCREASE_QUOTA_NAME, "SeIncreaseQuotaPrivilege"},
-        {SE_BACKUP_NAME, "SeBackupPrivilege"},
-        {SE_RESTORE_NAME, "SeRestorePrivilege"},
+        {L"SeIncreaseQuotaPrivilege", "SeIncreaseQuotaPrivilege"},
+        {L"SeBackupPrivilege", "SeBackupPrivilege"},
+        {L"SeRestorePrivilege", "SeRestorePrivilege"},
     };
     for (const auto &spec : kPrivileges)
     {

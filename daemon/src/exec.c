@@ -655,7 +655,7 @@ static int build_env_from_token(void *token, const taz_v1_KeyValue *extra,
     if ((pairs == NULL) || (owned == NULL))
     {
         free(pairs);
-        free(owned);
+        free((void *)owned);
         (void)DestroyEnvironmentBlock(block);
         return UV_ENOMEM;
     }
@@ -695,7 +695,7 @@ static int build_env_from_token(void *token, const taz_v1_KeyValue *extra,
         char *entry = owned[i];
         free(entry);
     }
-    free(owned);
+    free((void *)owned);
     free(pairs);
     (void)DestroyEnvironmentBlock(block);
     return rc;
