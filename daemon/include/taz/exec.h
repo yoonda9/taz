@@ -128,10 +128,15 @@ extern "C"
 
     /* Build the child's NULL-terminated NAME=VALUE environment in three
      * layers, a later one overriding an earlier one on a name match
-     * (case-insensitive on Windows): the daemon's own environment; then,
-     * when spec->switch_identity is set, USER and LOGNAME set to
-     * identity_user and HOME to identity_home ("/" when empty), as su and
-     * sudo set them; then spec->env. Returns 0 and stores the result in
+     * (case-insensitive on Windows): a base environment; then, when
+     * spec->switch_identity is set, USER and LOGNAME set to identity_user
+     * and HOME to identity_home ("/" when empty), as su and sudo set them;
+     * then spec->env. The base is the daemon's own environment
+     * (uv_os_environ), except on Windows when spec->token is non-NULL: there
+     * it is that token's own environment (CreateEnvironmentBlock(token,
+     * FALSE) - never the daemon's own environment), and the USER/LOGNAME/
+     * HOME trio is skipped entirely (POSIX-only; the target's loaded
+     * profile sets its own equivalents). Returns 0 and stores the result in
      * *out_env (free it with taz_exec_free_env), or a UV_E* code. Spawns
      * nothing, so tests can call it directly. */
     int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env);

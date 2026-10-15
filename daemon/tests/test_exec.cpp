@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -15,6 +16,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+
+#include "win32_token_test_support.h"
 #endif
 
 #include "taz/exec.h"
@@ -337,6 +340,101 @@ TEST(ExecBuildEnvTest, NoIdentityKeepsTheDaemonsOwnValues)
     EXPECT_EQ(EnvValues(env, "HOME"), DaemonValues("HOME"));
     taz_exec_free_env(env);
 }
+
+#ifdef _WIN32
+
+namespace
+{
+
+// The current process's own value for a wide env var name, converted to
+// UTF-8; empty when it is unset.
+std::string OwnEnvVarUtf8(const wchar_t *name)
+{
+    wchar_t buf[1024];
+    const DWORD n =
+        GetEnvironmentVariableW(name, buf, static_cast<DWORD>(std::size(buf)));
+    if ((n == 0) || (n >= std::size(buf)))
+    {
+        return std::string();
+    }
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(n),
+                                           nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<size_t>(needed), '\0');
+    (void)WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(n), out.data(),
+                              needed, nullptr, nullptr);
+    return out;
+}
+
+} // namespace
+
+// DEC-006: these rows duplicate the test process's own token (no second
+// account exists on the host yet), so the token's environment block is
+// expected to equal the current process's own session values.
+class ExecBuildEnvTokenTest : public ::testing::Test
+{
+  protected:
+    void SetUp() override
+    {
+        std::string reason;
+        token_ = OwnPrimaryToken(&reason);
+        if (!token_.valid())
+        {
+            GTEST_SKIP() << reason;
+        }
+    }
+
+    HANDLE Token() const
+    {
+        return token_.get();
+    }
+
+  private:
+    ScopedHandle token_;
+};
+
+TEST_F(ExecBuildEnvTokenTest, BaseComesFromTheTokensOwnEnvironmentBlock)
+{
+    set_parent_env("TAZ_ONLY_IN_DAEMON", "yes");
+    taz_exec_spec_t spec{};
+    spec.token = Token();
+    char **env = nullptr;
+
+    const int rc = taz_exec_build_env(&spec, &env);
+    unset_parent_env("TAZ_ONLY_IN_DAEMON");
+    ASSERT_EQ(rc, 0);
+
+    EXPECT_EQ(EnvValues(env, "USERPROFILE"),
+              std::vector<std::string>{OwnEnvVarUtf8(L"USERPROFILE")});
+    EXPECT_EQ(EnvValues(env, "USERNAME"),
+              std::vector<std::string>{OwnEnvVarUtf8(L"USERNAME")});
+    EXPECT_TRUE(EnvValues(env, "TAZ_ONLY_IN_DAEMON").empty());
+    EXPECT_TRUE(EnvValues(env, "USER").empty());
+    EXPECT_TRUE(EnvValues(env, "LOGNAME").empty());
+    EXPECT_TRUE(EnvValues(env, "HOME").empty());
+    taz_exec_free_env(env);
+}
+
+TEST_F(ExecBuildEnvTokenTest, RequestEnvOverridesTheTokenBase)
+{
+    taz_exec_spec_t spec{};
+    spec.token = Token();
+    taz_v1_KeyValue extra{};
+    (void)std::snprintf(extra.key, sizeof(extra.key), "%s", "USERPROFILE");
+    (void)std::snprintf(extra.value, sizeof(extra.value), "%s", "C:\\custom");
+    spec.env = &extra;
+    spec.env_count = 1U;
+    char **env = nullptr;
+
+    ASSERT_EQ(taz_exec_build_env(&spec, &env), 0);
+
+    EXPECT_EQ(EnvValues(env, "USERPROFILE"),
+              std::vector<std::string>{"C:\\custom"});
+    EXPECT_EQ(EnvValues(env, "USERNAME"),
+              std::vector<std::string>{OwnEnvVarUtf8(L"USERNAME")});
+    taz_exec_free_env(env);
+}
+
+#endif // _WIN32
 
 // --- taz_exec_start -------------------------------------------------------
 //

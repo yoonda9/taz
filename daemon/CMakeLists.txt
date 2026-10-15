@@ -312,6 +312,9 @@ if(WIN32)
     # GetNamedSecurityInfoW / LookupAccountSidW (handlers/file.c Windows
     # owner lookup) live in Advapi32.lib.
     target_link_libraries(taz_core PRIVATE Advapi32)
+    # CreateEnvironmentBlock/DestroyEnvironmentBlock (exec.c's token-aware
+    # env build) live in Userenv.lib.
+    target_link_libraries(taz_core PRIVATE Userenv)
 endif()
 # taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
 # to the C++ GoogleTest target that links taz_core.

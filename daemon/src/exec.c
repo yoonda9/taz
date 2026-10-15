@@ -10,6 +10,7 @@
 #include "taz/run_as.h"
 
 #ifdef _WIN32
+#include <userenv.h>
 #include <windows.h>
 #else
 #include <signal.h>
@@ -490,6 +491,17 @@ void taz_exec_free_env(char **env)
 /* The variables taz_exec_build_env sets for a switched identity. */
 #define TAZ_EXEC_IDENTITY_ENV_COUNT 3U
 
+/* One NAME/VALUE pair from an environment source: either the daemon's own
+ * process environment (uv_os_environ, on every platform), or - on Windows,
+ * when spawning as another user - that user's own environment block
+ * (CreateEnvironmentBlock). Neither pointer is owned by the pair; it just
+ * lets the merge below treat both sources the same way. */
+typedef struct
+{
+    const char *name;
+    const char *value;
+} env_pair_t;
+
 static int env_name_in_extra(const char *name, const taz_v1_KeyValue *extra,
                              size_t extra_count)
 {
@@ -502,6 +514,193 @@ static int env_name_in_extra(const char *name, const taz_v1_KeyValue *extra,
     }
     return 0;
 }
+
+/* Merges base (identity_count later entries override a same-named base
+ * entry, extra overrides both) into a NULL-terminated NAME=VALUE array.
+ * identity_names/identity_values may be NULL when identity_count is 0. */
+static int merge_env(const env_pair_t *base, size_t base_count,
+                     const char *const *identity_names,
+                     const char *const *identity_values, size_t identity_count,
+                     const taz_v1_KeyValue *extra, size_t extra_count,
+                     char ***out_env)
+{
+    char **merged = (char **)calloc(
+        base_count + identity_count + extra_count + 1U, sizeof(*merged));
+    if (merged == NULL)
+    {
+        return UV_ENOMEM;
+    }
+
+    size_t n = 0U;
+    for (size_t i = 0U; i < base_count; i++)
+    {
+        int overridden = env_name_in_extra(base[i].name, extra, extra_count);
+        for (size_t k = 0U; (overridden == 0) && (k < identity_count); k++)
+        {
+            if (TAZ_EXEC_ENV_NAME_CMP(base[i].name, identity_names[k]) == 0)
+            {
+                overridden = 1;
+            }
+        }
+        if (overridden)
+        {
+            continue;
+        }
+
+        merged[n] = join_name_value(base[i].name, base[i].value);
+        if (merged[n] == NULL)
+        {
+            free_env(merged);
+            return UV_ENOMEM;
+        }
+        n++;
+    }
+
+    for (size_t k = 0U; k < identity_count; k++)
+    {
+        if (env_name_in_extra(identity_names[k], extra, extra_count))
+        {
+            continue;
+        }
+        merged[n] = join_name_value(identity_names[k], identity_values[k]);
+        if (merged[n] == NULL)
+        {
+            free_env(merged);
+            return UV_ENOMEM;
+        }
+        n++;
+    }
+
+    for (size_t j = 0U; j < extra_count; j++)
+    {
+        merged[n] = join_name_value(extra[j].key, extra[j].value);
+        if (merged[n] == NULL)
+        {
+            free_env(merged);
+            return UV_ENOMEM;
+        }
+        n++;
+    }
+    merged[n] = NULL;
+
+    *out_env = merged;
+    return 0;
+}
+
+#ifdef _WIN32
+/* Converts one entry ("NAME=VALUE", or a handful of pseudo-variables whose
+ * own name starts with '=' - the per-drive cwd entries, "=ExitCode" - that
+ * libuv's uv_os_environ skips the same way) from a double-NUL-terminated
+ * wide multi-string into a single malloc'd, NUL-split UTF-8 buffer: *out
+ * points at NAME, *out_value at VALUE, both inside that one allocation.
+ * Returns UV_EINVAL (not a real error, just "skip this entry") when there
+ * is no '=' to split on. */
+static int wide_env_entry_to_utf8(const WCHAR *entry, char **out,
+                                  const char **out_value)
+{
+    int needed =
+        WideCharToMultiByte(CP_UTF8, 0, entry, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0)
+    {
+        return uv_translate_sys_error((int)GetLastError());
+    }
+
+    char *buf = (char *)malloc((size_t)needed);
+    if (buf == NULL)
+    {
+        return UV_ENOMEM;
+    }
+    (void)WideCharToMultiByte(CP_UTF8, 0, entry, -1, buf, needed, NULL, NULL);
+
+    /* Search from offset 1: those pseudo-variables have a name that itself
+     * starts with '=', so the first '=' in the string is not the
+     * separator. */
+    char *eq = strchr(buf + 1, '=');
+    if (eq == NULL)
+    {
+        free(buf);
+        return UV_EINVAL;
+    }
+    *eq = '\0';
+
+    *out = buf;
+    *out_value = eq + 1;
+    return 0;
+}
+
+/* The target's own environment (table S2): CreateEnvironmentBlock(token,
+ * FALSE) - never the daemon's own uv_os_environ - with no USER/LOGNAME/
+ * HOME trio (those are POSIX-only; the target's own profile sets its
+ * equivalents), request env on top. */
+static int build_env_from_token(void *token, const taz_v1_KeyValue *extra,
+                                size_t extra_count, char ***out_env)
+{
+    LPVOID block = NULL;
+    if (!CreateEnvironmentBlock(&block, (HANDLE)token, FALSE))
+    {
+        return uv_translate_sys_error((int)GetLastError());
+    }
+
+    size_t count = 0U;
+    for (const WCHAR *p = (const WCHAR *)block; *p != L'\0';
+         p += wcslen(p) + 1U)
+    {
+        count++;
+    }
+
+    /* +1 so pairs/owned are never NULL when count is 0 - see the matching
+     * comment in taz_exec_build_env. */
+    env_pair_t *pairs = (env_pair_t *)calloc(count + 1U, sizeof(*pairs));
+    char **owned = (char **)calloc(count + 1U, sizeof(*owned));
+    if ((pairs == NULL) || (owned == NULL))
+    {
+        free(pairs);
+        free(owned);
+        (void)DestroyEnvironmentBlock(block);
+        return UV_ENOMEM;
+    }
+
+    size_t n = 0U;
+    int rc = 0;
+    for (const WCHAR *p = (const WCHAR *)block; *p != L'\0';
+         p += wcslen(p) + 1U)
+    {
+        char *name = NULL;
+        const char *value = NULL;
+        int entry_rc = wide_env_entry_to_utf8(p, &name, &value);
+        if (entry_rc == UV_EINVAL)
+        {
+            continue; /* no '=': not a real entry, skip it */
+        }
+        if (entry_rc != 0)
+        {
+            rc = entry_rc;
+            break;
+        }
+
+        owned[n] = name;
+        pairs[n].name = name;
+        pairs[n].value = value;
+        n++;
+    }
+
+    if (rc == 0)
+    {
+        rc = merge_env(pairs, n, NULL, NULL, 0U, extra, extra_count, out_env);
+    }
+
+    for (size_t i = 0U; i < n; i++)
+    {
+        /* Free through a copy, same reason as free_env. */
+        char *entry = owned[i];
+        free(entry);
+    }
+    free(owned);
+    free(pairs);
+    (void)DestroyEnvironmentBlock(block);
+    return rc;
+}
+#endif /* _WIN32 */
 
 int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env)
 {
@@ -522,6 +721,13 @@ int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env)
         identity_count = TAZ_EXEC_IDENTITY_ENV_COUNT;
     }
 
+#ifdef _WIN32
+    if (spec->token != NULL)
+    {
+        return build_env_from_token(spec->token, extra, extra_count, out_env);
+    }
+#endif
+
     uv_env_item_t *base = NULL;
     int base_count = 0;
     int rc = uv_os_environ(&base, &base_count);
@@ -530,73 +736,30 @@ int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env)
         return rc;
     }
 
-    char **merged =
-        (char **)calloc((size_t)base_count + identity_count + extra_count + 1U,
-                        sizeof(*merged));
-    if (merged == NULL)
+    /* +1 and calloc (not malloc) so pairs is never NULL when base_count is
+     * 0 and every slot starts zeroed - GCC 13's -fanalyzer (unlike local
+     * GCC 16) cannot otherwise tell, across the merge_env call below, that
+     * a NULL pairs always pairs with a zero count, or that the loop below
+     * always fills indices [0, base_count) before merge_env reads them. */
+    env_pair_t *pairs =
+        (env_pair_t *)calloc((size_t)base_count + 1U, sizeof(*pairs));
+    if (pairs == NULL)
     {
         uv_os_free_environ(base, base_count);
         return UV_ENOMEM;
     }
-
-    size_t n = 0U;
     for (int i = 0; i < base_count; i++)
     {
-        int overridden = env_name_in_extra(base[i].name, extra, extra_count);
-        for (size_t k = 0U; (overridden == 0) && (k < identity_count); k++)
-        {
-            if (TAZ_EXEC_ENV_NAME_CMP(base[i].name, identity_names[k]) == 0)
-            {
-                overridden = 1;
-            }
-        }
-        if (overridden)
-        {
-            continue;
-        }
-
-        merged[n] = join_name_value(base[i].name, base[i].value);
-        if (merged[n] == NULL)
-        {
-            uv_os_free_environ(base, base_count);
-            free_env(merged);
-            return UV_ENOMEM;
-        }
-        n++;
+        pairs[i].name = base[i].name;
+        pairs[i].value = base[i].value;
     }
 
-    for (size_t k = 0U; k < identity_count; k++)
-    {
-        if (env_name_in_extra(identity_names[k], extra, extra_count))
-        {
-            continue;
-        }
-        merged[n] = join_name_value(identity_names[k], identity_values[k]);
-        if (merged[n] == NULL)
-        {
-            uv_os_free_environ(base, base_count);
-            free_env(merged);
-            return UV_ENOMEM;
-        }
-        n++;
-    }
+    rc = merge_env(pairs, (size_t)base_count, identity_names, identity_values,
+                   identity_count, extra, extra_count, out_env);
 
-    for (size_t j = 0U; j < extra_count; j++)
-    {
-        merged[n] = join_name_value(extra[j].key, extra[j].value);
-        if (merged[n] == NULL)
-        {
-            uv_os_free_environ(base, base_count);
-            free_env(merged);
-            return UV_ENOMEM;
-        }
-        n++;
-    }
-    merged[n] = NULL;
-
+    free(pairs);
     uv_os_free_environ(base, base_count);
-    *out_env = merged;
-    return 0;
+    return rc;
 }
 
 #ifdef _WIN32
