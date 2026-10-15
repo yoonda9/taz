@@ -1,7 +1,7 @@
 // Windows-only helpers for tests that need a real, usable primary token.
-// No second account exists on the host yet (DEC-006), so these rows
-// duplicate the test process's own token instead, enabling the handful of
-// privileges a later CreateProcessAsUserW/LoadUserProfileW spawn needs.
+// No second account exists on the host yet, so these rows duplicate the
+// test process's own token instead, enabling the handful of privileges a
+// later CreateProcessAsUserW/LoadUserProfileW spawn needs.
 // Included only from Windows-only test code (#ifdef _WIN32 in test_exec.cpp).
 
 #ifndef TAZ_TESTS_WIN32_TOKEN_TEST_SUPPORT_H

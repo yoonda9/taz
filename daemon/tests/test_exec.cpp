@@ -367,9 +367,9 @@ std::string OwnEnvVarUtf8(const wchar_t *name)
 
 } // namespace
 
-// DEC-006: these rows duplicate the test process's own token (no second
-// account exists on the host yet), so the token's environment block is
-// expected to equal the current process's own session values.
+// These rows duplicate the test process's own token (no second account
+// exists on the host yet), so the token's environment block is expected
+// to equal the current process's own session values.
 class ExecBuildEnvTokenTest : public ::testing::Test
 {
   protected:
