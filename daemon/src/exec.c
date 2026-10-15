@@ -705,6 +705,22 @@ static int merge_env(const env_pair_t *base, size_t base_count,
 }
 
 #ifdef _WIN32
+/* The value half of the first entry in envp (UTF-8 "NAME=VALUE", as built by
+ * taz_exec_build_env) whose name matches name case-insensitively, or NULL.
+ * Points into envp; not owned. */
+static const char *find_env_value(char *const *envp, const char *name)
+{
+    size_t len = strlen(name);
+    for (size_t i = 0U; envp[i] != NULL; i++)
+    {
+        if ((_strnicmp(envp[i], name, len) == 0) && (envp[i][len] == '='))
+        {
+            return envp[i] + len + 1U;
+        }
+    }
+    return NULL;
+}
+
 /* Converts one entry ("NAME=VALUE", or a handful of pseudo-variables whose
  * own name starts with '=' - the per-drive cwd entries, "=ExitCode" - that
  * libuv's uv_os_environ skips the same way) from a double-NUL-terminated
@@ -791,7 +807,8 @@ static int ensure_system_root(char ***envp_ptr)
     for (; envp[count] != NULL; count++)
     {
     }
-    char **grown = (char **)realloc(envp, (count + 2U) * sizeof(*grown));
+    char **grown =
+        (char **)realloc((void *)envp, (count + 2U) * sizeof(*grown));
     if (grown == NULL)
     {
         free(entry);
@@ -1029,22 +1046,6 @@ static wchar_t *utf8_to_wide(const char *s, int *out_rc)
     (void)MultiByteToWideChar(CP_UTF8, 0, s, -1, w, needed);
     *out_rc = 0;
     return w;
-}
-
-/* The value half of the first entry in envp (UTF-8 "NAME=VALUE", as built by
- * taz_exec_build_env) whose name matches name case-insensitively, or NULL.
- * Points into envp; not owned. */
-static const char *find_env_value(char *const *envp, const char *name)
-{
-    size_t len = strlen(name);
-    for (size_t i = 0U; envp[i] != NULL; i++)
-    {
-        if ((_strnicmp(envp[i], name, len) == 0) && (envp[i][len] == '='))
-        {
-            return envp[i] + len + 1U;
-        }
-    }
-    return NULL;
 }
 
 /* Converts envp (UTF-8 "NAME=VALUE", NULL-terminated, as built by
