@@ -435,7 +435,7 @@ EmptyTempDir MakeEmptyTempDir()
     result.wide = std::wstring(temp, temp_len) + L"taz-test-empty-" +
                   std::to_wstring(GetCurrentProcessId()) + L"-" +
                   std::to_wstring(GetTickCount64());
-    if (!CreateDirectoryW(result.wide.c_str(), nullptr))
+    if (CreateDirectoryW(result.wide.c_str(), nullptr) == 0)
     {
         result.wide.clear();
         return result;
@@ -483,14 +483,9 @@ std::vector<std::string> SplitEnvLines(const std::string &text)
 bool AnyLineStartsWith(const std::vector<std::string> &lines,
                        const std::string &prefix)
 {
-    for (const auto &line : lines)
-    {
-        if (line.rfind(prefix, 0) == 0)
-        {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(lines.begin(), lines.end(),
+                       [&prefix](const std::string &line)
+                       { return line.rfind(prefix, 0) == 0; });
 }
 
 } // namespace
@@ -828,7 +823,7 @@ TEST_F(ExecSpawnTest, NonexistentFileFailsSpawnAsUserAndClosesTheToken)
     }
     const std::string username = OwnEnvVarUtf8(L"USERNAME");
     ASSERT_FALSE(username.empty());
-    HANDLE const token = owned.get();
+    HANDLE token = owned.get();
 
     const std::string missing = Exe() + "-taz-test-does-not-exist";
     taz_exec_spec_t spec{};
@@ -943,7 +938,7 @@ TEST_F(ExecSpawnTest, HugeArgumentFailsSpawnAsUserWithE2bigAndClosesTheToken)
     }
     const std::string username = OwnEnvVarUtf8(L"USERNAME");
     ASSERT_FALSE(username.empty());
-    HANDLE const token = owned.get();
+    HANDLE token = owned.get();
 
     const std::string huge(40000, 'a');
     const char *const args[] = {huge.c_str()};
