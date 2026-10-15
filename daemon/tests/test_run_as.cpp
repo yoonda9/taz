@@ -46,9 +46,8 @@ class RunAsHandlerTest : public FileHandlerTest
 {
 };
 
-// Mirrors FileHandlerTest's own TearDown (RunAsResetOnTeardownTest below):
-// calls the base teardown first, so taz_run_as_reset has already run, then
-// checks what it left behind.
+// Checks what taz_run_as_reset left behind once the base fixture's own
+// TearDown (file_test_support.h) has already run it.
 class RunAsResetOnTeardownTest : public RunAsHandlerTest
 {
   protected:
@@ -65,6 +64,14 @@ class RunAsResetOnTeardownTest : public RunAsHandlerTest
 #endif
     }
 
+#ifdef _WIN32
+    void SetToken(HANDLE token)
+    {
+        token_ = token;
+    }
+#endif
+
+  private:
 #ifdef _WIN32
     HANDLE token_ = nullptr;
 #endif
@@ -146,9 +153,10 @@ TEST_F(RunAsResetOnTeardownTest, FixtureTeardownClosesAnOutstandingToken)
     (void)snprintf(Dispatch().run_as_user, sizeof(Dispatch().run_as_user), "%s",
                    "alice");
 #ifdef _WIN32
-    token_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    ASSERT_NE(token_, nullptr);
-    Dispatch().run_as_token = token_;
+    HANDLE token = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_NE(token, nullptr);
+    SetToken(token);
+    Dispatch().run_as_token = token;
 #endif
 }
 
