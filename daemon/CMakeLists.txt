@@ -282,6 +282,7 @@ add_library(
     src/dispatch.c
     src/connection.c
     src/run_as.c
+    src/run_as_name.c
     src/handlers/version.c
     src/handlers/config.c
     src/handlers/command.c

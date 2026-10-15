@@ -3,10 +3,58 @@
 
 #include <stddef.h>
 
+#include "taz/exec.h"
+
 #ifdef __cplusplus
 extern "C"
 {
 #endif
+
+    /* Which half of a parsed RUN_AS/as_user name taz_run_as_parse_name found:
+     * LOCAL names resolve against this machine's own accounts (passwd on
+     * POSIX, the local SAM via MSV1_0_S4U_LOGON on Windows); DOMAIN names
+     * need a domain controller (KERB_S4U_LOGON on Windows; POSIX never
+     * resolves one, since passwd has no notion of a domain). */
+    typedef enum
+    {
+        TAZ_RUN_AS_NAME_LOCAL = 0,
+        TAZ_RUN_AS_NAME_DOMAIN = 1
+    } taz_run_as_name_kind_t;
+
+    typedef struct
+    {
+        taz_run_as_name_kind_t kind;
+        /* LOCAL: the bare account name. DOMAIN: the name exactly as given
+         * (e.g. "CORP\\alice" or "alice@corp.example") - a logon call takes
+         * it verbatim, so there is nothing to split out. */
+        char user[TAZ_EXEC_USER_MAX];
+        /* LOCAL: computer_name, copied through. DOMAIN: "". */
+        char domain[TAZ_EXEC_USER_MAX];
+    } taz_run_as_name_t;
+
+    /* Classify and split a RUN_AS/as_user name. Pure: no I/O, no platform
+     * headers, same answer on every OS for the same inputs.
+     *
+     * Accepted forms:
+     *   "user"             -> LOCAL,  user="user",        domain=computer_name
+     *   ".\\user"          -> LOCAL,  user="user",        domain=computer_name
+     *   "COMPUTER\\user"   -> LOCAL (COMPUTER case-insensitively ==
+     *                         computer_name), user="user", domain=computer_name
+     *   "DOMAIN\\user"     -> DOMAIN (COMPUTER did not match, or
+     *                         computer_name is empty/NULL), user=input
+     *                         verbatim, domain=""
+     *   "user@realm"       -> DOMAIN, user=input verbatim, domain=""
+     *
+     * computer_name may be NULL or "" (nothing to match against): every
+     * "X\\user" form is then DOMAIN, and a bare "user" is still LOCAL, with
+     * domain="".
+     *
+     * Returns 0 on success. Returns -1, leaving *out untouched, for a
+     * malformed name: empty; a leading or trailing '\\'; more than one
+     * '\\'; both '\\' and '@' present; a leading or trailing '@'; or any
+     * part that would not fit in TAZ_EXEC_USER_MAX bytes including the NUL. */
+    int taz_run_as_parse_name(const char *input, const char *computer_name,
+                              taz_run_as_name_t *out);
 
     /* True when this process can switch a spawned child's identity: POSIX
      * effective uid 0. Windows RUN_AS is deferred, so this is always false

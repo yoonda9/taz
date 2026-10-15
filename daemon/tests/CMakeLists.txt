@@ -35,6 +35,7 @@ add_executable(
     test_task.cpp
     test_timeout.cpp
     test_run_as.cpp
+    test_run_as_name.cpp
     test_error.cpp
     test_response.cpp
     test_exec.cpp
