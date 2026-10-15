@@ -85,10 +85,13 @@ verify-static preset=release: (build preset)
 release-bundle preset=release: (build preset)
     {{ dev }} release-bundle {{ preset }}
 
-# Re-bundle preset, then check the shipped sha256 digest matches the binary
-# and the shipped LICENSE/THIRD_PARTY_NOTICES match the repo's — catches a
-# stale or truncated copy before it's uploaded as a CI artifact.
-verify-release-bundle preset=release: (release-bundle preset)
+# Check the sha256 digest already shipped in out/release/<artifact> matches
+# the binary and the shipped LICENSE/THIRD_PARTY_NOTICES match the repo's —
+# catches a stale or truncated copy before it's uploaded as a CI artifact.
+# Does NOT depend on `release-bundle`: CI runs that as its own prior step, and
+# re-bundling here would just re-verify a fresh copy instead of the one that
+# step actually produced. Run `just release-bundle preset` first.
+verify-release-bundle preset=release:
     {{ dev }} verify-release-bundle {{ preset }}
 
 # --- tests ------------------------------------------------------------------

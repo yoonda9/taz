@@ -776,6 +776,30 @@ def test_verify_release_bundle_fails_on_missing_license(
         dev.cmd_verify_release_bundle("linux-musl-release")
 
 
+def test_justfile_verify_release_bundle_does_not_rebundle() -> None:
+    """CI runs `just release-bundle` then `just verify-release-bundle` as two
+    separate steps so verify checks the artifact the first step produced. If
+    the `verify-release-bundle` recipe itself depends on `release-bundle`, it
+    silently re-bundles (and re-configures/re-builds) before checking,
+    tautologically verifying its own fresh copy instead of the one CI already
+    uploaded from the prior step -- defeating the point of a separate check."""
+    just = shutil.which("just")
+    assert just is not None, "just must be on PATH to run this test"
+    result = subprocess.run(
+        [just, "--dry-run", "verify-release-bundle", "linux-musl-release"],
+        cwd=dev.ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    # `just --dry-run` prints the commands it would run to stderr, not stdout.
+    planned = result.stderr
+
+    assert "configure" not in planned
+    assert "cmake --build" not in planned
+    assert " release-bundle " not in f" {planned} "
+
+
 # --- THIRD_PARTY_NOTICES covers every musl toolchain -------------------------
 
 
