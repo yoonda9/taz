@@ -59,6 +59,7 @@ jobs:
             checks: [release]
             conan-preset: linux-musl-release
             musl-arch: x86_64
+            release-artifact: taz-linux-x64
             mise-tools: uv just prek cmake ninja
             # linux-musl-release has its own Conan home (own package set,
             # never shared with the glibc presets' ~/.conan2), under
@@ -68,6 +69,7 @@ jobs:
             checks: [release]
             conan-preset: linux-musl-i686-release
             musl-arch: i686
+            release-artifact: taz-linux-i686
             mise-tools: uv just prek cmake ninja
             # Own Conan home, same rationale as linux-musl-release, keyed by
             # arch (tools/dev.py conan_env) so the i686 packages never
@@ -235,25 +237,22 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
         run: just verify-static ${{ matrix.conan-preset }}
 
-      # Only a binary that passed every check above is published. i686's
-      # bundle/artifact upload is a separate task (C3c); this entry only
-      # proves the preset builds, tests and is fully static in CI.
+      # Only a binary that passed every check above is published.
       - id: release-bundle
-        if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' && matrix.conan-preset == 'linux-musl-release' }}
-        run: just release-bundle linux-musl-release
+        if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' }}
+        run: just release-bundle ${{ matrix.conan-preset }}
 
       - if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: taz-linux-x64
-          path: out/release/taz-linux-x64
+          name: ${{ matrix.release-artifact }}
+          path: out/release/${{ matrix.release-artifact }}
 
   # aarch64 gets its own top-level job instead of a matrix entry on `linux`:
   # `runs-on` is pinned at the job level, so a matrix entry here would still
   # run on the x86_64 runner and force qemu for the whole build — exactly the
   # io_uring/qemu problem a native arm runner avoids. Release-only, same as
-  # i686's entry on `linux`; bundling + artifact upload is a separate task
-  # (C3c), so this job only builds, tests and verify-statics the preset.
+  # i686's entry on `linux`.
   linux-arm:
     name: Linux aarch64 (musl static tazd)
     runs-on: ubuntu-24.04-arm
@@ -343,6 +342,17 @@ jobs:
       - id: release-verify
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: just verify-static linux-musl-aarch64-release
+
+      # Only a binary that passed every check above is published.
+      - id: release-bundle
+        if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' }}
+        run: just release-bundle linux-musl-aarch64-release
+
+      - if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: taz-linux-aarch64
+          path: out/release/taz-linux-aarch64
 
   windows:
     name: ${{ matrix.name }}
