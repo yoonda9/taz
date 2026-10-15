@@ -1190,6 +1190,10 @@ static int spawn_as_user(uv_loop_t *loop, const taz_exec_spec_t *spec,
     int err_fd = -1;
     LPPROC_THREAD_ATTRIBUTE_LIST attr_list = NULL;
     SIZE_T attr_list_size = 0U;
+    /* Must stay valid from UpdateProcThreadAttribute through
+     * DeleteProcThreadAttributeList (MS docs): a nested block that closed
+     * before that call let the compiler reuse this stack slot. */
+    HANDLE handles[3];
     PROCESS_INFORMATION pi;
     STARTUPINFOEXW si;
     PROFILEINFOW profile_info;
@@ -1365,21 +1369,18 @@ static int spawn_as_user(uv_loop_t *loop, const taz_exec_spec_t *spec,
         goto fail;
     }
 
+    /* Exactly these three, so no other inheritable handle in this
+     * process (there are none right now, but a future caller's choice
+     * is not this function's to make) rides along. */
+    handles[0] = stdin_h;
+    handles[1] = out_child;
+    handles[2] = err_child;
+    if (!UpdateProcThreadAttribute(attr_list, 0,
+                                   PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles,
+                                   sizeof(handles), NULL, NULL))
     {
-        /* Exactly these three, so no other inheritable handle in this
-         * process (there are none right now, but a future caller's choice
-         * is not this function's to make) rides along. */
-        HANDLE handles[3];
-        handles[0] = stdin_h;
-        handles[1] = out_child;
-        handles[2] = err_child;
-        if (!UpdateProcThreadAttribute(attr_list, 0,
-                                       PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                       handles, sizeof(handles), NULL, NULL))
-        {
-            rc = uv_translate_sys_error((int)GetLastError());
-            goto fail;
-        }
+        rc = uv_translate_sys_error((int)GetLastError());
+        goto fail;
     }
 
     si.StartupInfo.cb = sizeof(si);

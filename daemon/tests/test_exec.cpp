@@ -647,8 +647,9 @@ TEST_F(ExecSpawnTest, OwnTokenSpawnSucceedsAndMarksAsUser)
     taz_exec_t *x = nullptr;
     ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
     // x is only valid up to uv_run below (on_done's close_all frees it), so
-    // taz_exec_as_user must be read now, not after.
+    // taz_exec_as_user/taz_exec_pid must be read now, not after.
     EXPECT_TRUE(taz_exec_as_user(x));
+    EXPECT_NE(taz_exec_pid(x), 0U);
 
     ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
