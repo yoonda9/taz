@@ -248,6 +248,102 @@ jobs:
           name: taz-linux-x64
           path: out/release/taz-linux-x64
 
+  # aarch64 gets its own top-level job instead of a matrix entry on `linux`:
+  # `runs-on` is pinned at the job level, so a matrix entry here would still
+  # run on the x86_64 runner and force qemu for the whole build — exactly the
+  # io_uring/qemu problem a native arm runner avoids. Release-only, same as
+  # i686's entry on `linux`; bundling + artifact upload is a separate task
+  # (C3c), so this job only builds, tests and verify-statics the preset.
+  linux-arm:
+    name: Linux aarch64 (musl static tazd)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      TAZ_CI_CONAN_PRESET: linux-musl-aarch64-release
+      TAZ_CACHE_DIR: ~/.cache/taz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0 # hatch-vcs derives the client version from tags
+          persist-credentials: false
+
+      - name: Install pinned tools
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: ${{ env.MISE_VERSION }}
+          install_args: uv just prek cmake ninja
+
+      - run: just setup
+
+      # Same rationale as the linux job's toolchain cache: must be on disk
+      # before `just deps`, keyed on the pinned tarball hash, saved right
+      # after the fetch so a red job never downloads it again.
+      - name: Toolchain cache key
+        id: toolchain-key
+        run: |
+          key=$(uv run python tools/dev.py musl-toolchain --print-key aarch64)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore musl toolchain
+        id: toolchain-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/taz/toolchains
+          key: ${{ steps.toolchain-key.outputs.key }}
+
+      - name: Fetch musl toolchain
+        run: just musl-toolchain aarch64
+
+      - name: Save musl toolchain
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/taz/toolchains
+          key: ${{ steps.toolchain-key.outputs.key }}
+
+      - name: Conan cache key
+        id: conan-key
+        run: |
+          key=$(uv run python tools/dev.py conan-cache-key linux-musl-aarch64-release)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Conan packages
+        id: conan-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/taz/conan-musl-aarch64/p
+          key: ${{ steps.conan-key.outputs.key }}
+
+      - id: deps
+        run: just deps linux-musl-aarch64-release
+
+      - name: Trim Conan packages
+        if: steps.conan-cache.outputs.cache-hit != 'true'
+        run: uv run python tools/dev.py conan-cache-trim linux-musl-aarch64-release
+
+      - name: Save Conan packages
+        if: steps.conan-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/taz/conan-musl-aarch64/p
+          key: ${{ steps.conan-key.outputs.key }}
+
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: just build linux-musl-aarch64-release
+
+      - id: release-test-c
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: just test-c linux-musl-aarch64-release
+
+      - id: release-test-py
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: just test-py --daemon daemon/build/linux-musl-aarch64-release/tazd
+
+      - id: release-verify
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: just verify-static linux-musl-aarch64-release
+
   windows:
     name: ${{ matrix.name }}
     runs-on: windows-2025
