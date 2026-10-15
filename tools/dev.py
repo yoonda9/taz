@@ -32,6 +32,10 @@ Subcommands:
                          and on Linux a FROM-scratch docker smoke run)
     release-bundle PRESET   copy a release preset's binary, sha256 file,
                          LICENSE and THIRD_PARTY_NOTICES into out/release/
+    verify-release-bundle PRESET   check an already-bundled release artifact's
+                         sha256 digest, LICENSE and THIRD_PARTY_NOTICES match
+                         the binary and the repo (catches a stale/corrupt copy
+                         before it ships)
 """
 
 from __future__ import annotations
@@ -1365,6 +1369,43 @@ def cmd_release_bundle(preset: str) -> None:
     print(f"wrote {out_dir.relative_to(ROOT)}")
 
 
+def cmd_verify_release_bundle(preset: str) -> None:
+    artifact = RELEASE_ARTIFACTS.get(preset)
+    if artifact is None:
+        sys.exit(
+            f"error: {preset} is not a release preset "
+            f"(expected one of {sorted(RELEASE_ARTIFACTS)})"
+        )
+
+    out_dir = ROOT / "out" / "release" / artifact
+    binary_name = daemon_binary(preset).name
+    binary = out_dir / binary_name
+    if not binary.exists():
+        sys.exit(
+            f"error: {binary} not found (run `just release-bundle {preset}` first)"
+        )
+
+    sha256_file = out_dir / f"{binary_name}.sha256"
+    if not sha256_file.exists():
+        sys.exit(f"error: {sha256_file} missing from shipped artifact")
+    expected_line = (
+        f"{hashlib.sha256(binary.read_bytes()).hexdigest()}  {binary_name}\n"
+    )
+    if sha256_file.read_bytes().decode() != expected_line:
+        sys.exit(
+            f"error: {sha256_file} does not match {binary} (corrupt or stale digest)"
+        )
+
+    for name in ("LICENSE", "THIRD_PARTY_NOTICES"):
+        shipped = out_dir / name
+        if not shipped.exists():
+            sys.exit(f"error: {shipped} missing from shipped artifact")
+        if shipped.read_bytes() != (ROOT / name).read_bytes():
+            sys.exit(f"error: {shipped} does not match the repo's {name} (stale copy)")
+
+    print(f"verified {out_dir.relative_to(ROOT)}")
+
+
 # ---------------------------------------------------------------------------
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="dev.py", description=__doc__)
@@ -1413,6 +1454,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     p = sub.add_parser("verify-static")
     p.add_argument("preset")
     p = sub.add_parser("release-bundle")
+    p.add_argument("preset")
+    p = sub.add_parser("verify-release-bundle")
     p.add_argument("preset")
 
     raw = list(sys.argv[1:] if argv is None else argv)
@@ -1468,6 +1511,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             cmd_verify_static(args.preset)
         case "release-bundle":
             cmd_release_bundle(args.preset)
+        case "verify-release-bundle":
+            cmd_verify_release_bundle(args.preset)
 
 
 if __name__ == "__main__":

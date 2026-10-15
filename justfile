@@ -85,6 +85,12 @@ verify-static preset=release: (build preset)
 release-bundle preset=release: (build preset)
     {{ dev }} release-bundle {{ preset }}
 
+# Re-bundle preset, then check the shipped sha256 digest matches the binary
+# and the shipped LICENSE/THIRD_PARTY_NOTICES match the repo's — catches a
+# stale or truncated copy before it's uploaded as a CI artifact.
+verify-release-bundle preset=release: (release-bundle preset)
+    {{ dev }} verify-release-bundle {{ preset }}
+
 # --- tests ------------------------------------------------------------------
 
 # Run C unit tests (GoogleTest via ctest). Goes through dev.py so MSVC ASan

@@ -242,7 +242,11 @@ jobs:
         if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' }}
         run: just release-bundle ${{ matrix.conan-preset }}
 
-      - if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
+      - id: release-verify-bundle
+        if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
+        run: just verify-release-bundle ${{ matrix.conan-preset }}
+
+      - if: ${{ !cancelled() && steps.release-verify-bundle.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.release-artifact }}
@@ -348,7 +352,11 @@ jobs:
         if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' }}
         run: just release-bundle linux-musl-aarch64-release
 
-      - if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
+      - id: release-verify-bundle
+        if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
+        run: just verify-release-bundle linux-musl-aarch64-release
+
+      - if: ${{ !cancelled() && steps.release-verify-bundle.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: taz-linux-aarch64
@@ -483,7 +491,11 @@ jobs:
         if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' }}
         run: just release-bundle windows-release
 
-      - if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
+      - id: release-verify-bundle
+        if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
+        run: just verify-release-bundle windows-release
+
+      - if: ${{ !cancelled() && steps.release-verify-bundle.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: taz-windows-x64

@@ -696,6 +696,86 @@ def test_release_bundle_names_windows_artifacts_tazd_exe(
     assert (out_dir / "tazd.exe.sha256").read_bytes() == sha_line
 
 
+# --- verify-release-bundle ---------------------------------------------------
+
+
+def _bundle_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Build a real linux-musl-release bundle via cmd_release_bundle, so the
+    verify tests exercise the exact artifact CI would upload."""
+    monkeypatch.setattr(dev, "ROOT", tmp_path)
+    monkeypatch.setattr(dev, "IS_WINDOWS", False)
+    binary_dir = tmp_path / "daemon" / "build" / "linux-musl-release"
+    binary_dir.mkdir(parents=True)
+    (binary_dir / "tazd").write_bytes(b"\x7fELF fake static binary")
+    (tmp_path / "LICENSE").write_text("licence text\n")
+    (tmp_path / "THIRD_PARTY_NOTICES").write_text("notices text\n")
+
+    dev.cmd_release_bundle("linux-musl-release")
+    return tmp_path / "out" / "release" / "taz-linux-x64"
+
+
+def test_verify_release_bundle_rejects_non_release_preset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dev, "ROOT", tmp_path)
+
+    with pytest.raises(SystemExit, match="not a release preset"):
+        dev.cmd_verify_release_bundle("linux-debug")
+
+
+def test_verify_release_bundle_passes_on_a_freshly_written_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _bundle_fixture(tmp_path, monkeypatch)
+
+    dev.cmd_verify_release_bundle("linux-musl-release")
+
+    assert "verified" in capsys.readouterr().out
+
+
+def test_verify_release_bundle_fails_on_missing_sha256(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = _bundle_fixture(tmp_path, monkeypatch)
+    (out_dir / "tazd.sha256").unlink()
+
+    with pytest.raises(SystemExit, match="sha256"):
+        dev.cmd_verify_release_bundle("linux-musl-release")
+
+
+def test_verify_release_bundle_fails_on_digest_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = _bundle_fixture(tmp_path, monkeypatch)
+    # Simulate a binary that was rebuilt after the digest was written.
+    (out_dir / "tazd").write_bytes(b"\x7fELF a different binary entirely")
+
+    with pytest.raises(SystemExit, match="does not match"):
+        dev.cmd_verify_release_bundle("linux-musl-release")
+
+
+def test_verify_release_bundle_fails_on_stale_notices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = _bundle_fixture(tmp_path, monkeypatch)
+    # Simulate THIRD_PARTY_NOTICES changing in the repo after the bundle shipped.
+    (tmp_path / "THIRD_PARTY_NOTICES").write_text("updated notices text\n")
+
+    with pytest.raises(SystemExit, match="THIRD_PARTY_NOTICES"):
+        dev.cmd_verify_release_bundle("linux-musl-release")
+    assert out_dir.exists()
+
+
+def test_verify_release_bundle_fails_on_missing_license(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = _bundle_fixture(tmp_path, monkeypatch)
+    (out_dir / "LICENSE").unlink()
+
+    with pytest.raises(SystemExit, match="LICENSE"):
+        dev.cmd_verify_release_bundle("linux-musl-release")
+
+
 # --- THIRD_PARTY_NOTICES covers every musl toolchain -------------------------
 
 
