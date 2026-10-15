@@ -678,6 +678,16 @@ static int build_env_from_token(void *token, const taz_v1_KeyValue *extra,
             break;
         }
 
+        /* Can't happen: this loop walks the same multi-string the count
+         * above already walked once, so it fills at most `count` slots.
+         * MSVC /analyze cannot see that across the two loops (C6386), so
+         * spell it out. */
+        if (n >= count)
+        {
+            free(name);
+            break;
+        }
+
         owned[n] = name;
         pairs[n].name = name;
         pairs[n].value = value;
