@@ -1240,6 +1240,14 @@ static int spawn_as_user(uv_loop_t *loop, const taz_exec_spec_t *spec,
         envp = NULL;
         goto fail;
     }
+    if (envp == NULL)
+    {
+        /* Can't happen: merge_env always sets *out_env on a 0 return, and
+         * every taz_exec_build_env path returns 0 only via merge_env - the
+         * analyzer can't see that across two calls. */
+        rc = UV_EINVAL;
+        goto fail;
+    }
 
     {
         const char *path_value = find_env_value(envp, "PATH");
