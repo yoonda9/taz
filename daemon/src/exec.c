@@ -1044,7 +1044,7 @@ static int build_wide_env_block(char *const *envp, wchar_t **out_block)
         wchar_t *entry = wide[i];
         free(entry);
     }
-    free(wide);
+    free((void *)wide);
 
     if (rc == 0)
     {
@@ -1159,6 +1159,10 @@ static int make_null_stdin(HANDLE *out)
     return 0;
 }
 
+/* stdin, stdout, stderr: the only handles PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+ * is ever given below. */
+#define TAZ_EXEC_STD_HANDLE_COUNT 3U
+
 /* The second spawn path (table S2): spec->token != NULL. Takes ownership of
  * spec->token into x (x->as_user, x->token) as its very first action after
  * x->exit_async itself is live - from that point on, every failure in here
@@ -1193,7 +1197,7 @@ static int spawn_as_user(uv_loop_t *loop, const taz_exec_spec_t *spec,
     /* Must stay valid from UpdateProcThreadAttribute through
      * DeleteProcThreadAttributeList (MS docs): a nested block that closed
      * before that call let the compiler reuse this stack slot. */
-    HANDLE handles[3];
+    HANDLE handles[TAZ_EXEC_STD_HANDLE_COUNT];
     PROCESS_INFORMATION pi;
     STARTUPINFOEXW si;
     PROFILEINFOW profile_info;
@@ -1375,9 +1379,9 @@ static int spawn_as_user(uv_loop_t *loop, const taz_exec_spec_t *spec,
     handles[0] = stdin_h;
     handles[1] = out_child;
     handles[2] = err_child;
-    if (!UpdateProcThreadAttribute(attr_list, 0,
-                                   PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles,
-                                   sizeof(handles), NULL, NULL))
+    if (!UpdateProcThreadAttribute(
+            attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, (void *)handles,
+            sizeof(handles), NULL, NULL))
     {
         rc = uv_translate_sys_error((int)GetLastError());
         goto fail;
