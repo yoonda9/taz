@@ -166,6 +166,18 @@ MUSL_TOOLCHAINS: dict[str, MuslToolchain] = {
         "78d3a4683d6ac47b5ee73bd5bce210b55eb93dff1b137c61298af97eb0d2b5a6",
         "x86_64-linux",
     ),
+    "i686": _bootlin_toolchain(
+        "x86-i686",
+        "x86-i686--musl--stable-2026.08-1",
+        "72f5e80c6d5b47eac20d63634b56d49600600230bbb33c621f83250a9d6b3cb4",
+        "i686-linux",
+    ),
+    "aarch64": _bootlin_toolchain(
+        "aarch64",
+        "aarch64--musl--stable-2026.08-1",
+        "b388c480a48e8e9f9b99e3d14e69219c4d61e5a2424a82faecb88a015b781a60",
+        "aarch64-linux",
+    ),
 }
 DEFAULT_MUSL_ARCH = "x86_64"
 
