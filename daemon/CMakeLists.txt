@@ -276,6 +276,7 @@ add_library(
     src/server.c
     src/shutdown.c
     src/restart_args.c
+    src/cmdline.c
     src/work.c
     src/fsutil.c
     src/crc32c.c

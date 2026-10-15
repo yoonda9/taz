@@ -47,6 +47,7 @@ add_executable(
     test_shutdown.cpp
     test_restart.cpp
     test_restart_args.cpp
+    test_cmdline.cpp
     test_work.cpp
     test_fsutil.cpp
     test_crc32c.cpp
