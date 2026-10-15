@@ -11,9 +11,10 @@
 #include "taz/run_as.h"
 
 // Forces taz_run_as_privileged()'s answer: 1 for the privileged rows, 0 for
-// the unprivileged ones (so they hold even when the suite runs as root).
-// Restores the real geteuid() answer (-1) on scope exit. A no-op on
-// Windows, where RUN_AS is deferred and the answer is always 0.
+// the unprivileged ones (so they hold even when the suite runs as root, or,
+// on Windows, as SYSTEM). Restores the real answer (-1) on scope exit:
+// geteuid() == 0 on POSIX, the cached privilege probe (still a constant 0
+// here) on Windows.
 class ScopedPrivilege
 {
   public:

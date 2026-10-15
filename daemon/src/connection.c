@@ -8,6 +8,7 @@
 #include "taz/frame.h"
 #include "taz/payload.h"
 #include "taz/reassembly.h"
+#include "taz/run_as.h"
 #include "taz/task.h"
 #include "taz/v1/common.pb.h"
 
@@ -73,8 +74,11 @@ static void conn_unref(taz_conn_t *conn)
     if (conn->refcount == 0U && conn->closing)
     {
         /* Every exec and subscription held a reference, so nothing can
-         * reach the task table any more. */
+         * reach the task table any more. The one place every connection
+         * passes exactly once, so it is also the one place a RUN_AS
+         * identity's token is guaranteed to be closed. */
         conn_unlink(conn);
+        taz_run_as_reset(&conn->dispatch);
         taz_task_table_free(&conn->dispatch.tasks);
         free(conn);
     }

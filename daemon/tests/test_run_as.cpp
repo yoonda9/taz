@@ -15,6 +15,8 @@
 
 #ifndef _WIN32
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 #include "file_test_support.h"
@@ -44,6 +46,30 @@ class RunAsHandlerTest : public FileHandlerTest
 {
 };
 
+// Mirrors FileHandlerTest's own TearDown (RunAsResetOnTeardownTest below):
+// calls the base teardown first, so taz_run_as_reset has already run, then
+// checks what it left behind.
+class RunAsResetOnTeardownTest : public RunAsHandlerTest
+{
+  protected:
+    void TearDown() override
+    {
+        RunAsHandlerTest::TearDown();
+        EXPECT_EQ(Dispatch().run_as_active, 0);
+        EXPECT_EQ(Dispatch().run_as_uid, 0U);
+        EXPECT_STREQ(Dispatch().run_as_user, "");
+        EXPECT_EQ(Dispatch().run_as_token, nullptr);
+#ifdef _WIN32
+        DWORD flags = 0;
+        EXPECT_FALSE(GetHandleInformation(token_, &flags));
+#endif
+    }
+
+#ifdef _WIN32
+    HANDLE token_ = nullptr;
+#endif
+};
+
 } // namespace
 
 TEST(RunAsPrivilege, RealAnswerFollowsEffectiveUidAndSeamRestoresIt)
@@ -56,11 +82,74 @@ TEST(RunAsPrivilege, RealAnswerFollowsEffectiveUidAndSeamRestoresIt)
     EXPECT_EQ(taz_run_as_privileged(), real);
     {
         const ScopedPrivilege forced(1 - real);
-#ifndef _WIN32
         EXPECT_EQ(taz_run_as_privileged(), 1 - real);
-#endif
     }
     EXPECT_EQ(taz_run_as_privileged(), real);
+}
+
+// ---------------------------------------------------------------------------
+// taz_run_as_reset (run_as.c): closes and clears a connection's RUN_AS
+// identity, including the Windows token. H4/H9.
+// ---------------------------------------------------------------------------
+
+TEST(RunAsReset, ClosesTheTokenAndZeroesEveryField)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+
+    d.run_as_active = 1;
+    d.run_as_uid = 4242U;
+    d.run_as_gid = 4243U;
+    (void)snprintf(d.run_as_user, sizeof(d.run_as_user), "%s", "alice");
+    (void)snprintf(d.run_as_home, sizeof(d.run_as_home), "%s", "/home/alice");
+
+#ifdef _WIN32
+    HANDLE token = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_NE(token, nullptr);
+    d.run_as_token = token;
+#endif
+
+    taz_run_as_reset(&d);
+
+    EXPECT_EQ(d.run_as_active, 0);
+    EXPECT_EQ(d.run_as_uid, 0U);
+    EXPECT_EQ(d.run_as_gid, 0U);
+    EXPECT_STREQ(d.run_as_user, "");
+    EXPECT_STREQ(d.run_as_home, "");
+    EXPECT_EQ(d.run_as_token, nullptr);
+#ifdef _WIN32
+    DWORD flags = 0;
+    EXPECT_FALSE(GetHandleInformation(token, &flags));
+#endif
+}
+
+TEST(RunAsReset, IsIdempotentAndNullSafe)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+
+    taz_run_as_reset(&d);
+    taz_run_as_reset(&d);
+
+    EXPECT_EQ(d.run_as_active, 0);
+    EXPECT_EQ(d.run_as_token, nullptr);
+}
+
+TEST_F(RunAsResetOnTeardownTest, FixtureTeardownClosesAnOutstandingToken)
+{
+    // Seeded as a prior RUN_AS (or, once a real logon lands, as_user) would
+    // have left it; this fixture's TearDown (file_test_support.h) calls
+    // taz_run_as_reset itself now, so the identity - and the token - must
+    // not outlive the test even though nothing in the test body resets it.
+    Dispatch().run_as_active = 1;
+    Dispatch().run_as_uid = 4242U;
+    (void)snprintf(Dispatch().run_as_user, sizeof(Dispatch().run_as_user), "%s",
+                   "alice");
+#ifdef _WIN32
+    token_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_NE(token_, nullptr);
+    Dispatch().run_as_token = token_;
+#endif
 }
 
 TEST_F(RunAsHandlerTest, OpcodeIsMarkedAsync)

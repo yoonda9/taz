@@ -30,6 +30,7 @@
 #include "taz/dispatch.h"
 #include "taz/frame.h"
 #include "taz/fsutil.h"
+#include "taz/run_as.h"
 #include "taz/task.h"
 #include "taz/task_registry.h"
 #include "taz/v1/common.pb.h"
@@ -254,6 +255,9 @@ class FileHandlerTest : public ::testing::Test
         // Finished monitor=true tasks keep their results until the
         // connection is freed; this fixture's fake connection never is.
         taz_task_table_free(&d_.tasks);
+        // Mirrors connection.c's free path: a fake token a test left on
+        // d_.run_as_token must not outlive the test either.
+        taz_run_as_reset(&d_);
         RemoveTree(dir_);
         ASSERT_EQ(uv_loop_close(&loop_), 0);
     }

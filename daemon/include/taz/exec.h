@@ -87,6 +87,14 @@ extern "C"
          * home directory, which become the child's USER/LOGNAME and HOME. */
         char identity_user[TAZ_EXEC_USER_MAX];
         char identity_home[TAZ_EXEC_HOME_MAX];
+        /* Windows: a primary token (HANDLE) for a CreateProcessAsUserW
+         * spawn, duplicated per call by the caller; always NULL on POSIX.
+         * taz_exec_start takes ownership on entry - closed on every path
+         * (failure, success, and once the child exits). Until the
+         * token-aware spawn path lands, a non-NULL token is simply closed
+         * and refused with UV_ENOTSUP: no Windows caller hands one out
+         * yet. */
+        void *token;
     } taz_exec_spec_t;
 
     /* Outcome of a finished exec. out/err point into buffers owned by the

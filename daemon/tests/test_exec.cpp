@@ -13,6 +13,10 @@
 #include <gtest/gtest.h>
 #include <uv.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "taz/exec.h"
 
 namespace
@@ -478,6 +482,51 @@ TEST_F(ExecSpawnTest, NonexistentCwdReturnsError)
     EXPECT_NE(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
     EXPECT_FALSE(outcome.called);
 }
+
+// --- a non-NULL token (H8) ---------------------------------------------
+//
+// No caller hands taz_exec_start a token yet (the token-aware spawn path is
+// a later step), so this is purely defensive: taz_exec_start must still
+// close whatever it was handed and refuse it, on every platform, rather
+// than spawn with it ignored or leak it.
+
+#ifdef _WIN32
+TEST_F(ExecSpawnTest, NonNullTokenIsClosedAndReturnsNotSupported)
+{
+    HANDLE token = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_NE(token, nullptr);
+
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.token = token;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    EXPECT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x),
+              UV_ENOTSUP);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+
+    DWORD flags = 0;
+    EXPECT_FALSE(GetHandleInformation(token, &flags));
+}
+#else
+TEST_F(ExecSpawnTest, NonNullTokenReturnsNotSupported)
+{
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.token = reinterpret_cast<void *>(1);
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    EXPECT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x),
+              UV_ENOTSUP);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+}
+#endif
 
 // --- env merge --------------------------------------------------------
 //

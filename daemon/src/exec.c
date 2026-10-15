@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "taz/process.h"
+#include "taz/run_as.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -646,6 +647,16 @@ void taz_exec_apply_identity(uv_process_options_t *options,
 int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
                    taz_exec_done_fn_t on_done, void *arg, taz_exec_t **out)
 {
+    /* taz_exec_start takes ownership of spec->token on entry: closed here
+     * and refused with UV_ENOTSUP, on every platform, until a token-aware
+     * spawn path exists - no caller hands one out yet, so this is a
+     * defensive row, not a reachable feature gap. */
+    if (spec->token != NULL)
+    {
+        taz_run_as_token_close(spec->token);
+        return UV_ENOTSUP;
+    }
+
     taz_exec_t *x = (taz_exec_t *)calloc(1U, sizeof(*x));
     if (x == NULL)
     {
