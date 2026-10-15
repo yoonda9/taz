@@ -347,29 +347,67 @@ namespace
 {
 
 // The current process's own value for a wide env var name, converted to
-// UTF-8; empty when it is unset. Sized dynamically - PATH under a loaded
-// MSVC dev environment routinely runs well past a four-figure character
-// count.
+// UTF-8; empty when it is unset.
 std::string OwnEnvVarUtf8(const wchar_t *name)
 {
-    const DWORD needed_w = GetEnvironmentVariableW(name, nullptr, 0);
-    if (needed_w == 0)
+    wchar_t buf[1024];
+    const DWORD n =
+        GetEnvironmentVariableW(name, buf, static_cast<DWORD>(std::size(buf)));
+    if ((n == 0) || (n >= std::size(buf)))
     {
         return std::string();
     }
-    std::vector<wchar_t> buf(needed_w);
-    const DWORD n = GetEnvironmentVariableW(name, buf.data(), needed_w);
-    if ((n == 0) || (n >= needed_w))
-    {
-        return std::string();
-    }
-    const int needed =
-        WideCharToMultiByte(CP_UTF8, 0, buf.data(), static_cast<int>(n),
-                            nullptr, 0, nullptr, nullptr);
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(n),
+                                           nullptr, 0, nullptr, nullptr);
     std::string out(static_cast<size_t>(needed), '\0');
-    (void)WideCharToMultiByte(CP_UTF8, 0, buf.data(), static_cast<int>(n),
-                              out.data(), needed, nullptr, nullptr);
+    (void)WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(n), out.data(),
+                              needed, nullptr, nullptr);
     return out;
+}
+
+// The directory containing the ASan runtime DLL already loaded into this
+// process, or empty when this binary isn't ASan-instrumented. Named
+// candidates, not a search, since clang-cl's handful of ASan runtime DLL
+// names (debug/release) are the only ones that can be mapped into this
+// process - no other component here is a DLL.
+std::string LoadedAsanRuntimeDirUtf8()
+{
+    static const wchar_t *const candidates[] = {
+        L"clang_rt.asan_dynamic-x86_64.dll",
+        L"clang_rt.asan_dbg_dynamic-x86_64.dll",
+    };
+    for (const wchar_t *name : candidates)
+    {
+        const HMODULE mod = GetModuleHandleW(name);
+        if (mod == nullptr)
+        {
+            continue;
+        }
+        wchar_t path[MAX_PATH];
+        const DWORD len =
+            GetModuleFileNameW(mod, path, static_cast<DWORD>(std::size(path)));
+        if ((len == 0) || (len >= std::size(path)))
+        {
+            continue;
+        }
+        std::wstring dir(path, len);
+        const size_t slash = dir.find_last_of(L"\\/");
+        if (slash == std::wstring::npos)
+        {
+            continue;
+        }
+        dir.resize(slash);
+
+        const int needed = WideCharToMultiByte(CP_UTF8, 0, dir.data(),
+                                               static_cast<int>(dir.size()),
+                                               nullptr, 0, nullptr, nullptr);
+        std::string out(static_cast<size_t>(needed), '\0');
+        (void)WideCharToMultiByte(CP_UTF8, 0, dir.data(),
+                                  static_cast<int>(dir.size()), out.data(),
+                                  needed, nullptr, nullptr);
+        return out;
+    }
+    return std::string();
 }
 
 } // namespace
@@ -646,13 +684,19 @@ TEST_F(ExecSpawnTest, OwnTokenSpawnSucceedsAndMarksAsUser)
     ASSERT_FALSE(username.empty());
 
     // The spawned child is this same test binary, so under an ASan build it
-    // needs the ASan runtime DLL's directory; that's on this process's own
-    // PATH (a loaded MSVC dev environment), not on the duplicated token's
-    // default profile PATH (table S2 deliberately builds the latter from
-    // the token alone). Request env overrides the token base, same as any
-    // other caller supplying a PATH the target identity should use.
-    const std::string own_path = OwnEnvVarUtf8(L"PATH");
-    taz_v1_KeyValue env[] = {{"PATH", own_path.c_str()}};
+    // needs the ASan runtime DLL's directory on its PATH; the duplicated
+    // token's own default profile PATH (table S2 deliberately builds the
+    // child's base from the token alone) has no reason to carry it. Request
+    // env overrides the token base, same as any other caller supplying a
+    // PATH the target identity should use.
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+    }
 
     const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
     taz_exec_spec_t spec{};
@@ -661,7 +705,7 @@ TEST_F(ExecSpawnTest, OwnTokenSpawnSucceedsAndMarksAsUser)
     spec.args_count = 1;
     spec.max_output_bytes = 1U << 20;
     spec.token = token.release();
-    if (!own_path.empty())
+    if (!asan_dir.empty())
     {
         spec.env = env;
         spec.env_count = 1;
