@@ -347,21 +347,28 @@ namespace
 {
 
 // The current process's own value for a wide env var name, converted to
-// UTF-8; empty when it is unset.
+// UTF-8; empty when it is unset. Sized dynamically - PATH under a loaded
+// MSVC dev environment routinely runs well past a four-figure character
+// count.
 std::string OwnEnvVarUtf8(const wchar_t *name)
 {
-    wchar_t buf[1024];
-    const DWORD n =
-        GetEnvironmentVariableW(name, buf, static_cast<DWORD>(std::size(buf)));
-    if ((n == 0) || (n >= std::size(buf)))
+    const DWORD needed_w = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed_w == 0)
     {
         return std::string();
     }
-    const int needed = WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(n),
-                                           nullptr, 0, nullptr, nullptr);
+    std::vector<wchar_t> buf(needed_w);
+    const DWORD n = GetEnvironmentVariableW(name, buf.data(), needed_w);
+    if ((n == 0) || (n >= needed_w))
+    {
+        return std::string();
+    }
+    const int needed =
+        WideCharToMultiByte(CP_UTF8, 0, buf.data(), static_cast<int>(n),
+                            nullptr, 0, nullptr, nullptr);
     std::string out(static_cast<size_t>(needed), '\0');
-    (void)WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(n), out.data(),
-                              needed, nullptr, nullptr);
+    (void)WideCharToMultiByte(CP_UTF8, 0, buf.data(), static_cast<int>(n),
+                              out.data(), needed, nullptr, nullptr);
     return out;
 }
 
@@ -638,6 +645,15 @@ TEST_F(ExecSpawnTest, OwnTokenSpawnSucceedsAndMarksAsUser)
     const std::string username = OwnEnvVarUtf8(L"USERNAME");
     ASSERT_FALSE(username.empty());
 
+    // The spawned child is this same test binary, so under an ASan build it
+    // needs the ASan runtime DLL's directory; that's on this process's own
+    // PATH (a loaded MSVC dev environment), not on the duplicated token's
+    // default profile PATH (table S2 deliberately builds the latter from
+    // the token alone). Request env overrides the token base, same as any
+    // other caller supplying a PATH the target identity should use.
+    const std::string own_path = OwnEnvVarUtf8(L"PATH");
+    taz_v1_KeyValue env[] = {{"PATH", own_path.c_str()}};
+
     const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
     taz_exec_spec_t spec{};
     spec.file = Exe().c_str();
@@ -645,6 +661,11 @@ TEST_F(ExecSpawnTest, OwnTokenSpawnSucceedsAndMarksAsUser)
     spec.args_count = 1;
     spec.max_output_bytes = 1U << 20;
     spec.token = token.release();
+    if (!own_path.empty())
+    {
+        spec.env = env;
+        spec.env_count = 1;
+    }
     (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
                         username.c_str());
 
