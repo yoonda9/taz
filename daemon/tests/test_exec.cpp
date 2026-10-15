@@ -525,6 +525,9 @@ TEST_F(ExecSpawnTest, SuccessfulSpawnCallsOnDoneOnceWithOutput)
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
     ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+    // x is only valid up to uv_run below (on_done's close_all frees it), so
+    // taz_exec_as_user must be read now, not after.
+    EXPECT_FALSE(taz_exec_as_user(x));
 
     ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
@@ -583,13 +586,19 @@ TEST_F(ExecSpawnTest, NonexistentCwdReturnsError)
 
 // --- a non-NULL token (H8) ---------------------------------------------
 //
-// No caller hands taz_exec_start a token yet (the token-aware spawn path is
-// a later step), so this is purely defensive: taz_exec_start must still
-// close whatever it was handed and refuse it, on every platform, rather
-// than spawn with it ignored or leak it.
+// On POSIX taz_exec_start still has no token-aware spawn path, so this stays
+// purely defensive: close whatever it was handed and refuse it, rather than
+// spawn with it ignored or leak it.
+//
+// On Windows a non-NULL token now enters spawn_as_user (table S2). A handle
+// that is not a real token (here, a plain event) makes LoadUserProfileW fail
+// before anything is spawned, so the row instead proves: a non-UV_ENOTSUP
+// UV_E* code, no callback, nothing spawned, and the token closed once the
+// loop has run the close callbacks close_all schedules
+// (close_all -> on_handle_closed -> taz_run_as_token_close).
 
 #ifdef _WIN32
-TEST_F(ExecSpawnTest, NonNullTokenIsClosedAndReturnsNotSupported)
+TEST_F(ExecSpawnTest, NonNullTokenFailsSpawnAsUserAndClosesTheToken)
 {
     HANDLE token = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     ASSERT_NE(token, nullptr);
@@ -601,13 +610,53 @@ TEST_F(ExecSpawnTest, NonNullTokenIsClosedAndReturnsNotSupported)
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
-    EXPECT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x),
-              UV_ENOTSUP);
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    EXPECT_NE(rc, 0);
+    EXPECT_NE(rc, UV_ENOTSUP);
     EXPECT_FALSE(outcome.called);
     EXPECT_EQ(x, nullptr);
 
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
     DWORD flags = 0;
     EXPECT_FALSE(GetHandleInformation(token, &flags));
+}
+
+TEST_F(ExecSpawnTest, OwnTokenSpawnSucceedsAndMarksAsUser)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1U << 20;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+    // x is only valid up to uv_run below (on_done's close_all frees it), so
+    // taz_exec_as_user must be read now, not after.
+    EXPECT_TRUE(taz_exec_as_user(x));
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.exit_status, 0);
+    EXPECT_FALSE(outcome.out.empty());
+    EXPECT_FALSE(outcome.timed_out);
+    EXPECT_FALSE(outcome.truncated);
 }
 #else
 TEST_F(ExecSpawnTest, NonNullTokenReturnsNotSupported)

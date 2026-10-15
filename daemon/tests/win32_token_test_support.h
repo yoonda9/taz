@@ -58,6 +58,14 @@ class ScopedHandle
         }
         handle_ = h;
     }
+    // Gives up ownership without closing - for handing the handle to a
+    // callee (e.g. taz_exec_start) that takes ownership of it itself.
+    HANDLE release()
+    {
+        HANDLE h = handle_;
+        handle_ = nullptr;
+        return h;
+    }
 
   private:
     HANDLE handle_ = nullptr;

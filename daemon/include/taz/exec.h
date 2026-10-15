@@ -83,17 +83,20 @@ extern "C"
         uv_uid_t uid; /* only used when switch_identity is set */
         uv_gid_t gid; /* only used when switch_identity is set */
         bool switch_identity;
-        /* Only used when switch_identity is set: the target user's name and
-         * home directory, which become the child's USER/LOGNAME and HOME. */
+        /* Only used when switch_identity is set, except identity_user also
+         * doubles, on Windows when token is non-NULL, as the name
+         * LoadUserProfileW loads the profile for (it must name the token's
+         * own account - the spawn path reads it unconditionally in that
+         * case, switch_identity or not). Home directory and USER/LOGNAME/
+         * HOME still only come from switch_identity. */
         char identity_user[TAZ_EXEC_USER_MAX];
         char identity_home[TAZ_EXEC_HOME_MAX];
         /* Windows: a primary token (HANDLE) for a CreateProcessAsUserW
          * spawn, duplicated per call by the caller; always NULL on POSIX.
          * taz_exec_start takes ownership on entry - closed on every path
-         * (failure, success, and once the child exits). Until the
-         * token-aware spawn path lands, a non-NULL token is simply closed
-         * and refused with UV_ENOTSUP: no Windows caller hands one out
-         * yet. */
+         * (failure, success, and once the child exits). On POSIX a
+         * non-NULL token is simply closed and refused with UV_ENOTSUP, since
+         * there is nothing there to spawn it with. */
         void *token;
     } taz_exec_spec_t;
 
@@ -161,6 +164,11 @@ extern "C"
     /* x's child pid, matching uv_process_t.pid, or 0 once on_done has fired
      * (the process is reaped and its pid may be reused by something else). */
     uint32_t taz_exec_pid(const taz_exec_t *x);
+
+    /* True when x was spawned through the CreateProcessAsUserW path (a
+     * non-NULL token was given to taz_exec_start), false for the plain
+     * uv_spawn path. Always false on POSIX. */
+    bool taz_exec_as_user(const taz_exec_t *x);
 
     /* An on-exit hook: fn(pid, start_key, exit_status, term_signal, arg). */
     typedef void (*taz_exec_on_exit_fn_t)(uint32_t pid, uint64_t start_key,
