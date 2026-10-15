@@ -1219,7 +1219,7 @@ def elf_needed(dynamic_section: str) -> list[str]:
     return needed
 
 
-def _verify_static_linux(binary: Path) -> None:
+def _verify_static_linux(binary: Path, *, smoke: bool = True) -> None:
     readelf = tool("readelf")
     headers = subprocess.run(
         [readelf, "-lW", str(binary)], capture_output=True, text=True, check=True
@@ -1236,7 +1236,12 @@ def _verify_static_linux(binary: Path) -> None:
     if needed:
         sys.exit(f"error: {binary} has NEEDED entries: {needed}")
 
-    _verify_static_smoke(binary)
+    # readelf (above) works cross-arch, but the smoke run executes the binary,
+    # so it only runs where this host can run it. The aarch64 build lane cross-
+    # compiles on x86_64 and skips the smoke (--no-smoke); its native-arm test
+    # job runs the binary for real, a stronger runtime proof than `--version`.
+    if smoke:
+        _verify_static_smoke(binary)
 
 
 def _verify_static_smoke(binary: Path) -> None:
@@ -1309,7 +1314,7 @@ def _verify_static_windows(binary: Path) -> None:
         sys.exit(f"error: unexpected DLL dependencies: {sorted(unexpected)}")
 
 
-def cmd_verify_static(preset: str) -> None:
+def cmd_verify_static(preset: str, *, smoke: bool = True) -> None:
     binary = daemon_binary(preset)
     if not binary.exists():
         sys.exit(f"error: {binary} not found (run `just build {preset}` first)")
@@ -1325,7 +1330,7 @@ def cmd_verify_static(preset: str) -> None:
     if IS_WINDOWS:
         _verify_static_windows(binary)
     else:
-        _verify_static_linux(binary)
+        _verify_static_linux(binary, smoke=smoke)
     print("static link verified")
 
 
@@ -1453,6 +1458,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub.add_parser("clean")
     p = sub.add_parser("verify-static")
     p.add_argument("preset")
+    p.add_argument(
+        "--no-smoke",
+        action="store_true",
+        help="skip the FROM-scratch run smoke test (which executes the binary); "
+        "readelf static checks still run. For cross-built binaries this host "
+        "cannot execute, e.g. aarch64 on x86_64.",
+    )
     p = sub.add_parser("release-bundle")
     p.add_argument("preset")
     p = sub.add_parser("verify-release-bundle")
@@ -1508,7 +1520,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         case "clean":
             cmd_clean()
         case "verify-static":
-            cmd_verify_static(args.preset)
+            cmd_verify_static(args.preset, smoke=not args.no_smoke)
         case "release-bundle":
             cmd_release_bundle(args.preset)
         case "verify-release-bundle":

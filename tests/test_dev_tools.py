@@ -602,6 +602,21 @@ def test_cmd_verify_static_passes_a_static_binary_on_to_the_smoke_run(
     assert "static link verified" in capsys.readouterr().out
 
 
+def test_cmd_verify_static_no_smoke_runs_readelf_but_skips_the_smoke_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The aarch64 lane cross-builds on x86_64 and can't execute the binary, so
+    # --no-smoke keeps the (cross-arch) readelf checks but skips the run smoke.
+    smoked = _patch_verify_static(
+        tmp_path, monkeypatch, _READELF_HEADERS_STATIC, _READELF_NO_DYNAMIC_SECTION
+    )
+
+    dev.cmd_verify_static("linux-musl-release", smoke=False)
+
+    assert smoked == []
+    assert "static link verified" in capsys.readouterr().out
+
+
 def test_verify_static_smoke_missing_docker_warns_locally_fails_in_ci(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -74,9 +74,12 @@
     {
       "name": "linux-musl-aarch64-release",
       "displayName": "Linux Release (musl, static, aarch64)",
-      "description": "Bootlin musl aarch64 toolchain via `just configure`; fully static tazd (no INTERP, no NEEDED).",
+      "description": "Bootlin musl aarch64 toolchain via `just configure`; fully static tazd (no INTERP, no NEEDED). Cross-built on x86_64, so GoogleTest discovery is deferred to test time (PRE_TEST): it can't run the aarch64 test binary at build time. The native-arm CI job runs the binary directly.",
       "inherits": "linux-base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE": "PRE_TEST"
+      }
     },
     {
       "name": "linux-analyze",
