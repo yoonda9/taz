@@ -65,6 +65,20 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
+      "name": "linux-musl-i686-release",
+      "displayName": "Linux Release (musl, static, i686)",
+      "description": "Bootlin musl i686 toolchain via `just configure`; fully static tazd (no INTERP, no NEEDED).",
+      "inherits": "linux-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "linux-musl-aarch64-release",
+      "displayName": "Linux Release (musl, static, aarch64)",
+      "description": "Bootlin musl aarch64 toolchain via `just configure`; fully static tazd (no INTERP, no NEEDED).",
+      "inherits": "linux-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
       "name": "linux-analyze",
       "displayName": "Linux Debug + GCC -fanalyzer",
       "description": "Build-only check: GCC's static analyzer over first-party code, findings are errors.",
@@ -153,6 +167,14 @@
     { "name": "linux-release", "configurePreset": "linux-release" },
     { "name": "linux-clang-debug", "configurePreset": "linux-clang-debug" },
     { "name": "linux-musl-release", "configurePreset": "linux-musl-release" },
+    {
+      "name": "linux-musl-i686-release",
+      "configurePreset": "linux-musl-i686-release"
+    },
+    {
+      "name": "linux-musl-aarch64-release",
+      "configurePreset": "linux-musl-aarch64-release"
+    },
     { "name": "linux-analyze", "configurePreset": "linux-analyze" },
     { "name": "linux-coverage", "configurePreset": "linux-coverage" },
     { "name": "windows-analyze", "configurePreset": "windows-analyze" },
@@ -182,6 +204,16 @@
     {
       "name": "linux-musl-release",
       "configurePreset": "linux-musl-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-musl-i686-release",
+      "configurePreset": "linux-musl-i686-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-musl-aarch64-release",
+      "configurePreset": "linux-musl-aarch64-release",
       "output": { "outputOnFailure": true }
     },
     {

@@ -269,14 +269,30 @@ def test_host_profiles_for_musl_is_a_standalone_complete_profile() -> None:
     ]
 
 
+def test_host_profiles_for_musl_i686_and_aarch64_pick_their_own_profile() -> None:
+    assert dev.host_profiles_for("linux-musl-i686-release") == [
+        str(dev.PROFILES_DIR / "linux-musl-i686")
+    ]
+    assert dev.host_profiles_for("linux-musl-aarch64-release") == [
+        str(dev.PROFILES_DIR / "linux-musl-aarch64")
+    ]
+
+
 def test_is_musl_preset() -> None:
     assert dev.is_musl_preset("linux-musl-release") is True
+    assert dev.is_musl_preset("linux-musl-i686-release") is True
+    assert dev.is_musl_preset("linux-musl-aarch64-release") is True
     assert dev.is_musl_preset("linux-release") is False
     assert dev.is_musl_preset("linux-debug") is False
 
 
 def test_musl_arch_for_preset_defaults_to_x86_64() -> None:
     assert dev.musl_arch_for_preset("linux-musl-release") == "x86_64"
+
+
+def test_musl_arch_for_preset_resolves_i686_and_aarch64() -> None:
+    assert dev.musl_arch_for_preset("linux-musl-i686-release") == "i686"
+    assert dev.musl_arch_for_preset("linux-musl-aarch64-release") == "aarch64"
 
 
 # --- conan_env: musl gets its own Conan home ---------------------------------
@@ -300,6 +316,21 @@ def test_conan_env_sets_own_conan_home_and_toolchain_for_musl(
 
     assert env["CONAN_HOME"] == str(tmp_path / "conan-musl")
     assert env["TAZ_MUSL_TOOLCHAIN"] == str(toolchain)
+
+
+def test_conan_env_gives_i686_and_aarch64_their_own_conan_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dev, "cache_root", lambda: tmp_path)
+    monkeypatch.setattr(dev, "musl_toolchain_dir", lambda arch: tmp_path / arch)
+
+    i686_env = dev.conan_env("linux-musl-i686-release")
+    aarch64_env = dev.conan_env("linux-musl-aarch64-release")
+
+    assert i686_env["CONAN_HOME"] == str(tmp_path / "conan-musl-i686")
+    assert i686_env["TAZ_MUSL_TOOLCHAIN"] == str(tmp_path / "i686")
+    assert aarch64_env["CONAN_HOME"] == str(tmp_path / "conan-musl-aarch64")
+    assert aarch64_env["TAZ_MUSL_TOOLCHAIN"] == str(tmp_path / "aarch64")
 
 
 # --- conan-cache-key ---------------------------------------------------------
@@ -588,6 +619,11 @@ def test_verify_static_smoke_missing_docker_warns_locally_fails_in_ci(
 
 
 # --- release-bundle ----------------------------------------------------------
+
+
+def test_release_artifacts_cover_the_new_musl_arches() -> None:
+    assert dev.RELEASE_ARTIFACTS["linux-musl-i686-release"] == "taz-linux-i686"
+    assert dev.RELEASE_ARTIFACTS["linux-musl-aarch64-release"] == "taz-linux-aarch64"
 
 
 def test_release_bundle_rejects_non_release_preset(

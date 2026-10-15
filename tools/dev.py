@@ -431,10 +431,14 @@ def is_musl_preset(preset: str) -> bool:
 def musl_arch_for_preset(preset: str) -> str:
     """Which `MUSL_TOOLCHAINS` entry a musl preset builds against.
 
-    Only one musl preset exists today (`linux-musl-release` -> x86_64);
-    per-arch musl presets land in Project C2 alongside their table entries.
-    Callers only reach this for a preset already known to be musl.
+    `linux-musl-release` is the original target and stays unsuffixed
+    (x86_64); every other arch names itself in the preset, e.g.
+    `linux-musl-i686-release` / `linux-musl-aarch64-release`. Callers only
+    reach this for a preset already known to be musl.
     """
+    for arch in MUSL_TOOLCHAINS:
+        if arch != DEFAULT_MUSL_ARCH and preset == f"linux-musl-{arch}-release":
+            return arch
     return DEFAULT_MUSL_ARCH
 
 
@@ -442,7 +446,9 @@ def host_profiles_for(preset: str) -> list[str]:
     """Host profile chain for a preset: detected base first, then our partials."""
     if is_musl_preset(preset):
         # Complete profile: the Bootlin toolchain is unknown to `default`.
-        return [str(PROFILES_DIR / "linux-musl")]
+        arch = musl_arch_for_preset(preset)
+        name = "linux-musl" if arch == DEFAULT_MUSL_ARCH else f"linux-musl-{arch}"
+        return [str(PROFILES_DIR / name)]
     if preset.startswith("windows-"):
         return ["default", str(PROFILES_DIR / "windows-static")]
     if preset.startswith("linux-fuzz") or preset.startswith("linux-clang"):
@@ -458,17 +464,20 @@ def conan_env(preset: str) -> dict[str, str]:
     """Environment for a Conan invocation on `preset`.
 
     Identity for every preset except musl, which gets its own Conan home
-    (so its from-source packages never collide with the glibc ones in
-    ~/.conan2 — package ids cover neither the libc nor [conf] keys such as
-    compiler_executables) and TAZ_MUSL_TOOLCHAIN for the profile's jinja
-    template to read the toolchain's compiler paths from.
+    per arch (so its from-source packages never collide with the glibc
+    ones in ~/.conan2, nor with another arch's musl packages — package ids
+    cover neither the libc nor [conf] keys such as compiler_executables)
+    and TAZ_MUSL_TOOLCHAIN for the profile's jinja template to read that
+    arch's toolchain compiler paths from.
     """
     if not is_musl_preset(preset):
         return dict(os.environ)
+    arch = musl_arch_for_preset(preset)
+    home_name = "conan-musl" if arch == DEFAULT_MUSL_ARCH else f"conan-musl-{arch}"
     return {
         **os.environ,
-        "CONAN_HOME": str(cache_root() / "conan-musl"),
-        "TAZ_MUSL_TOOLCHAIN": str(musl_toolchain_dir(musl_arch_for_preset(preset))),
+        "CONAN_HOME": str(cache_root() / home_name),
+        "TAZ_MUSL_TOOLCHAIN": str(musl_toolchain_dir(arch)),
     }
 
 
@@ -1021,7 +1030,10 @@ def cmd_doctor() -> None:
                 warnings.append(flag)
 
     if not IS_WINDOWS:
-        print("musl toolchains (optional, for `just build linux-musl-release`):")
+        print(
+            "musl toolchains (optional, for `just build linux-musl-release` "
+            "and the i686/aarch64 musl presets):"
+        )
         for arch in MUSL_TOOLCHAINS:
             toolchain_dir = musl_toolchain_dir(arch)
             if _musl_toolchain_valid(toolchain_dir, arch):
@@ -1318,6 +1330,8 @@ def cmd_verify_static(preset: str) -> None:
 # ---------------------------------------------------------------------------
 RELEASE_ARTIFACTS = {
     "linux-musl-release": "taz-linux-x64",
+    "linux-musl-i686-release": "taz-linux-i686",
+    "linux-musl-aarch64-release": "taz-linux-aarch64",
     "windows-release": "taz-windows-x64",
 }
 

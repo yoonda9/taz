@@ -1,0 +1,35 @@
+# Complete Conan host profile for linux-musl-aarch64-release — unlike every
+# other Linux profile here, it is not composed after a detected base profile
+# (`default`), because the Bootlin musl toolchain is a compiler `default`
+# knows nothing about.
+#
+# Mirrors daemon/profiles/linux-musl (the x86_64 musl target) except for
+# `arch` and the compiler triple: this preset cross-builds for aarch64 even
+# when the Conan build profile (`default`) is x86_64.
+#
+# This preset gets its own Conan home (tools/dev.py's conan_env sets
+# CONAN_HOME to <cache root>/conan-musl-aarch64) so its from-source musl
+# packages can never satisfy, or be satisfied by, the glibc packages in
+# ~/.conan2 or the other musl arches' homes: Conan package ids cover neither
+# the libc nor [conf] keys such as compiler_executables.
+#
+# tools/dev.py sets TAZ_MUSL_TOOLCHAIN to this arch's toolchain directory
+# (fetching it first if needed) before every Conan invocation on this
+# preset; an unset variable would render "None/bin/..." below.
+[settings]
+os=Linux
+arch=armv8
+compiler=gcc
+compiler.version=15
+compiler.libcxx=libstdc++11
+compiler.cppstd=17
+
+[options]
+*:shared=False
+
+[conf]
+# Must match the generator in daemon/CMakePresets.json.
+tools.cmake.cmaketoolchain:generator=Ninja
+tools.build:compiler_executables={"c": "{{ os.getenv('TAZ_MUSL_TOOLCHAIN') }}/bin/aarch64-linux-gcc", "cpp": "{{ os.getenv('TAZ_MUSL_TOOLCHAIN') }}/bin/aarch64-linux-g++"}
+# A fully static tazd: no INTERP, no NEEDED (verified by `just verify-static`).
+tools.build:exelinkflags=["-static"]
