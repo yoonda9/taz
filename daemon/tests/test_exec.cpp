@@ -1,6 +1,7 @@
 // Unit tests for exec.c/h: the output capture buffer and the taz_exec_start
 // spawn engine.
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -410,6 +411,88 @@ std::string LoadedAsanRuntimeDirUtf8()
     return std::string();
 }
 
+// A fresh, empty directory under the system temp path, as both its wide
+// path (for RemoveDirectoryW) and UTF-8 path (for a PATH override). S9's
+// not-found row needs a real, empty directory so SearchPathW's failure
+// comes from an exhausted search, not an invalid path.
+struct EmptyTempDir
+{
+    std::wstring wide;
+    std::string utf8;
+    bool valid = false;
+};
+
+EmptyTempDir MakeEmptyTempDir()
+{
+    EmptyTempDir result;
+    wchar_t temp[MAX_PATH];
+    const DWORD temp_len =
+        GetTempPathW(static_cast<DWORD>(std::size(temp)), temp);
+    if ((temp_len == 0) || (temp_len >= std::size(temp)))
+    {
+        return result;
+    }
+    result.wide = std::wstring(temp, temp_len) + L"taz-test-empty-" +
+                  std::to_wstring(GetCurrentProcessId()) + L"-" +
+                  std::to_wstring(GetTickCount64());
+    if (!CreateDirectoryW(result.wide.c_str(), nullptr))
+    {
+        result.wide.clear();
+        return result;
+    }
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, result.wide.data(),
+                                           static_cast<int>(result.wide.size()),
+                                           nullptr, 0, nullptr, nullptr);
+    result.utf8.resize(static_cast<size_t>(needed));
+    (void)WideCharToMultiByte(CP_UTF8, 0, result.wide.data(),
+                              static_cast<int>(result.wide.size()),
+                              result.utf8.data(), needed, nullptr, nullptr);
+    result.valid = true;
+    return result;
+}
+
+// Splits a captured "cmd /c set" stdout into its NAME=VALUE lines (CRLF or
+// LF terminated, blanks dropped).
+std::vector<std::string> SplitEnvLines(const std::string &text)
+{
+    std::vector<std::string> lines;
+    size_t start = 0U;
+    while (start <= text.size())
+    {
+        const size_t end = text.find('\n', start);
+        std::string line = (end == std::string::npos)
+                               ? text.substr(start)
+                               : text.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        if (!line.empty())
+        {
+            lines.push_back(line);
+        }
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        start = end + 1U;
+    }
+    return lines;
+}
+
+bool AnyLineStartsWith(const std::vector<std::string> &lines,
+                       const std::string &prefix)
+{
+    for (const auto &line : lines)
+    {
+        if (line.rfind(prefix, 0) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 // These rows duplicate the test process's own token (no second account
@@ -728,6 +811,211 @@ TEST_F(ExecSpawnTest, OwnTokenSpawnSucceedsAndMarksAsUser)
     EXPECT_FALSE(outcome.out.empty());
     EXPECT_FALSE(outcome.timed_out);
     EXPECT_FALSE(outcome.truncated);
+}
+
+// --- table S5: failure before/at CreateProcessAsUserW ------------------
+//
+// S6 (AssignProcessToJobObject failing on an already-suspended child) has
+// no row here; it is covered by the next task's S12 (leak oracle) work.
+
+TEST_F(ExecSpawnTest, NonexistentFileFailsSpawnAsUserAndClosesTheToken)
+{
+    std::string reason;
+    ScopedHandle owned = OwnPrimaryToken(&reason);
+    if (!owned.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const HANDLE token = owned.get();
+
+    const std::string missing = Exe() + "-taz-test-does-not-exist";
+    taz_exec_spec_t spec{};
+    spec.file = missing.c_str();
+    spec.max_output_bytes = 1024;
+    spec.token = owned.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    EXPECT_EQ(rc, UV_ENOENT);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    DWORD flags = 0;
+    EXPECT_FALSE(GetHandleInformation(token, &flags));
+}
+
+// --- table S9: file resolution along the child's own PATH --------------
+
+TEST_F(ExecSpawnTest, BareNameResolvesAlongTheChildsOwnPathNotTheDaemons)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string system_root = OwnEnvVarUtf8(L"SystemRoot");
+    ASSERT_FALSE(system_root.empty());
+    const std::string system32 = system_root + "\\System32";
+
+    taz_v1_KeyValue env[1];
+    (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+    (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                        system32.c_str());
+
+    taz_exec_spec_t spec{};
+    spec.file = "whoami";
+    spec.env = env;
+    spec.env_count = 1;
+    spec.max_output_bytes = 1024;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.exit_status, 0);
+    EXPECT_FALSE(outcome.out.empty());
+}
+
+TEST_F(ExecSpawnTest, BareNameNotOnChildsPathIsEnoent)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    EmptyTempDir empty_dir = MakeEmptyTempDir();
+    ASSERT_TRUE(empty_dir.valid);
+
+    taz_v1_KeyValue env[1];
+    (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+    (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                        empty_dir.utf8.c_str());
+
+    taz_exec_spec_t spec{};
+    spec.file = "whoami";
+    spec.env = env;
+    spec.env_count = 1;
+    spec.max_output_bytes = 1024;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    EXPECT_EQ(rc, UV_ENOENT);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    (void)RemoveDirectoryW(empty_dir.wide.c_str());
+}
+
+// --- table S10: quoting/command-line overflow ---------------------------
+
+TEST_F(ExecSpawnTest, HugeArgumentFailsSpawnAsUserWithE2bigAndClosesTheToken)
+{
+    std::string reason;
+    ScopedHandle owned = OwnPrimaryToken(&reason);
+    if (!owned.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const HANDLE token = owned.get();
+
+    const std::string huge(40000, 'a');
+    const char *const args[] = {huge.c_str()};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1024;
+    spec.token = owned.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    EXPECT_EQ(rc, UV_E2BIG);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    DWORD flags = 0;
+    EXPECT_FALSE(GetHandleInformation(token, &flags));
+}
+
+// --- env rows through a real child (table S2) ---------------------------
+
+TEST_F(ExecSpawnTest, ChildEnvReflectsTokenBaseOverrideAndSystemRootBackfill)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string system_root = OwnEnvVarUtf8(L"SystemRoot");
+    ASSERT_FALSE(system_root.empty());
+    const std::string own_userprofile = OwnEnvVarUtf8(L"USERPROFILE");
+    ASSERT_FALSE(own_userprofile.empty());
+    const std::string cmd_exe = system_root + "\\System32\\cmd.exe";
+
+    taz_v1_KeyValue env[1];
+    (void)std::snprintf(env[0].key, sizeof(env[0].key), "USERPROFILE");
+    (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s", "C:\\custom");
+
+    const char *const args[] = {"/c", "set"};
+    taz_exec_spec_t spec{};
+    spec.file = cmd_exe.c_str();
+    spec.args = args;
+    spec.args_count = std::size(args);
+    spec.env = env;
+    spec.env_count = 1;
+    spec.max_output_bytes = 1U << 16;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    ASSERT_TRUE(outcome.called);
+    ASSERT_EQ(outcome.exit_status, 0);
+    const std::vector<std::string> lines = SplitEnvLines(outcome.out);
+    EXPECT_TRUE(std::find(lines.begin(), lines.end(),
+                          "USERPROFILE=C:\\custom") != lines.end());
+    EXPECT_FALSE(AnyLineStartsWith(lines, "USER="));
+    EXPECT_TRUE(AnyLineStartsWith(lines, "SystemRoot="));
 }
 #else
 TEST_F(ExecSpawnTest, NonNullTokenReturnsNotSupported)
