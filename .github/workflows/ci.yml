@@ -58,11 +58,21 @@ jobs:
           - name: Linux release (musl static tazd)
             checks: [release]
             conan-preset: linux-musl-release
+            musl-arch: x86_64
             mise-tools: uv just prek cmake ninja
             # linux-musl-release has its own Conan home (own package set,
             # never shared with the glibc presets' ~/.conan2), under
             # TAZ_CACHE_DIR.
             conan-cache-path: ~/.cache/taz/conan-musl/p
+          - name: Linux i686 (musl static tazd)
+            checks: [release]
+            conan-preset: linux-musl-i686-release
+            musl-arch: i686
+            mise-tools: uv just prek cmake ninja
+            # Own Conan home, same rationale as linux-musl-release, keyed by
+            # arch (tools/dev.py conan_env) so the i686 packages never
+            # collide with the x86_64 musl ones.
+            conan-cache-path: ~/.cache/taz/conan-musl-i686/p
     env:
       # Every preset an entry builds must need the same Conan packages as this
       # one; `just deps` enforces it (see the Conan cache steps).
@@ -102,7 +112,7 @@ jobs:
         id: toolchain-key
         if: contains(matrix.checks, 'release')
         run: |
-          key=$(uv run python tools/dev.py musl-toolchain --print-key)
+          key=$(uv run python tools/dev.py musl-toolchain --print-key ${{ matrix.musl-arch }})
           echo "key=$key" >> "$GITHUB_OUTPUT"
 
       - name: Restore musl toolchain
@@ -115,7 +125,7 @@ jobs:
 
       - name: Fetch musl toolchain
         if: contains(matrix.checks, 'release')
-        run: just musl-toolchain
+        run: just musl-toolchain ${{ matrix.musl-arch }}
 
       - name: Save musl toolchain
         if: contains(matrix.checks, 'release') && steps.toolchain-cache.outputs.cache-hit != 'true'
@@ -211,23 +221,25 @@ jobs:
           path: out/coverage
 
       - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
-        run: just build linux-musl-release
+        run: just build ${{ matrix.conan-preset }}
 
       - id: release-test-c
         if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
-        run: just test-c linux-musl-release
+        run: just test-c ${{ matrix.conan-preset }}
 
       - id: release-test-py
         if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
-        run: just test-py --daemon daemon/build/linux-musl-release/tazd
+        run: just test-py --daemon daemon/build/${{ matrix.conan-preset }}/tazd
 
       - id: release-verify
         if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
-        run: just verify-static linux-musl-release
+        run: just verify-static ${{ matrix.conan-preset }}
 
-      # Only a binary that passed every check above is published.
+      # Only a binary that passed every check above is published. i686's
+      # bundle/artifact upload is a separate task (C3c); this entry only
+      # proves the preset builds, tests and is fully static in CI.
       - id: release-bundle
-        if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' && matrix.conan-preset == 'linux-musl-release' }}
         run: just release-bundle linux-musl-release
 
       - if: ${{ !cancelled() && steps.release-bundle.outcome == 'success' }}
