@@ -10,7 +10,6 @@
 
 #include "taz/config.h"
 #include "taz/error.h"
-#include "taz/fsutil.h"
 #include "taz/log.h"
 #include "taz/response.h"
 #include "taz/run_as.h"
@@ -27,6 +26,7 @@ typedef struct
     void *write_ctx;
     uint32_t stream_id;
     uint16_t opcode;
+    bool as_user;
 } exec_ctx_t;
 
 static void on_exec_done(const taz_exec_result_t *result, void *arg)
@@ -34,6 +34,7 @@ static void on_exec_done(const taz_exec_result_t *result, void *arg)
     exec_ctx_t *ectx = (exec_ctx_t *)arg;
     const char *timed_out = "";
     const char *cancelled = "";
+    const char *as_user = "";
 
     if (result->timed_out)
     {
@@ -43,10 +44,14 @@ static void on_exec_done(const taz_exec_result_t *result, void *arg)
     {
         cancelled = " cancelled";
     }
+    if (ectx->as_user)
+    {
+        as_user = " as_user";
+    }
     taz_log(TAZ_LOG_INFO,
-            "executed command: exit=%lld signal=%d%s%s output=%zu",
+            "executed command: exit=%lld signal=%d%s%s%s output=%zu",
             (long long)result->exit_status, result->term_signal, timed_out,
-            cancelled, result->out_len);
+            cancelled, as_user, result->out_len);
 
     taz_command_send_exec_response(ectx->write_fn, ectx->write_ctx,
                                    ectx->stream_id, ectx->opcode, result);
@@ -86,13 +91,12 @@ int taz_command_resolve_as_user(const taz_dispatch_t *d,
                                 const taz_v1_CommandExecRequest *req,
                                 taz_exec_spec_t *spec,
                                 taz_v1_ErrorCode *error_code,
-                                const char **error_message)
+                                const char **error_message, char *message_buf,
+                                size_t message_buf_size)
 {
     if (req->as_user[0] != '\0')
     {
-        unsigned long uid = 0UL;
-        unsigned long gid = 0UL;
-        char home[TAZ_EXEC_HOME_MAX];
+        taz_run_as_identity_t identity;
 
         if (!taz_run_as_privileged())
         {
@@ -101,29 +105,51 @@ int taz_command_resolve_as_user(const taz_dispatch_t *d,
             return -1;
         }
 
-        if (!taz_passwd_lookup_by_name(taz_run_as_passwd_path(), req->as_user,
-                                       &uid, &gid, home, sizeof(home)))
+        if (taz_run_as_resolve(req->as_user, &identity, error_code, message_buf,
+                               message_buf_size) != 0)
         {
-            *error_code = taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND;
-            *error_message = "as_user not found";
+            /* POSIX's resolve leaves message_buf "" on a passwd miss, so
+             * the wire behaviour here stays byte-identical to the old
+             * inline lookup's literal; Windows always fills it with the
+             * real LsaLogonUser/DuplicateTokenEx failure text. */
+            *error_message =
+                (message_buf[0] != '\0') ? message_buf : "as_user not found";
             return -1;
         }
 
-        spec->uid = (uv_uid_t)uid;
-        spec->gid = (uv_gid_t)gid;
+        spec->uid = (uv_uid_t)identity.uid;
+        spec->gid = (uv_gid_t)identity.gid;
         spec->switch_identity = true;
+        spec->token = identity.token;
         (void)snprintf(spec->identity_user, sizeof(spec->identity_user), "%s",
-                       req->as_user);
+                       identity.user);
         (void)snprintf(spec->identity_home, sizeof(spec->identity_home), "%s",
-                       home);
+                       identity.home);
         return 0;
     }
 
     if (d->run_as_active)
     {
+        void *token = NULL;
+
+        if (d->run_as_token != NULL)
+        {
+            token = taz_run_as_token_dup(d->run_as_token, message_buf,
+                                         message_buf_size);
+            if (token == NULL)
+            {
+                *error_code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+                *error_message = (message_buf[0] != '\0')
+                                     ? message_buf
+                                     : "token duplication failed";
+                return -1;
+            }
+        }
+
         spec->uid = (uv_uid_t)d->run_as_uid;
         spec->gid = (uv_gid_t)d->run_as_gid;
         spec->switch_identity = true;
+        spec->token = token;
         (void)snprintf(spec->identity_user, sizeof(spec->identity_user), "%s",
                        d->run_as_user);
         (void)snprintf(spec->identity_home, sizeof(spec->identity_home), "%s",
@@ -219,9 +245,11 @@ void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
     {
         taz_v1_ErrorCode as_user_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
         const char *as_user_message = NULL;
+        char as_user_message_buf[256];
 
         if (taz_command_resolve_as_user(d, req, &spec, &as_user_code,
-                                        &as_user_message) != 0)
+                                        &as_user_message, as_user_message_buf,
+                                        sizeof(as_user_message_buf)) != 0)
         {
             free(ectx);
             free(req);
@@ -244,6 +272,8 @@ void handle_command_exec(taz_dispatch_t *d, const taz_frame_header_t *header,
         taz_dispatch_stream_done(d, header->stream_id);
         return;
     }
+
+    ectx->as_user = taz_exec_as_user(exec_handle);
 
     /* The exec now owns a reference on the connection until on_exec_done
      * unrefs it, so a client disconnect can never free the connection out

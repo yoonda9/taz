@@ -14,6 +14,7 @@
 #include "taz/error.h"
 #include "taz/log.h"
 #include "taz/response.h"
+#include "taz/run_as.h"
 #include "taz/task.h"
 #include "taz/task_registry.h"
 #include "taz/v1/advanced.pb.h"
@@ -299,9 +300,11 @@ void handle_detach(taz_dispatch_t *d, const taz_frame_header_t *header,
     {
         taz_v1_ErrorCode as_user_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
         const char *as_user_message = NULL;
+        char as_user_message_buf[256];
 
         if (taz_command_resolve_as_user(d, inner, &spec, &as_user_code,
-                                        &as_user_message) != 0)
+                                        &as_user_message, as_user_message_buf,
+                                        sizeof(as_user_message_buf)) != 0)
         {
             detach_fail(d, header, write_fn, ctx, req, as_user_code,
                         as_user_message, NULL);
@@ -312,6 +315,10 @@ void handle_detach(taz_dispatch_t *d, const taz_frame_header_t *header,
     dctx = (detach_ctx_t *)malloc(sizeof(*dctx));
     if (dctx == NULL)
     {
+        /* taz_command_resolve_as_user already resolved a token onto spec
+         * above; taz_exec_start never gets called on this path, so nothing
+         * else will ever close it. */
+        taz_run_as_token_close(spec.token);
         detach_fail(d, header, write_fn, ctx, req,
                     taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
                     NULL);

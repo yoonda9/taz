@@ -90,7 +90,7 @@ inline int LogonFn(const char *, void **token, taz_v1_ErrorCode *code,
 {
     if (LogonSucceeds())
     {
-        *token = taz_run_as_token_dup(LogonToken());
+        *token = taz_run_as_token_dup(LogonToken(), nullptr, 0);
         return (*token != nullptr) ? 0 : -1;
     }
     *code = LogonCode();

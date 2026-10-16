@@ -20,6 +20,10 @@
 
 #ifndef _WIN32
 #include <unistd.h>
+#else
+#include <windows.h>
+
+#include "win32_token_test_support.h"
 #endif
 
 #include "handlers/command.h"
@@ -769,28 +773,34 @@ TEST_F(CommandResolveAsUserTest,
     taz_exec_spec_t spec{};
     taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
     const char *error_message = nullptr;
+    char message_buf[256];
 
     EXPECT_NE(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
-                                          &error_message),
+                                          &error_message, message_buf,
+                                          sizeof(message_buf)),
               0);
     EXPECT_EQ(error_code, taz_v1_ErrorCode_ERROR_CODE_NOT_SUPPORTED);
     EXPECT_NE(error_message, nullptr);
     EXPECT_FALSE(spec.switch_identity);
 }
 
-// taz_run_as_set_privileged_for_tests is a documented no-op on _WIN32
-// (RUN_AS is deferred there regardless, so taz_run_as_privileged stays
-// hard-0), so the two rows below cannot run there - the per-call override
-// would see NOT_SUPPORTED, matching PerCallOverrideNotPrivilegedReturns-
-// NotSupported above instead of the privileged behaviour under test.
-#ifndef _WIN32
+// The per-call override resolves through the platform-neutral
+// taz_run_as_resolve (table H5): POSIX drives it with ScopedPasswdPath,
+// Windows fakes the S4U logon with ScopedLogon, handing out either a
+// duplicate of the test process's own token (OwnPrimaryToken) or a canned
+// failure - the same seam test_run_as.cpp's handler rows use.
 
 TEST_F(CommandResolveAsUserTest,
        PerCallOverridePrivilegedUnknownUserReturnsNotFound)
 {
     const ScopedPrivilege privileged(1);
+#ifndef _WIN32
     WritePasswd("alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
     const ScopedPasswdPath passwd(PasswdPath());
+#else
+    const ScopedLogon logon(taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND,
+                            "LsaLogonUser(MSV1_0): no such user (fake)");
+#endif
 
     auto req = std::make_unique<taz_v1_CommandExecRequest>();
     (void)strncpy(req->as_user, "ghost", sizeof(req->as_user) - 1U);
@@ -799,20 +809,40 @@ TEST_F(CommandResolveAsUserTest,
     taz_exec_spec_t spec{};
     taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
     const char *error_message = nullptr;
+    char message_buf[256];
 
     EXPECT_NE(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
-                                          &error_message),
+                                          &error_message, message_buf,
+                                          sizeof(message_buf)),
               0);
     EXPECT_EQ(error_code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
     EXPECT_FALSE(spec.switch_identity);
+    EXPECT_EQ(spec.token, nullptr);
+#ifndef _WIN32
+    // POSIX's resolve leaves message "", so the handler falls back to the
+    // same literal the old inline lookup sent.
+    EXPECT_STREQ(error_message, "as_user not found");
+#else
+    EXPECT_STREQ(error_message, "LsaLogonUser(MSV1_0): no such user (fake)");
+#endif
 }
 
 TEST_F(CommandResolveAsUserTest,
        PerCallOverridePrivilegedKnownUserWinsOverConnectionIdentity)
 {
     const ScopedPrivilege privileged(1);
+#ifndef _WIN32
     WritePasswd("alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
     const ScopedPasswdPath passwd(PasswdPath());
+#else
+    std::string reason;
+    const ScopedHandle own_token = OwnPrimaryToken(&reason);
+    if (!own_token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const ScopedLogon logon(own_token.get());
+#endif
 
     auto req = std::make_unique<taz_v1_CommandExecRequest>();
     (void)strncpy(req->as_user, "alice", sizeof(req->as_user) - 1U);
@@ -827,18 +857,31 @@ TEST_F(CommandResolveAsUserTest,
     taz_exec_spec_t spec{};
     taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
     const char *error_message = nullptr;
+    char message_buf[256];
 
-    EXPECT_EQ(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
-                                          &error_message),
+    ASSERT_EQ(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
+                                          &error_message, message_buf,
+                                          sizeof(message_buf)),
               0);
     EXPECT_TRUE(spec.switch_identity);
+    EXPECT_STREQ(spec.identity_user, "alice");
+#ifndef _WIN32
     EXPECT_EQ(spec.uid, 4242U);
     EXPECT_EQ(spec.gid, 4243U);
-    EXPECT_STREQ(spec.identity_user, "alice");
     EXPECT_STREQ(spec.identity_home, "/home/alice");
+    EXPECT_EQ(spec.token, nullptr);
+#else
+    // H5: ownership of the resolved identity's token moves onto spec.
+    ASSERT_NE(spec.token, nullptr);
+    TOKEN_TYPE token_type = TokenImpersonation;
+    DWORD returned_len = 0;
+    EXPECT_TRUE(GetTokenInformation(static_cast<HANDLE>(spec.token), TokenType,
+                                    &token_type, sizeof(token_type),
+                                    &returned_len));
+    EXPECT_EQ(token_type, TokenPrimary);
+    taz_run_as_token_close(spec.token);
+#endif
 }
-
-#endif /* !_WIN32 */
 
 TEST(CommandResolveAsUser, ConnectionIdentityAppliesWhenAsUserEmpty)
 {
@@ -853,19 +896,26 @@ TEST(CommandResolveAsUser, ConnectionIdentityAppliesWhenAsUserEmpty)
     d.run_as_gid = 88U;
     (void)snprintf(d.run_as_user, sizeof(d.run_as_user), "%s", "carol");
     (void)snprintf(d.run_as_home, sizeof(d.run_as_home), "%s", "/home/carol");
+    // d.run_as_token stays NULL: no Windows token to duplicate, matching a
+    // connection that reached this state without ever running RUN_AS on
+    // Windows (e.g. a privileged daemon whose RUN_AS seam is faked
+    // directly, as this row does).
 
     taz_exec_spec_t spec{};
     taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
     const char *error_message = nullptr;
+    char message_buf[256];
 
     EXPECT_EQ(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
-                                          &error_message),
+                                          &error_message, message_buf,
+                                          sizeof(message_buf)),
               0);
     EXPECT_TRUE(spec.switch_identity);
     EXPECT_EQ(spec.uid, 77U);
     EXPECT_EQ(spec.gid, 88U);
     EXPECT_STREQ(spec.identity_user, "carol");
     EXPECT_STREQ(spec.identity_home, "/home/carol");
+    EXPECT_EQ(spec.token, nullptr);
 }
 
 TEST(CommandResolveAsUser, NoSwitchWhenNeitherAsUserNorConnectionIdentitySet)
@@ -876,12 +926,100 @@ TEST(CommandResolveAsUser, NoSwitchWhenNeitherAsUserNorConnectionIdentitySet)
     taz_exec_spec_t spec{};
     taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
     const char *error_message = nullptr;
+    char message_buf[256];
 
     EXPECT_EQ(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
-                                          &error_message),
+                                          &error_message, message_buf,
+                                          sizeof(message_buf)),
               0);
     EXPECT_FALSE(spec.switch_identity);
+    EXPECT_EQ(spec.token, nullptr);
 }
+
+#ifdef _WIN32
+
+// H6: the connection identity's token is never handed to spec directly -
+// each call gets its own duplicate, so a RUN_AS reset (which closes
+// d.run_as_token) can never pull the handle out from under an in-flight
+// spawn, and a duplication failure is reported as INTERNAL with the real
+// DuplicateTokenEx text rather than silently falling back to no identity
+// switch at all.
+
+TEST(CommandResolveAsUser, ConnectionIdentityDuplicatesTheTokenNotTheHandle)
+{
+    std::string reason;
+    const ScopedHandle own_token = OwnPrimaryToken(&reason);
+    if (!own_token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+
+    auto req = std::make_unique<taz_v1_CommandExecRequest>(); // as_user == ""
+    taz_dispatch_t d{};
+    d.run_as_active = 1;
+    d.run_as_token = own_token.get();
+    (void)snprintf(d.run_as_user, sizeof(d.run_as_user), "%s", "carol");
+
+    taz_exec_spec_t spec{};
+    taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *error_message = nullptr;
+    char message_buf[256];
+
+    ASSERT_EQ(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
+                                          &error_message, message_buf,
+                                          sizeof(message_buf)),
+              0);
+    EXPECT_TRUE(spec.switch_identity);
+    ASSERT_NE(spec.token, nullptr);
+    EXPECT_NE(spec.token, d.run_as_token);
+    TOKEN_TYPE token_type = TokenImpersonation;
+    DWORD returned_len = 0;
+    EXPECT_TRUE(GetTokenInformation(static_cast<HANDLE>(spec.token), TokenType,
+                                    &token_type, sizeof(token_type),
+                                    &returned_len));
+    EXPECT_EQ(token_type, TokenPrimary);
+
+    taz_run_as_token_close(spec.token);
+    // d.run_as_token (own_token) is closed by ScopedHandle's destructor;
+    // this test set the field directly, bypassing taz_run_as_reset.
+}
+
+TEST(CommandResolveAsUser, ConnectionIdentityDuplicationFailureReturnsInternal)
+{
+    std::string reason;
+    ScopedHandle own_token = OwnPrimaryToken(&reason);
+    if (!own_token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    // A handle this test just closed reliably fails DuplicateTokenEx with
+    // ERROR_INVALID_HANDLE.
+    const HANDLE closed = own_token.release();
+    ASSERT_TRUE(CloseHandle(closed));
+
+    auto req = std::make_unique<taz_v1_CommandExecRequest>();
+    taz_dispatch_t d{};
+    d.run_as_active = 1;
+    d.run_as_token = closed;
+
+    taz_exec_spec_t spec{};
+    taz_v1_ErrorCode error_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+    const char *error_message = nullptr;
+    char message_buf[256];
+
+    EXPECT_NE(taz_command_resolve_as_user(&d, req.get(), &spec, &error_code,
+                                          &error_message, message_buf,
+                                          sizeof(message_buf)),
+              0);
+    EXPECT_EQ(error_code, taz_v1_ErrorCode_ERROR_CODE_INTERNAL);
+    ASSERT_NE(error_message, nullptr);
+    EXPECT_NE(std::string(error_message).find("DuplicateTokenEx"),
+              std::string::npos);
+    EXPECT_FALSE(spec.switch_identity);
+    EXPECT_EQ(spec.token, nullptr);
+}
+
+#endif /* _WIN32 */
 
 // ---------------------------------------------------------------------------
 // handle_command_exec wiring: the as_user precedence's error rows surface

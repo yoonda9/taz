@@ -363,6 +363,12 @@ static void format_lsa_message(const char *package, unsigned long ntstatus,
                    package, ntstatus, text);
 }
 
+void taz_run_as_win32_format_error(const char *api, unsigned long win32_error,
+                                   char *message, size_t message_size)
+{
+    format_api_message(api, win32_error, message, message_size);
+}
+
 static void set_message(char *message, size_t message_size, const char *text)
 {
     if ((message == NULL) || (message_size == 0U))

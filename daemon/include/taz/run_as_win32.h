@@ -83,6 +83,17 @@ extern "C"
      * PERMISSION_DENIED, anything else -> INTERNAL. */
     taz_v1_ErrorCode taz_run_as_win32_map_dup_error(unsigned long win32_error);
 
+    /* Builds "<api>: <win32 text>" into message (table L9's style),
+     * truncated to message_size; no-op when message is NULL or
+     * message_size is 0. Exposed so any caller that fails a plain Win32
+     * API (not an LSA call - see format_lsa_message, kept file-local
+     * since only the logon itself produces an NTSTATUS) can report it the
+     * same way taz_run_as_win32_logon's own DuplicateTokenEx failure
+     * does. */
+    void taz_run_as_win32_format_error(const char *api,
+                                       unsigned long win32_error, char *message,
+                                       size_t message_size);
+
     typedef int (*taz_run_as_win32_logon_fn_t)(const char *, void **,
                                                taz_v1_ErrorCode *, char *,
                                                size_t);

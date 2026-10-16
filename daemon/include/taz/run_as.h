@@ -98,10 +98,14 @@ extern "C"
     /* Duplicates a Windows primary token for a single spawn, so closing the
      * connection's own token later (taz_run_as_reset) can never pull it out
      * from under an in-flight child. Returns the duplicate, or NULL on
-     * failure. Always NULL on POSIX, where there is no token to duplicate.
+     * failure. Always NULL on POSIX, where there is no token to duplicate
+     * (message is left untouched there - nothing ever fails). On a Windows
+     * failure, message is filled with "DuplicateTokenEx: <Win32 text>"
+     * (table L9's style); message/message_size may be NULL/0 to discard it.
      * const: this only ever reads the handle value to hand to
      * DuplicateTokenEx, never writes through it. */
-    void *taz_run_as_token_dup(const void *token);
+    void *taz_run_as_token_dup(const void *token, char *message,
+                               size_t message_size);
 
     /* Closes a token from taz_run_as_token_dup/taz_run_as_resolve.
      * NULL-safe; a no-op on POSIX. const for the same reason as

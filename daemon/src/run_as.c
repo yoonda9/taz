@@ -67,8 +67,13 @@ void taz_run_as_set_passwd_path_for_tests(const char *path)
     g_passwd_path = (path != NULL) ? path : TAZ_RUN_AS_DEFAULT_PASSWD_PATH;
 }
 
-void *taz_run_as_token_dup(const void *token)
+void *taz_run_as_token_dup(const void *token, char *message,
+                           size_t message_size)
 {
+    if ((message != NULL) && (message_size > 0U))
+    {
+        message[0] = '\0';
+    }
     if (token == NULL)
     {
         return NULL;
@@ -81,6 +86,8 @@ void *taz_run_as_token_dup(const void *token)
     if (!DuplicateTokenEx((HANDLE)token, TOKEN_ALL_ACCESS, NULL,
                           SecurityImpersonation, TokenPrimary, &dup))
     {
+        taz_run_as_win32_format_error("DuplicateTokenEx", GetLastError(),
+                                      message, message_size);
         return NULL;
     }
     return (void *)dup;
