@@ -426,10 +426,10 @@ static int real_logon(const char *name, void **token, taz_v1_ErrorCode *code,
     TOKEN_SOURCE source;
     PVOID profile_buffer = NULL;
     ULONG profile_buffer_len = 0UL;
-    LUID logon_id;
+    LUID logon_id = {0};
     HANDLE impersonation_token = NULL;
     HANDLE primary_token = NULL;
-    QUOTA_LIMITS quotas;
+    QUOTA_LIMITS quotas = {0};
     NTSTATUS sub_status = 0;
     NTSTATUS status;
     TOKEN_TYPE token_type = TokenPrimary;
