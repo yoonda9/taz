@@ -993,8 +993,11 @@ TEST(CommandResolveAsUser, ConnectionIdentityDuplicationFailureReturnsInternal)
         GTEST_SKIP() << reason;
     }
     // A handle this test just closed reliably fails DuplicateTokenEx with
-    // ERROR_INVALID_HANDLE.
-    const HANDLE closed = own_token.release();
+    // ERROR_INVALID_HANDLE. Not const: HANDLE is void*, so a top-level
+    // const binds to the pointer, not the pointee - clang-tidy's
+    // misc-misplaced-const flags that regardless of spelling, matching
+    // every other HANDLE local in this file.
+    HANDLE closed = own_token.release();
     ASSERT_TRUE(CloseHandle(closed));
 
     auto req = std::make_unique<taz_v1_CommandExecRequest>();
