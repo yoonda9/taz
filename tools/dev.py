@@ -1292,6 +1292,7 @@ def _verify_static_windows(binary: Path) -> None:
         "psapi.dll",
         "iphlpapi.dll",
         "userenv.dll",
+        "secur32.dll",
         "shell32.dll",
         "dbghelp.dll",
         "ole32.dll",
