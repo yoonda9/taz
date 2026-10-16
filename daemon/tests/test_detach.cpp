@@ -746,7 +746,11 @@ TEST_F(FileHandlerTest, DetachRunsAsTheConnectionRunAsIdentity)
 // calls into the shared taz_command_resolve_as_user: the connection
 // identity's token reaches a real CreateProcessAsUserW spawn. No second
 // account exists yet, so this duplicates the test process's own token -
-// OwnPrimaryToken's reason covers the missing-privilege skip.
+// OwnPrimaryToken's reason covers the missing-privilege skip. Spawns
+// System32's own cmd.exe, not this (possibly ASan-instrumented) test
+// binary re-exec'd - the as-user path's own env block carries no ASan
+// runtime DLL directory, which test_exec.cpp's ExecSpawnTest rows handle
+// with a PATH override this row has no need for.
 TEST_F(FileHandlerTest, DetachRunsAsTheConnectionRunAsIdentityOnWindows)
 {
     std::string reason;
@@ -756,6 +760,13 @@ TEST_F(FileHandlerTest, DetachRunsAsTheConnectionRunAsIdentityOnWindows)
         GTEST_SKIP() << reason;
     }
 
+    char system_root[1024];
+    const DWORD system_root_len = GetEnvironmentVariableA(
+        "SystemRoot", system_root, static_cast<DWORD>(sizeof(system_root)));
+    ASSERT_GT(system_root_len, 0U);
+    const std::string cmd_exe =
+        std::string(system_root, system_root_len) + "\\System32\\cmd.exe";
+
     Dispatch().run_as_active = 1;
     // Ownership moves to the connection; FileHandlerTest::TearDown's
     // taz_run_as_reset closes it, mirroring a real connection close.
@@ -763,10 +774,7 @@ TEST_F(FileHandlerTest, DetachRunsAsTheConnectionRunAsIdentityOnWindows)
     (void)std::snprintf(Dispatch().run_as_user, sizeof(Dispatch().run_as_user),
                         "%s", "whoever");
 
-    const std::string exe = SelfExePath();
-    ASSERT_FALSE(exe.empty());
-    const auto payload =
-        DetachExecRequestBytes(exe, {"--gtest_filter=NoSuchSuite.*"});
+    const auto payload = DetachExecRequestBytes(cmd_exe, {"/c", "exit 0"});
     DispatchRequest(taz_v1_Opcode_OPCODE_DETACH, payload, 90U);
 
     ASSERT_EQ(Frames().size(), 1U);
