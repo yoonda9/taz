@@ -67,7 +67,7 @@ extern "C"
                                            size_t bufsize);
 
     /* Same layout discipline for KERB_S4U_LOGON: ClientUpn = upn,
-     * ClientRealm left empty (DEC-005). Table L2. */
+     * ClientRealm left empty. Table L2. */
     size_t taz_run_as_win32_kerb_s4u_layout(const wchar_t *upn, void *buf,
                                             size_t bufsize);
 
