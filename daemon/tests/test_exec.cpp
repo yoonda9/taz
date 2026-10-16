@@ -1031,6 +1031,13 @@ TEST_F(ExecSpawnTest, TimeoutKillsAsUserChildAndSetsTimedOut)
     }
     const std::string username = OwnEnvVarUtf8(L"USERNAME");
     ASSERT_FALSE(username.empty());
+    // taz_test_sleeper.exe is built with the same flags as this binary, so
+    // under windows-asan it needs the ASan runtime DLL's directory on its
+    // PATH too (see OwnTokenSpawnSucceedsAndMarksAsUser/DEC-011) - without
+    // it the child dies at once with STATUS_DLL_NOT_FOUND, which finishes
+    // (and so un-arms the timer) long before timeout_ms ever elapses.
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
 
     taz_exec_spec_t spec{};
     spec.file = TAZ_TEST_SLEEPER_PATH;
@@ -1039,6 +1046,14 @@ TEST_F(ExecSpawnTest, TimeoutKillsAsUserChildAndSetsTimedOut)
     spec.token = token.release();
     (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
                         username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
@@ -1064,6 +1079,8 @@ TEST_F(ExecSpawnTest, CancelKillsAsUserChildAndSetsCancelled)
     }
     const std::string username = OwnEnvVarUtf8(L"USERNAME");
     ASSERT_FALSE(username.empty());
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
 
     taz_exec_spec_t spec{};
     spec.file = TAZ_TEST_SLEEPER_PATH;
@@ -1071,6 +1088,14 @@ TEST_F(ExecSpawnTest, CancelKillsAsUserChildAndSetsCancelled)
     spec.token = token.release();
     (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
                         username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
@@ -1101,6 +1126,8 @@ TEST_F(ExecSpawnTest, TimeoutKillsAsUserGrandchildToo)
     const std::string system_root = OwnEnvVarUtf8(L"SystemRoot");
     ASSERT_FALSE(system_root.empty());
     const std::string cmd_exe = system_root + "\\System32\\cmd.exe";
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
 
     // cmd.exe waits for its own child before it exits, so if on_done fires
     // quickly rather than after the sleeper's full 60 s, the job took the
@@ -1116,6 +1143,14 @@ TEST_F(ExecSpawnTest, TimeoutKillsAsUserGrandchildToo)
     spec.token = token.release();
     (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
                         username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
@@ -1142,6 +1177,8 @@ TEST_F(ExecSpawnTest, OutputCapTruncatesButAsUserChildIsStillReaped)
     }
     const std::string username = OwnEnvVarUtf8(L"USERNAME");
     ASSERT_FALSE(username.empty());
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
 
     const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
     taz_exec_spec_t spec{};
@@ -1152,6 +1189,14 @@ TEST_F(ExecSpawnTest, OutputCapTruncatesButAsUserChildIsStillReaped)
     spec.token = token.release();
     (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
                         username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
 
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
@@ -1615,6 +1660,8 @@ TEST_F(ExecSpawnTest, OnExitHookFiresWithRealPidAndStartKeyOnAsUserPath)
     }
     const std::string username = OwnEnvVarUtf8(L"USERNAME");
     ASSERT_FALSE(username.empty());
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
 
     const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
     taz_exec_spec_t spec{};
@@ -1625,6 +1672,14 @@ TEST_F(ExecSpawnTest, OnExitHookFiresWithRealPidAndStartKeyOnAsUserPath)
     spec.token = token.release();
     (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
                         username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
 
     ExecOutcome outcome;
     OnExitOrderProbe probe;
