@@ -1176,7 +1176,7 @@ TEST_F(ExecSpawnTest, HandleCountIsStableAcrossAsUserSpawnBatches)
 {
     std::string reason;
     {
-        ScopedHandle probe = OwnPrimaryToken(&reason);
+        const ScopedHandle probe = OwnPrimaryToken(&reason);
         if (!probe.valid())
         {
             GTEST_SKIP() << reason;
