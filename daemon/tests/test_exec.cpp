@@ -1012,6 +1012,261 @@ TEST_F(ExecSpawnTest, ChildEnvReflectsTokenBaseOverrideAndSystemRootBackfill)
     EXPECT_FALSE(AnyLineStartsWith(lines, "USER="));
     EXPECT_TRUE(AnyLineStartsWith(lines, "SystemRoot="));
 }
+
+// --- table S7: timeout, cancel and tree kill on the as-user path --------
+//
+// taz_test_sleeper sleeps 60 s with no shell involved. tree_kill and the
+// timeout timer only ever touch x->job, which is set up identically for
+// this path and the plain uv_spawn path (table S7 is "unchanged" per
+// context.md) - these rows prove that sharing actually holds for a
+// CreateProcessAsUserW child, not just that the mechanism exists elsewhere.
+
+TEST_F(ExecSpawnTest, TimeoutKillsAsUserChildAndSetsTimedOut)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+    spec.timeout_ms = 300;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.timed_out);
+    EXPECT_FALSE(outcome.cancelled);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+TEST_F(ExecSpawnTest, CancelKillsAsUserChildAndSetsCancelled)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    taz_exec_cancel(x);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.cancelled);
+    EXPECT_FALSE(outcome.timed_out);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+TEST_F(ExecSpawnTest, TimeoutKillsAsUserGrandchildToo)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string system_root = OwnEnvVarUtf8(L"SystemRoot");
+    ASSERT_FALSE(system_root.empty());
+    const std::string cmd_exe = system_root + "\\System32\\cmd.exe";
+
+    // cmd.exe waits for its own child before it exits, so if on_done fires
+    // quickly rather than after the sleeper's full 60 s, the job took the
+    // whole tree down together - cmd.exe and the sleeper it spawned - not
+    // just the immediate child.
+    const char *const args[] = {"/c", TAZ_TEST_SLEEPER_PATH};
+    taz_exec_spec_t spec{};
+    spec.file = cmd_exe.c_str();
+    spec.args = args;
+    spec.args_count = std::size(args);
+    spec.max_output_bytes = 1024;
+    spec.timeout_ms = 300;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.timed_out);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+// --- table S8: output cap on the as-user path ---------------------------
+
+TEST_F(ExecSpawnTest, OutputCapTruncatesButAsUserChildIsStillReaped)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 5;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.truncated);
+    EXPECT_LE(outcome.out.size() + outcome.err.size(), 5U);
+}
+
+// --- table S12: handle-count leak oracle for the as-user path -----------
+//
+// GetProcessHandleCount covers every kind of handle this path opens (token,
+// profile, process, wait registration, pipe ends) - ASan does not catch any
+// of them. Each spawn below duplicates a fresh token of its own, the way a
+// real caller gets a fresh logon or duplicate per spawn, rather than
+// reusing one handle across the whole batch.
+
+TEST_F(ExecSpawnTest, HandleCountIsStableAcrossAsUserSpawnBatches)
+{
+    std::string reason;
+    {
+        ScopedHandle probe = OwnPrimaryToken(&reason);
+        if (!probe.valid())
+        {
+            GTEST_SKIP() << reason;
+        }
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    const char *const gtest_args[] = {"--gtest_filter=NoSuchSuite.*"};
+
+    auto spawn_ok = [&](const char *file, uint32_t timeout_ms)
+    {
+        std::string local_reason;
+        ScopedHandle token = OwnPrimaryToken(&local_reason);
+        ASSERT_TRUE(token.valid()) << local_reason;
+
+        taz_v1_KeyValue env[1];
+        taz_exec_spec_t spec{};
+        spec.file = file;
+        spec.args = gtest_args;
+        spec.args_count = 1;
+        spec.max_output_bytes = 1U << 16;
+        spec.token = token.release();
+        spec.timeout_ms = timeout_ms;
+        (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user),
+                            "%s", username.c_str());
+        if (!asan_dir.empty())
+        {
+            (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+            (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                                asan_dir.c_str());
+            spec.env = env;
+            spec.env_count = 1;
+        }
+
+        ExecOutcome outcome;
+        taz_exec_t *x = nullptr;
+        ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x),
+                  0);
+        ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+        EXPECT_TRUE(outcome.called);
+    };
+
+    auto spawn_fails = [&]()
+    {
+        std::string local_reason;
+        ScopedHandle token = OwnPrimaryToken(&local_reason);
+        ASSERT_TRUE(token.valid()) << local_reason;
+        const std::string missing = Exe() + "-taz-test-does-not-exist";
+
+        taz_exec_spec_t spec{};
+        spec.file = missing.c_str();
+        spec.max_output_bytes = 1024;
+        spec.token = token.release();
+        (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user),
+                            "%s", username.c_str());
+
+        ExecOutcome outcome;
+        taz_exec_t *x = nullptr;
+        EXPECT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x),
+                  UV_ENOENT);
+        EXPECT_FALSE(outcome.called);
+        ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    };
+
+    // Warm-up: the first-ever LoadUserProfileW/DuplicateTokenEx/module-load
+    // path in this process can allocate one-time state, so the baseline is
+    // measured only once that has already happened once.
+    spawn_ok(Exe().c_str(), 0U);
+
+    DWORD baseline = 0;
+    ASSERT_TRUE(GetProcessHandleCount(GetCurrentProcess(), &baseline));
+
+    for (int i = 0; i < 10; i++)
+    {
+        spawn_ok(Exe().c_str(), 0U);
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        spawn_fails();
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        spawn_ok(TAZ_TEST_SLEEPER_PATH, 300U);
+    }
+
+    DWORD after = 0;
+    ASSERT_TRUE(GetProcessHandleCount(GetCurrentProcess(), &after));
+    EXPECT_EQ(after, baseline);
+}
 #else
 TEST_F(ExecSpawnTest, NonNullTokenReturnsNotSupported)
 {
@@ -1342,6 +1597,46 @@ TEST_F(ExecSpawnTest, OnExitHookFiresBeforeOnDoneWhenGrandchildHoldsStdout)
     ASSERT_EQ(probe.order.size(), 2U);
     EXPECT_EQ(probe.order[0], "on_exit");
     EXPECT_EQ(probe.order[1], "on_done");
+    EXPECT_EQ(probe.pid, pid);
+    EXPECT_GT(probe.start_time, 0U);
+}
+#else
+// taz_test_grandchild compiles as a no-op on Windows (see grandchild.c), so
+// the ordering half of the POSIX row above cannot be reproduced here; this
+// row instead proves the hook itself works on the as-user path: it fires
+// once, with the real pid and a non-zero start key.
+TEST_F(ExecSpawnTest, OnExitHookFiresWithRealPidAndStartKeyOnAsUserPath)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1U << 20;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    OnExitOrderProbe probe;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+    taz_exec_set_on_exit(x, record_on_exit_order, &probe);
+    const uint32_t pid = taz_exec_pid(x);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    ASSERT_EQ(probe.on_exit_calls, 1);
     EXPECT_EQ(probe.pid, pid);
     EXPECT_GT(probe.start_time, 0U);
 }
