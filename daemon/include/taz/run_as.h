@@ -6,6 +6,7 @@
 
 #include "taz/dispatch.h"
 #include "taz/exec.h"
+#include "taz/v1/common.pb.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -77,6 +78,23 @@ extern "C"
      * user/home elsewhere don't need this to touch them. */
     void taz_run_as_identity_close(taz_run_as_identity_t *id);
 
+    /* Resolves a non-empty RUN_AS/as_user name into *out: POSIX looks it up
+     * in taz_run_as_passwd_path() (NOT_FOUND on a miss; message left ""
+     * either way, so the two existing callers keep their own literal
+     * message); Windows runs an S4U logon (taz_run_as_win32_logon, table
+     * L) and fills message with the real LSA/Win32 failure text on
+     * failure. On success returns 0, out->user holds the sanitized name,
+     * and (Windows only) out->token is a primary HANDLE the caller owns
+     * (close with taz_run_as_identity_close/taz_run_as_token_close). On
+     * failure returns -1, *out is untouched, *code is a defined
+     * taz_v1_ErrorCode. Safe to call from a thread-pool thread: touches
+     * only the global passwd path / the win32 module's own LSA calls,
+     * never a taz_dispatch_t. name, out, code and message must not be
+     * NULL; message_size must be at least 1. */
+    int taz_run_as_resolve(const char *name, taz_run_as_identity_t *out,
+                           taz_v1_ErrorCode *code, char *message,
+                           size_t message_size);
+
     /* Duplicates a Windows primary token for a single spawn, so closing the
      * connection's own token later (taz_run_as_reset) can never pull it out
      * from under an in-flight child. Returns the duplicate, or NULL on
@@ -98,21 +116,25 @@ extern "C"
     void taz_run_as_reset(taz_dispatch_t *d);
 
     /* True when this process can switch a spawned child's identity: POSIX
-     * effective uid 0; Windows the cached privilege probe (still a
-     * constant 0 here - the real check lands later). The test seam below
-     * forces either answer on both platforms. run_as.c is the only place
-     * in this codebase allowed to call geteuid(). */
+     * effective uid 0; Windows the cached privilege probe
+     * (taz_run_as_win32_privileged - SeTcbPrivilege and friends, table
+     * P1). The test seam below forces either answer on both platforms.
+     * run_as.c is the only place in this codebase allowed to call
+     * geteuid(). */
     int taz_run_as_privileged(void);
 
     /* The /etc/passwd-style file RUN_AS resolves usernames against.
-     * Defaults to TAZ_PASSWD_PATH on POSIX; on Windows taz_run_as_privileged
-     * is always false, so nothing ever reads this path there. */
+     * Defaults to TAZ_PASSWD_PATH on POSIX; on Windows RUN_AS resolves
+     * through an S4U logon instead (table P6), so nothing ever reads this
+     * path there. */
     const char *taz_run_as_passwd_path(void);
 
-    /* Copy the daemon's own user name (its effective uid, resolved through
-     * taz_run_as_passwd_path(), or the decimal uid when no line matches)
-     * into buf, NUL-terminated. What RUN_AS reports after a reset. Always
-     * "" on Windows, where RUN_AS is deferred. */
+    /* Copy the daemon's own user name into buf, NUL-terminated. What
+     * RUN_AS reports after a reset. POSIX: the effective uid resolved
+     * through taz_run_as_passwd_path(), or the decimal uid when no line
+     * matches. Windows: the process token's own account,
+     * "DOMAIN\\name" (table P5; taz_run_as_win32_daemon_user), "" only if
+     * that lookup fails. */
     void taz_run_as_daemon_user(char *buf, size_t bufsize);
 
     /* Test-only override for taz_run_as_privileged()'s answer on either
