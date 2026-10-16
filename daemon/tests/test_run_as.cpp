@@ -281,7 +281,10 @@ TEST_F(RunAsHandlerTest, PrivilegedNamedUserStoresIdentityAndRespondsSuccess)
     EXPECT_EQ(Dispatch().run_as_token, nullptr);
 #else
     ASSERT_NE(Dispatch().run_as_token, nullptr);
-    TOKEN_TYPE token_type{};
+    // TOKEN_TYPE has no zero-value enumerator, so a brace-initialized
+    // default trips clang-tidy; seed it with the value GetTokenInformation
+    // below must overwrite.
+    TOKEN_TYPE token_type = TokenImpersonation;
     DWORD returned_len = 0;
     EXPECT_TRUE(GetTokenInformation(
         static_cast<HANDLE>(Dispatch().run_as_token), TokenType, &token_type,
