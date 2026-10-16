@@ -9,6 +9,7 @@
 #ifdef _WIN32
 
 #include <cstring>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -290,6 +291,12 @@ TEST(RunAsWin32Logon, UnresolvableDomainReturnsDefinedErrorAndDoesNotCrash)
     const int rc = taz_run_as_win32_logon("NODOMAIN\\x", &token, &code, message,
                                           sizeof(message));
 
+    // Unconditional, not just on failure: progress.md records the exact
+    // status this KDC-less host returns (table L11), and the message
+    // text (table L9) always carries it as "0x%08lX".
+    std::cerr << "UnresolvableDomainReturnsDefinedErrorAndDoesNotCrash: "
+              << message << std::endl;
+
     EXPECT_EQ(rc, -1);
     EXPECT_EQ(token, nullptr);
     EXPECT_TRUE((code == taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND) ||
@@ -309,6 +316,9 @@ TEST(RunAsWin32Logon, OwnAccountWithoutSeTcbIsPermissionDenied)
 
     const int rc = taz_run_as_win32_logon(input.c_str(), &token, &code, message,
                                           sizeof(message));
+
+    std::cerr << "OwnAccountWithoutSeTcbIsPermissionDenied: " << message
+              << std::endl;
 
     EXPECT_EQ(rc, -1);
     EXPECT_EQ(token, nullptr);
