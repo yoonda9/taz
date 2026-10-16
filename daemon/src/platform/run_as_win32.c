@@ -19,6 +19,14 @@
 #include "taz/fsutil.h"
 #include "taz/run_as.h"
 
+/* UNICODE_STRING's Length/MaximumLength are USHORT byte counts. */
+#define TAZ_RUN_AS_WIN32_UNICODE_STRING_MAX_BYTES 0xFFFFU
+
+/* Scratch size for one FormatMessageW result after CR/LF stripping and
+ * UTF-8 conversion - comfortably more than any system message text, and
+ * still small next to the 256-byte ErrorInfo.message it feeds into. */
+#define TAZ_RUN_AS_WIN32_WIN32_TEXT_MAX 200U
+
 /* -1 until the first probe; 0/1 afterward (table P1: "cached"). */
 static int g_privileged_cached = -1;
 
@@ -158,7 +166,8 @@ size_t taz_run_as_win32_msv_s4u_layout(const wchar_t *user,
     unsigned char *user_ptr;
     unsigned char *domain_ptr;
 
-    if ((user_bytes > 0xFFFFU) || (domain_bytes > 0xFFFFU))
+    if ((user_bytes > TAZ_RUN_AS_WIN32_UNICODE_STRING_MAX_BYTES) ||
+        (domain_bytes > TAZ_RUN_AS_WIN32_UNICODE_STRING_MAX_BYTES))
     {
         return 0U;
     }
@@ -174,12 +183,16 @@ size_t taz_run_as_win32_msv_s4u_layout(const wchar_t *user,
     msg->Flags = 0UL;
 
     user_ptr = base + header;
+    /* A UNICODE_STRING is not NUL-terminated by convention - its Length
+     * field is authoritative - so this is not a string copy needing one. */
+    // NOLINTNEXTLINE(bugprone-not-null-terminated-result)
     memcpy(user_ptr, user, user_bytes);
     msg->UserPrincipalName.Buffer = (PWSTR)user_ptr;
     msg->UserPrincipalName.Length = (USHORT)user_bytes;
     msg->UserPrincipalName.MaximumLength = (USHORT)user_bytes;
 
     domain_ptr = user_ptr + user_bytes;
+    // NOLINTNEXTLINE(bugprone-not-null-terminated-result)
     memcpy(domain_ptr, domain, domain_bytes);
     msg->DomainName.Buffer = (PWSTR)domain_ptr;
     msg->DomainName.Length = (USHORT)domain_bytes;
@@ -198,7 +211,7 @@ size_t taz_run_as_win32_kerb_s4u_layout(const wchar_t *upn, void *buf,
     KERB_S4U_LOGON *msg;
     unsigned char *upn_ptr;
 
-    if (upn_bytes > 0xFFFFU)
+    if (upn_bytes > TAZ_RUN_AS_WIN32_UNICODE_STRING_MAX_BYTES)
     {
         return 0U;
     }
@@ -214,6 +227,8 @@ size_t taz_run_as_win32_kerb_s4u_layout(const wchar_t *upn, void *buf,
     msg->Flags = 0UL;
 
     upn_ptr = base + header;
+    /* Not NUL-terminated by design - see the MSV1_0_S4U_LOGON copy above. */
+    // NOLINTNEXTLINE(bugprone-not-null-terminated-result)
     memcpy(upn_ptr, upn, upn_bytes);
     msg->ClientUpn.Buffer = (PWSTR)upn_ptr;
     msg->ClientUpn.Length = (USHORT)upn_bytes;
@@ -320,7 +335,7 @@ static void format_win32_text(unsigned long win32_error, char *out,
 static void format_api_message(const char *api, unsigned long win32_error,
                                char *message, size_t message_size)
 {
-    char text[200];
+    char text[TAZ_RUN_AS_WIN32_WIN32_TEXT_MAX];
 
     if ((message == NULL) || (message_size == 0U))
     {
@@ -336,7 +351,7 @@ static void format_api_message(const char *api, unsigned long win32_error,
 static void format_lsa_message(const char *package, unsigned long ntstatus,
                                char *message, size_t message_size)
 {
-    char text[200];
+    char text[TAZ_RUN_AS_WIN32_WIN32_TEXT_MAX];
 
     if ((message == NULL) || (message_size == 0U))
     {
@@ -396,7 +411,7 @@ static int utf8_to_wide_fixed(const char *utf8, WCHAR *out, size_t out_count)
 static int real_logon(const char *name, void **token, taz_v1_ErrorCode *code,
                       char *message, size_t message_size)
 {
-    char computer[TAZ_EXEC_USER_MAX];
+    char computer_name[TAZ_EXEC_USER_MAX];
     taz_run_as_name_t parsed;
     unsigned char submit_buf[1024];
     size_t submit_len;
@@ -420,9 +435,9 @@ static int real_logon(const char *name, void **token, taz_v1_ErrorCode *code,
     TOKEN_TYPE token_type = TokenPrimary;
     DWORD type_len = (DWORD)sizeof(token_type);
 
-    get_computer_name_utf8(computer, sizeof(computer));
+    get_computer_name_utf8(computer_name, sizeof(computer_name));
 
-    if (taz_run_as_parse_name(name, computer, &parsed) != 0)
+    if (taz_run_as_parse_name(name, computer_name, &parsed) != 0)
     {
         *code = taz_v1_ErrorCode_ERROR_CODE_INVALID_REQUEST;
         set_message(message, message_size, "invalid user name");

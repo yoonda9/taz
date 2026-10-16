@@ -37,7 +37,7 @@ namespace
 bool TokenHasPrivilege(HANDLE token, LPCWSTR name)
 {
     LUID luid;
-    if (!LookupPrivilegeValueW(nullptr, name, &luid))
+    if (LookupPrivilegeValueW(nullptr, name, &luid) == 0)
     {
         return false;
     }
@@ -49,7 +49,8 @@ bool TokenHasPrivilege(HANDLE token, LPCWSTR name)
         return false;
     }
     std::vector<unsigned char> buf(size);
-    if (!GetTokenInformation(token, TokenPrivileges, buf.data(), size, &size))
+    if (GetTokenInformation(token, TokenPrivileges, buf.data(), size, &size) ==
+        0)
     {
         return false;
     }
@@ -70,7 +71,7 @@ std::string CurrentUserNameUtf8()
 {
     WCHAR wide[256];
     DWORD len = static_cast<DWORD>(sizeof(wide) / sizeof(wide[0]));
-    if (!GetUserNameW(wide, &len))
+    if (GetUserNameW(wide, &len) == 0)
     {
         return "";
     }
