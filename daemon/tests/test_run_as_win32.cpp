@@ -295,7 +295,7 @@ TEST(RunAsWin32Logon, UnresolvableDomainReturnsDefinedErrorAndDoesNotCrash)
     // status this KDC-less host returns (table L11), and the message
     // text (table L9) always carries it as "0x%08lX".
     std::cerr << "UnresolvableDomainReturnsDefinedErrorAndDoesNotCrash: "
-              << message << std::endl;
+              << message << "\n";
 
     EXPECT_EQ(rc, -1);
     EXPECT_EQ(token, nullptr);
@@ -318,7 +318,7 @@ TEST(RunAsWin32Logon, OwnAccountWithoutSeTcbIsPermissionDenied)
                                           sizeof(message));
 
     std::cerr << "OwnAccountWithoutSeTcbIsPermissionDenied: " << message
-              << std::endl;
+              << "\n";
 
     EXPECT_EQ(rc, -1);
     EXPECT_EQ(token, nullptr);
