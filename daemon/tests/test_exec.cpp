@@ -1034,7 +1034,7 @@ TEST_F(ExecSpawnTest, TimeoutKillsAsUserChildAndSetsTimedOut)
     ASSERT_FALSE(username.empty());
     // taz_test_sleeper.exe is built with the same flags as this binary, so
     // under windows-asan it needs the ASan runtime DLL's directory on its
-    // PATH too (see OwnTokenSpawnSucceedsAndMarksAsUser/DEC-011) - without
+    // PATH too (see OwnTokenSpawnSucceedsAndMarksAsUser) - without
     // it the child dies at once with STATUS_DLL_NOT_FOUND, which finishes
     // (and so un-arms the timer) long before timeout_ms ever elapses.
     const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
