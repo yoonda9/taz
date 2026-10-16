@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <iterator>
 #include <string>
 #include <thread>
@@ -1310,6 +1311,10 @@ TEST_F(ExecSpawnTest, HandleCountIsStableAcrossAsUserSpawnBatches)
 
     DWORD after = 0;
     ASSERT_TRUE(GetProcessHandleCount(GetCurrentProcess(), &after));
+    // Printed unconditionally (not only on failure) so a win-gate run always
+    // leaves the actual counts in the log for the task's evidence trail.
+    std::cerr << "HandleCountIsStableAcrossAsUserSpawnBatches: baseline="
+              << baseline << " after=" << after << '\n';
     EXPECT_EQ(after, baseline);
 }
 #else
@@ -1614,7 +1619,6 @@ void record_on_exit_order(uint32_t pid, uint64_t start_time,
     probe->order.emplace_back("on_exit");
 }
 
-#ifndef _WIN32
 void record_on_done_order(const taz_exec_result_t *result, void *arg)
 {
     (void)result;
@@ -1623,6 +1627,7 @@ void record_on_done_order(const taz_exec_result_t *result, void *arg)
     probe->order.emplace_back("on_done");
 }
 
+#ifndef _WIN32
 TEST_F(ExecSpawnTest, OnExitHookFiresBeforeOnDoneWhenGrandchildHoldsStdout)
 {
     taz_exec_spec_t spec{};
@@ -1681,17 +1686,19 @@ TEST_F(ExecSpawnTest, OnExitHookFiresWithRealPidAndStartKeyOnAsUserPath)
         spec.env_count = 1;
     }
 
-    ExecOutcome outcome;
     OnExitOrderProbe probe;
     taz_exec_t *x = nullptr;
-    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_on_done_order, &probe, &x),
+              0);
     taz_exec_set_on_exit(x, record_on_exit_order, &probe);
     const uint32_t pid = taz_exec_pid(x);
 
     ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
-    EXPECT_TRUE(outcome.called);
     ASSERT_EQ(probe.on_exit_calls, 1);
+    ASSERT_EQ(probe.order.size(), 2U);
+    EXPECT_EQ(probe.order[0], "on_exit");
+    EXPECT_EQ(probe.order[1], "on_done");
     EXPECT_EQ(probe.pid, pid);
     EXPECT_GT(probe.start_time, 0U);
 }
