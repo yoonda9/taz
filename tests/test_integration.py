@@ -1019,6 +1019,11 @@ class TestRunAsSystem:
         target_user = _test_user()
         proc = psutil.Process(daemon.pid)
 
+        # The first few RUN_AS logons grow the daemon's worker pool and the
+        # LSA client state once; warm them up so the baseline is steady.
+        for _ in range(6):
+            with TazClient("127.0.0.1", daemon.port) as warm:
+                assert warm.run_as(target_user) == target_user
         assert taz_client.run_as(target_user) == target_user
         taz_client.command.exec(_WHOAMI)
         taz_client.command.exec(_WHOAMI)
@@ -1072,7 +1077,12 @@ class TestRunAsSystem:
             return  # unreachable at runtime; gives mypy the platform narrowing
         target_user = _test_user()
         proc = psutil.Process(daemon.pid)
-        time.sleep(0.2)
+        # The first few RUN_AS logons grow the daemon's worker pool and the
+        # LSA client state once; warm them up so the baseline is steady.
+        for _ in range(6):
+            with TazClient("127.0.0.1", daemon.port) as warm:
+                assert warm.run_as(target_user) == target_user
+        time.sleep(0.5)
         baseline = proc.num_handles()
 
         with TazClient("127.0.0.1", daemon.port) as other:
