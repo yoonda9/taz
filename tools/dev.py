@@ -43,6 +43,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -921,14 +922,14 @@ def system_lane_wrapper(
     tmp = out_dir / "tmp"
     lines = ["@echo off", f'cd /d "{root}"']
     if ci:
-        lines.append("set CI=1")
+        lines.append('set "CI=1"')
     lines += [
-        f"set TAZ_DAEMON={daemon}",
-        f"set TAZ_TEST_USER={user}",
-        f"set TEMP={tmp}",
-        f"set TMP={tmp}",
-        "set PYTHONUNBUFFERED=1",
-        "set PYTHONDONTWRITEBYTECODE=1",
+        f'set "TAZ_DAEMON={daemon}"',
+        f'set "TAZ_TEST_USER={user}"',
+        f'set "TEMP={tmp}"',
+        f'set "TMP={tmp}"',
+        'set "PYTHONUNBUFFERED=1"',
+        'set "PYTHONDONTWRITEBYTECODE=1"',
     ]
     pytest = subprocess.list2cmdline(
         [
@@ -961,6 +962,31 @@ def skipped_rows(junit_xml: str) -> list[str]:
         for case in root.iter("testcase")
         if case.find("skipped") is not None
     ]
+
+
+def task_status(query_output: str) -> str | None:
+    """Status column of `schtasks /Query /FO CSV /NH`, or None if unparseable."""
+    for row in csv.reader(query_output.splitlines()):
+        if len(row) >= 3:
+            return row[2].strip()
+    return None
+
+
+# Seconds a started task may sit outside "Running" with no exit.txt before the
+# lane gives up (covers the Ready -> Running gap right after /Run).
+SYSTEM_LANE_START_GRACE = 20
+
+
+def read_lane_exit(exit_file: Path, wait: float = 10.0) -> int:
+    """exit.txt can be seen empty or locked while cmd writes it; retry briefly."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            return int(exit_file.read_text().strip())
+        except (OSError, ValueError):
+            if time.monotonic() > deadline:
+                sys.exit(f"error: cannot read a SYSTEM lane exit code from {exit_file}")
+            time.sleep(0.2)
 
 
 def _schtasks(*args: str) -> subprocess.CompletedProcess[str]:
@@ -1050,17 +1076,31 @@ def cmd_test_py_system(
             sys.exit(f"error: schtasks /Run failed: {started.stderr.strip()}")
         print(f"SYSTEM lane running ({SYSTEM_LANE_TASK}); log: {log}", flush=True)
         deadline = time.monotonic() + timeout
+        idle_since: float | None = None
         while not exit_file.exists():
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 _schtasks("/End", "/TN", SYSTEM_LANE_TASK)
                 print_lane_log(log)
                 sys.exit(f"error: SYSTEM lane timed out after {timeout}s")
+            queried = _schtasks("/Query", "/TN", SYSTEM_LANE_TASK, "/FO", "CSV", "/NH")
+            if task_status(queried.stdout) == "Running":
+                idle_since = None
+            elif exit_file.exists():
+                break
+            elif idle_since is None:
+                idle_since = now
+            elif now - idle_since > SYSTEM_LANE_START_GRACE:
+                print_lane_log(log)
+                sys.exit(
+                    "error: SYSTEM lane task is not running and wrote no exit code"
+                )
             time.sleep(2)
     finally:
         _schtasks("/Delete", "/TN", SYSTEM_LANE_TASK, "/F")
 
     print_lane_log(log)
-    exit_code = int(exit_file.read_text().strip() or "1")
+    exit_code = read_lane_exit(exit_file)
     junit = out_dir / "junit.xml"
     skipped = skipped_rows(junit.read_text(encoding="utf-8")) if junit.exists() else []
     if skipped:

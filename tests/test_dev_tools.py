@@ -871,11 +871,11 @@ def test_system_lane_wrapper_sets_the_environment_and_writes_exit_last() -> None
     text = _wrapper(ci=False, args=("-k", "run as"))
     lines = text.split("\r\n")
     assert lines[0] == "@echo off"
-    assert "set CI=1" not in lines
-    assert "set TAZ_TEST_USER=taz-runas" in lines
-    assert "set TAZ_DAEMON=C:\\taz\\daemon\\build\\windows-debug\\tazd.exe" in lines
-    assert "set TEMP=C:\\taz\\out\\test-py-system\\tmp" in lines
-    assert "set PYTHONDONTWRITEBYTECODE=1" in lines
+    assert 'set "CI=1"' not in lines
+    assert 'set "TAZ_TEST_USER=taz-runas"' in lines
+    assert 'set "TAZ_DAEMON=C:\\taz\\daemon\\build\\windows-debug\\tazd.exe"' in lines
+    assert 'set "TEMP=C:\\taz\\out\\test-py-system\\tmp"' in lines
+    assert 'set "PYTHONDONTWRITEBYTECODE=1"' in lines
     pytest_line = next(line for line in lines if "-m pytest" in line)
     assert pytest_line.startswith(
         r"C:\taz\.venv\Scripts\python.exe -m pytest -m system"
@@ -885,8 +885,37 @@ def test_system_lane_wrapper_sets_the_environment_and_writes_exit_last() -> None
     assert lines[-2] == r'echo %ERRORLEVEL% > "C:\taz\out\test-py-system\exit.txt"'
 
 
+def test_system_lane_wrapper_quotes_set_values() -> None:
+    text = dev.system_lane_wrapper(
+        root=PureWindowsPath("C:/a&b"),
+        python=PureWindowsPath("C:/py/python.exe"),
+        daemon=PureWindowsPath("C:/a&b/^t/tazd.exe"),
+        out_dir=PureWindowsPath("C:/out"),
+        user="u",
+        pytest_args=(),
+        ci=False,
+    )
+    assert 'set "TAZ_DAEMON=C:\\a&b\\^t\\tazd.exe"' in text.split("\r\n")
+
+
+def test_task_status_parses_the_csv_row() -> None:
+    assert dev.task_status('"\\t","N/A","Running"\r\n') == "Running"
+    assert dev.task_status('"\\t","10/17/2026 12:00:00 AM","Ready"') == "Ready"
+    assert dev.task_status("ERROR: The system cannot find the file.") is None
+    assert dev.task_status("") is None
+
+
+def test_read_lane_exit_retries_until_it_parses(tmp_path: Path) -> None:
+    f = tmp_path / "exit.txt"
+    f.write_text("")
+    with pytest.raises(SystemExit):
+        dev.read_lane_exit(f, wait=0.3)
+    f.write_text("3 \r\n")
+    assert dev.read_lane_exit(f) == 3
+
+
 def test_system_lane_wrapper_forwards_ci() -> None:
-    assert "set CI=1" in _wrapper(ci=True).split("\r\n")
+    assert 'set "CI=1"' in _wrapper(ci=True).split("\r\n")
 
 
 JUNIT_NO_SKIPS = (
