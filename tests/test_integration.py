@@ -765,6 +765,7 @@ class TestRunAs:
             taz_client.run_as("definitely-no-such-user")
         assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
 
+    @pytest.mark.system
     def test_demo_timeout_run_as_and_log(self, taz_client: TazClient) -> None:
         taz_client.timeout(5000)
         if sys.platform != "win32" and os.geteuid() == 0:
@@ -905,21 +906,29 @@ class TestRunAsSystem:
         target_user = _test_user()
         try:
             assert taz_client.run_as(target_user) == target_user
+            result = taz_client.command.exec(_WHOAMI)
+            assert (
+                result.stdout.decode()
+                .strip()
+                .lower()
+                .endswith(f"\\{target_user.lower()}")
+            )
+
             result = taz_client.command.exec(_CMD, args=["/c", "set"])
             text = result.stdout.decode()
-            assert f"USERNAME={target_user}" in text
+            assert re.search(rf"(?im)^USERNAME={re.escape(target_user)}\r?$", text)
             assert re.search(
                 rf"(?im)^USERPROFILE=C:\\Users\\{re.escape(target_user)}", text
             )
-            assert "USER=" not in text
-            assert "LOGNAME=" not in text
+            assert re.search(r"(?im)^USER=", text) is None
+            assert re.search(r"(?im)^LOGNAME=", text) is None
 
             result = taz_client.command.exec(
                 _CMD, args=["/c", "set"], env={"USERPROFILE": r"C:\custom"}
             )
             text = result.stdout.decode()
-            assert "USERPROFILE=C:\\custom" in text
-            assert f"USERNAME={target_user}" in text
+            assert re.search(r"(?im)^USERPROFILE=C:\\custom\r?$", text)
+            assert re.search(rf"(?im)^USERNAME={re.escape(target_user)}\r?$", text)
         finally:
             taz_client.run_as("")
 
