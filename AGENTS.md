@@ -89,6 +89,10 @@ TAZ layer.
 - `just test-sanitizers` — ASan+UBSan, TSan (Linux); ASan (Windows)
 - `just test-valgrind` — Valgrind memcheck
 - `just test-py-valgrind` — the marked Valgrind integration subset (Linux only)
+- `just test-py-system` — Windows only: the RUN_AS integration rows (`-m system`)
+  with pytest running as SYSTEM through a one-shot scheduled task; creates the
+  local account `taz-runas` (random password, never stored) and leaves it in
+  place; a privileged row that skips fails the lane under `CI=1`
 - `just analyze` — compiler static analyzer (GCC -fanalyzer / MSVC /analyze)
 - `just coverage` — gcov + pytest-cov, reports under `out/coverage/`
 - `just test-c linux-musl-release` — the C unit tests built against musl

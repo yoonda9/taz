@@ -24,6 +24,8 @@ Subcommands:
     proto-breaking       buf breaking against main (skips if main has no schemas)
     valgrind --build-dir DIR   run the C unit tests under Valgrind memcheck
     valgrind-py --daemon PATH   run the marked Valgrind integration subset (pytest)
+    test-py-system [--daemon PATH] [--timeout S] [PYTEST ARGS...]   Windows: run the
+                         RUN_AS rows with pytest as SYSTEM (one-shot scheduled task)
     coverage --build-dir DIR   gcovr report for a coverage-instrumented build
     doctor               report tools mise cannot provide / missing pinned tools
     clean                remove daemon build directories
@@ -46,17 +48,20 @@ import json
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 import urllib.request
+import xml.etree.ElementTree as ElementTree
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -869,6 +874,209 @@ def cmd_valgrind_py(daemon: Path) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# SYSTEM test lane (Windows): pytest as SYSTEM through a one-shot scheduled task
+# ---------------------------------------------------------------------------
+SYSTEM_LANE_TASK = "taz-test-py-system"
+SYSTEM_LANE_USER = "taz-runas"
+SYSTEM_LANE_DIR = ROOT / "out" / "test-py-system"
+_PASSWORD_CLASSES = (
+    "abcdefghijklmnopqrstuvwxyz",
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "0123456789",
+    "!#$%&()*+,-./:;<=>?@[]^_{|}~",
+)
+
+
+def random_password(length: int = 24) -> str:
+    """A password with every character class, so any complexity policy accepts it."""
+    pool = "".join(_PASSWORD_CLASSES)
+    chars = [secrets.choice(c) for c in _PASSWORD_CLASSES]
+    chars += [secrets.choice(pool) for _ in range(length - len(chars))]
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
+def net_user_state(returncode: int, output: str) -> str:
+    """Classify `net user NAME` as 'exists', 'inactive' or 'missing'."""
+    if returncode != 0:
+        return "missing"
+    for line in output.splitlines():
+        if line.lower().startswith("account active"):
+            return "inactive" if line.split()[-1].lower() == "no" else "exists"
+    return "exists"
+
+
+def system_lane_wrapper(
+    *,
+    root: PurePath,
+    python: PurePath,
+    daemon: PurePath,
+    out_dir: PurePath,
+    user: str,
+    pytest_args: Sequence[str],
+    ci: bool,
+) -> str:
+    """The batch file the scheduled task runs; `exit.txt` is written last."""
+    tmp = out_dir / "tmp"
+    lines = ["@echo off", f'cd /d "{root}"']
+    if ci:
+        lines.append("set CI=1")
+    lines += [
+        f"set TAZ_DAEMON={daemon}",
+        f"set TAZ_TEST_USER={user}",
+        f"set TEMP={tmp}",
+        f"set TMP={tmp}",
+        "set PYTHONUNBUFFERED=1",
+        "set PYTHONDONTWRITEBYTECODE=1",
+    ]
+    pytest = subprocess.list2cmdline(
+        [
+            str(python),
+            "-m",
+            "pytest",
+            "-m",
+            "system",
+            "-rA",
+            "-p",
+            "no:cacheprovider",
+            f"--basetemp={tmp / 'pytest'}",
+            f"--junit-xml={out_dir / 'junit.xml'}",
+            "tests\\test_integration.py",
+            *pytest_args,
+        ]
+    )
+    lines += [
+        f'{pytest} > "{out_dir / "log.txt"}" 2>&1',
+        f'echo %ERRORLEVEL% > "{out_dir / "exit.txt"}"',
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def skipped_rows(junit_xml: str) -> list[str]:
+    """Names of the test cases a junit report marks skipped (any suite nesting)."""
+    root = ElementTree.fromstring(junit_xml)  # noqa: S314 - our own pytest output
+    return [
+        f"{case.get('classname', '')}::{case.get('name', '')}"
+        for case in root.iter("testcase")
+        if case.find("skipped") is not None
+    ]
+
+
+def _schtasks(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["schtasks", *args], capture_output=True, text=True, check=False
+    )
+
+
+def _ensure_system_lane_user() -> None:
+    probe = subprocess.run(
+        ["net", "user", SYSTEM_LANE_USER], capture_output=True, text=True, check=False
+    )
+    state = net_user_state(probe.returncode, probe.stdout)
+    if state == "inactive":
+        run(["net", "user", SYSTEM_LANE_USER, "/active:yes"])
+    if state != "missing":
+        return
+    # The password reaches `net user *` on stdin only: never argv, never logged.
+    password = random_password()
+    print(f"$ net user {SYSTEM_LANE_USER} * /add /y", flush=True)
+    created = subprocess.run(
+        ["net", "user", SYSTEM_LANE_USER, "*", "/add", "/y"],
+        input=f"{password}\n{password}\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        sys.exit(f"error: cannot create {SYSTEM_LANE_USER}: {created.stdout.strip()}")
+    run(["net", "user", SYSTEM_LANE_USER, "/passwordchg:no"])
+    run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            f"Set-LocalUser -Name {SYSTEM_LANE_USER} -PasswordNeverExpires $true",
+        ]
+    )
+
+
+def cmd_test_py_system(
+    daemon: Path | None, timeout: int, pytest_args: list[str]
+) -> None:
+    if not IS_WINDOWS:
+        print("error: test-py-system is Windows-only", file=sys.stderr)
+        sys.exit(2)
+    if daemon is None:
+        env_daemon = os.environ.get("TAZ_DAEMON")
+        daemon = Path(env_daemon) if env_daemon else daemon_binary("windows-debug")
+    daemon = daemon.resolve()
+    if not daemon.is_file():
+        sys.exit(f"error: daemon binary not found: {daemon}")
+    out_dir = SYSTEM_LANE_DIR
+    wrapper = out_dir / "run.cmd"
+    if " " in str(wrapper):
+        # schtasks /TR is a bare path (nested quotes do not survive the VM's
+        # PowerShell shell), so the checkout path cannot hold a space.
+        sys.exit(f"error: checkout path must not contain spaces: {wrapper}")
+
+    _schtasks("/Delete", "/TN", SYSTEM_LANE_TASK, "/F")
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    (out_dir / "tmp").mkdir(parents=True)
+    _ensure_system_lane_user()
+    wrapper.write_text(
+        system_lane_wrapper(
+            root=ROOT,
+            python=Path(sys.executable),
+            daemon=daemon,
+            out_dir=out_dir,
+            user=SYSTEM_LANE_USER,
+            pytest_args=pytest_args,
+            ci=IN_CI,
+        ),
+        newline="",
+    )
+    log, exit_file = out_dir / "log.txt", out_dir / "exit.txt"
+    try:
+        created = _schtasks(
+            "/Create", "/TN", SYSTEM_LANE_TASK, "/TR", str(wrapper),
+            "/SC", "ONCE", "/ST", "00:00", "/RU", "SYSTEM", "/RL", "HIGHEST", "/F",
+        )  # fmt: skip
+        if created.returncode != 0:
+            sys.exit(f"error: schtasks /Create failed: {created.stderr.strip()}")
+        started = _schtasks("/Run", "/TN", SYSTEM_LANE_TASK)
+        if started.returncode != 0:
+            sys.exit(f"error: schtasks /Run failed: {started.stderr.strip()}")
+        print(f"SYSTEM lane running ({SYSTEM_LANE_TASK}); log: {log}", flush=True)
+        deadline = time.monotonic() + timeout
+        while not exit_file.exists():
+            if time.monotonic() > deadline:
+                _schtasks("/End", "/TN", SYSTEM_LANE_TASK)
+                print_lane_log(log)
+                sys.exit(f"error: SYSTEM lane timed out after {timeout}s")
+            time.sleep(2)
+    finally:
+        _schtasks("/Delete", "/TN", SYSTEM_LANE_TASK, "/F")
+
+    print_lane_log(log)
+    exit_code = int(exit_file.read_text().strip() or "1")
+    junit = out_dir / "junit.xml"
+    skipped = skipped_rows(junit.read_text(encoding="utf-8")) if junit.exists() else []
+    if skipped:
+        listing = "\n  ".join(skipped)
+        print(f"skipped privileged rows:\n  {listing}")
+        if IN_CI:
+            sys.exit("error: privileged rows skipped under CI")
+        print("warning: privileged rows skipped")
+    sys.exit(exit_code)
+
+
+def print_lane_log(log: Path) -> None:
+    if log.exists():
+        print(log.read_text(encoding="utf-8", errors="replace"))
+
+
 def cmd_coverage(build_dir: Path) -> None:
     out = ROOT / "out" / "coverage" / "c"
     out.mkdir(parents=True, exist_ok=True)
@@ -1450,6 +1658,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--build-dir", type=Path, required=True)
     p = sub.add_parser("valgrind-py")
     p.add_argument("--daemon", type=Path, required=True)
+    p = sub.add_parser("test-py-system")
+    p.add_argument("--daemon", type=Path)
+    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("pytest_args", nargs=argparse.REMAINDER)
     p = sub.add_parser("coverage")
     p.add_argument("--build-dir", type=Path, required=True)
     p = sub.add_parser("fuzz")
@@ -1512,6 +1724,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             cmd_valgrind(args.build_dir.resolve())
         case "valgrind-py":
             cmd_valgrind_py(args.daemon.resolve())
+        case "test-py-system":
+            cmd_test_py_system(args.daemon, args.timeout, args.pytest_args)
         case "coverage":
             cmd_coverage(args.build_dir.resolve())
         case "fuzz":

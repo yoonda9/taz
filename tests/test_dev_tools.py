@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import tarfile
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import ModuleType
 from typing import Any
 
@@ -824,3 +824,100 @@ def test_third_party_notices_mentions_every_musl_toolchain() -> None:
         assert toolchain.name in notices, (
             f"{toolchain.name} missing from THIRD_PARTY_NOTICES"
         )
+
+
+# --- test-py-system (SYSTEM lane) --------------------------------------------
+
+
+def test_random_password_has_every_class_and_never_repeats() -> None:
+    passwords = {dev.random_password() for _ in range(50)}
+    assert len(passwords) == 50
+    for password in passwords:
+        assert len(password) == 24
+        assert any(c.islower() for c in password)
+        assert any(c.isupper() for c in password)
+        assert any(c.isdigit() for c in password)
+        assert any(not c.isalnum() for c in password)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "output", "state"),
+    [
+        (2, "The user name could not be found.\n", "missing"),
+        (0, "User name  taz-runas\nAccount active  Yes\n", "exists"),
+        (0, "User name  taz-runas\nAccount active  No\n", "inactive"),
+        (0, "User name  taz-runas\n", "exists"),
+    ],
+)
+def test_net_user_state(returncode: int, output: str, state: str) -> None:
+    assert dev.net_user_state(returncode, output) == state
+
+
+def _wrapper(*, ci: bool, args: tuple[str, ...] = ()) -> str:
+    return str(
+        dev.system_lane_wrapper(
+            root=PureWindowsPath(r"C:\taz"),
+            python=PureWindowsPath(r"C:\taz\.venv\Scripts\python.exe"),
+            daemon=PureWindowsPath(r"C:\taz\daemon\build\windows-debug\tazd.exe"),
+            out_dir=PureWindowsPath(r"C:\taz\out\test-py-system"),
+            user="taz-runas",
+            pytest_args=args,
+            ci=ci,
+        )
+    )
+
+
+def test_system_lane_wrapper_sets_the_environment_and_writes_exit_last() -> None:
+    text = _wrapper(ci=False, args=("-k", "run as"))
+    lines = text.split("\r\n")
+    assert lines[0] == "@echo off"
+    assert "set CI=1" not in lines
+    assert "set TAZ_TEST_USER=taz-runas" in lines
+    assert "set TAZ_DAEMON=C:\\taz\\daemon\\build\\windows-debug\\tazd.exe" in lines
+    assert "set TEMP=C:\\taz\\out\\test-py-system\\tmp" in lines
+    assert "set PYTHONDONTWRITEBYTECODE=1" in lines
+    pytest_line = next(line for line in lines if "-m pytest" in line)
+    assert pytest_line.startswith(
+        r"C:\taz\.venv\Scripts\python.exe -m pytest -m system"
+    )
+    assert '-k "run as"' in pytest_line
+    assert pytest_line.endswith(r'> "C:\taz\out\test-py-system\log.txt" 2>&1')
+    assert lines[-2] == r'echo %ERRORLEVEL% > "C:\taz\out\test-py-system\exit.txt"'
+
+
+def test_system_lane_wrapper_forwards_ci() -> None:
+    assert "set CI=1" in _wrapper(ci=True).split("\r\n")
+
+
+JUNIT_NO_SKIPS = (
+    "<testsuites><testsuite>"
+    '<testcase classname="a.B" name="t1"/>'
+    "</testsuite></testsuites>"
+)
+JUNIT_TWO_SKIPS = (
+    "<testsuites>"
+    "<testsuite>"
+    '<testcase classname="a.B" name="t1"><skipped message="x"/></testcase>'
+    "</testsuite>"
+    "<testsuite><testsuite>"
+    '<testcase classname="a.C" name="t2"><skipped/></testcase>'
+    '<testcase classname="a.C" name="t3"/>'
+    "</testsuite></testsuite>"
+    "</testsuites>"
+)
+
+
+def test_skipped_rows() -> None:
+    assert dev.skipped_rows(JUNIT_NO_SKIPS) == []
+    assert dev.skipped_rows(JUNIT_TWO_SKIPS) == ["a.B::t1", "a.C::t2"]
+    assert dev.skipped_rows(
+        "<testsuite><testcase name='x'><skipped/></testcase></testsuite>"
+    ) == ["::x"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="asserts the off-Windows refusal")
+def test_test_py_system_refuses_off_windows(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        dev.cmd_test_py_system(None, 1, [])
+    assert raised.value.code == 2
+    assert "Windows-only" in capsys.readouterr().err

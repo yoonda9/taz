@@ -125,6 +125,12 @@ test-valgrind preset=preset: (build preset)
 test-py-valgrind preset=preset: (build preset)
     {{ dev }} valgrind-py --daemon daemon/build/{{ preset }}/tazd
 
+# Run the RUN_AS integration rows with pytest as SYSTEM (creates the taz-runas
+# test account; extra args go to pytest)
+[windows]
+test-py-system *args: (build preset)
+    {{ dev }} test-py-system {{ args }}
+
 # Run each libFuzzer harness from its seed corpus for [seconds] seconds
 [unix]
 fuzz seconds="60": (build "linux-fuzz")
