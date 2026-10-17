@@ -540,14 +540,14 @@ jobs:
         env:
           TAZ_DAEMON: daemon/build/windows-debug/tazd.exe
         run: just test
-      - if: contains(matrix.checks, 'main')
-        run: just lint
       # RUN_AS needs SYSTEM: pytest runs as SYSTEM through a one-shot
       # scheduled task, against a throwaway local account the recipe creates.
       - if: contains(matrix.checks, 'main')
         env:
           TAZ_DAEMON: daemon/build/windows-debug/tazd.exe
         run: just test-py-system
+      - if: contains(matrix.checks, 'main')
+        run: just lint
 
       - if: contains(matrix.checks, 'main')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

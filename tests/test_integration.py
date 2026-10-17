@@ -1085,8 +1085,11 @@ class TestRunAsSystem:
         time.sleep(0.5)
         baseline = proc.num_handles()
 
-        with TazClient("127.0.0.1", daemon.port) as other:
-            assert other.run_as(target_user) == target_user
+        # A per-close token/profile leak is 1-2 handles; ten closes put it
+        # well past the tolerance.
+        for _ in range(10):
+            with TazClient("127.0.0.1", daemon.port) as other:
+                assert other.run_as(target_user) == target_user
 
         time.sleep(0.5)
         after = proc.num_handles()
