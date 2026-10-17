@@ -112,6 +112,8 @@ GitHub Actions (`.github/workflows/ci.yml`). One job per toolchain: Linux GCC
 (build, test, lint, ASan, TSan, Valgrind, static analysis, coverage), Linux
 Clang, Linux release (musl static `tazd`), Windows MSVC (build, test, lint),
 Windows ASan + static analysis, and Windows release (static `tazd.exe`).
+The Windows MSVC job also runs `just test-py-system`, the RUN_AS rows as
+SYSTEM (CI sets `CI=1`, so a privileged row that skips fails it).
 Every check is a `just` recipe and runs even when an earlier one fails. The
 Conan package cache is restored only on an exact key match
 (`tools/dev.py conan-cache-key`); the musl entry caches its own Conan home
