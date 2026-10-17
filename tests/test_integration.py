@@ -1046,6 +1046,7 @@ class TestRunAsSystem:
 
         time.sleep(1.0)
         after = proc.num_handles()
+        print(f"handles baseline={baseline} after={after}")
         assert after <= baseline + 2, f"baseline={baseline} after={after}"
         taz_client.run_as("")
 
@@ -1093,6 +1094,7 @@ class TestRunAsSystem:
 
         time.sleep(0.5)
         after = proc.num_handles()
+        print(f"handles baseline={baseline} after={after}")
         assert after <= baseline + 2, f"baseline={baseline} after={after}"
 
 
