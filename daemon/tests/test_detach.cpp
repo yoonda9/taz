@@ -24,6 +24,10 @@
 #include <csignal>
 
 #include <unistd.h>
+#else
+#include <windows.h>
+
+#include "win32_token_test_support.h"
 #endif
 
 #include "file_test_support.h"
@@ -736,6 +740,52 @@ TEST_F(FileHandlerTest, DetachRunsAsTheConnectionRunAsIdentity)
     EXPECT_EQ(TaskStdout(task), "taz-run-as taz-run-as /taz-home");
 }
 #endif /* !_WIN32 */
+
+#ifdef _WIN32
+// The per-spawn token duplicate, through detach.c's own wiring rather than
+// test_command.cpp's direct calls into the shared taz_command_resolve_as_user:
+// the connection identity's token reaches a real CreateProcessAsUserW spawn. No
+// second account exists yet, so this duplicates the test process's own token -
+// OwnPrimaryToken's reason covers the missing-privilege skip. Spawns
+// System32's own cmd.exe, not this (possibly ASan-instrumented) test
+// binary re-exec'd - the as-user path's own env block carries no ASan
+// runtime DLL directory, which test_exec.cpp's ExecSpawnTest rows handle
+// with a PATH override this row has no need for.
+TEST_F(FileHandlerTest, DetachRunsAsTheConnectionRunAsIdentityOnWindows)
+{
+    std::string reason;
+    ScopedHandle own_token = OwnPrimaryToken(&reason);
+    if (!own_token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+
+    char system_root[1024];
+    const DWORD system_root_len = GetEnvironmentVariableA(
+        "SystemRoot", system_root, static_cast<DWORD>(sizeof(system_root)));
+    ASSERT_GT(system_root_len, 0U);
+    const std::string cmd_exe =
+        std::string(system_root, system_root_len) + "\\System32\\cmd.exe";
+
+    Dispatch().run_as_active = 1;
+    // Ownership moves to the connection; FileHandlerTest::TearDown's
+    // taz_run_as_reset closes it, mirroring a real connection close.
+    Dispatch().run_as_token = own_token.release();
+    (void)std::snprintf(Dispatch().run_as_user, sizeof(Dispatch().run_as_user),
+                        "%s", "whoever");
+
+    const auto payload = DetachExecRequestBytes(cmd_exe, {"/c", "exit 0"});
+    DispatchRequest(taz_v1_Opcode_OPCODE_DETACH, payload, 90U);
+
+    ASSERT_EQ(Frames().size(), 1U);
+    taz_v1_DetachResponse resp = taz_v1_DetachResponse_init_zero;
+    ASSERT_TRUE(DecodeDetachResponse(Frames()[0], &resp));
+    const detached_task_t *task =
+        taz_task_find(&Dispatch().tasks, resp.task_id);
+    ASSERT_NE(task, nullptr);
+    EXPECT_EQ(task->state, taz_v1_TaskState_TASK_STATE_COMPLETED);
+}
+#endif /* _WIN32 */
 
 // taz_task_alloc only evicts a *finished* monitor=true slot; a table full
 // of still-running tasks has nothing eligible to evict, so it returns 0 and

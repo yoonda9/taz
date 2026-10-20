@@ -6,6 +6,7 @@
 // as root, and in any order.
 
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,10 @@
 
 #ifndef _WIN32
 #include <unistd.h>
+#else
+#include <windows.h>
+
+#include "win32_token_test_support.h"
 #endif
 
 #include "file_test_support.h"
@@ -44,6 +49,38 @@ class RunAsHandlerTest : public FileHandlerTest
 {
 };
 
+// Checks what taz_run_as_reset left behind once the base fixture's own
+// TearDown (file_test_support.h) has already run it.
+class RunAsResetOnTeardownTest : public RunAsHandlerTest
+{
+  protected:
+    void TearDown() override
+    {
+        RunAsHandlerTest::TearDown();
+        EXPECT_EQ(Dispatch().run_as_active, 0);
+        EXPECT_EQ(Dispatch().run_as_uid, 0U);
+        EXPECT_STREQ(Dispatch().run_as_user, "");
+        EXPECT_EQ(Dispatch().run_as_token, nullptr);
+#ifdef _WIN32
+        ASSERT_TRUE(watch_ != nullptr);
+        EXPECT_FALSE(watch_->StillOpen());
+#endif
+    }
+
+#ifdef _WIN32
+    void SetToken(HANDLE token)
+    {
+        watch_ = std::make_unique<HandleCloseWatch>(token);
+        ASSERT_TRUE(watch_->armed());
+    }
+#endif
+
+  private:
+#ifdef _WIN32
+    std::unique_ptr<HandleCloseWatch> watch_;
+#endif
+};
+
 } // namespace
 
 TEST(RunAsPrivilege, RealAnswerFollowsEffectiveUidAndSeamRestoresIt)
@@ -56,11 +93,76 @@ TEST(RunAsPrivilege, RealAnswerFollowsEffectiveUidAndSeamRestoresIt)
     EXPECT_EQ(taz_run_as_privileged(), real);
     {
         const ScopedPrivilege forced(1 - real);
-#ifndef _WIN32
         EXPECT_EQ(taz_run_as_privileged(), 1 - real);
-#endif
     }
     EXPECT_EQ(taz_run_as_privileged(), real);
+}
+
+// ---------------------------------------------------------------------------
+// taz_run_as_reset (run_as.c): closes and clears a connection's RUN_AS
+// identity, including the Windows token.
+// ---------------------------------------------------------------------------
+
+TEST(RunAsReset, ClosesTheTokenAndZeroesEveryField)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+
+    d.run_as_active = 1;
+    d.run_as_uid = 4242U;
+    d.run_as_gid = 4243U;
+    (void)snprintf(d.run_as_user, sizeof(d.run_as_user), "%s", "alice");
+    (void)snprintf(d.run_as_home, sizeof(d.run_as_home), "%s", "/home/alice");
+
+#ifdef _WIN32
+    HANDLE token = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_NE(token, nullptr);
+    const HandleCloseWatch watch(token);
+    ASSERT_TRUE(watch.armed());
+    d.run_as_token = token;
+#endif
+
+    taz_run_as_reset(&d);
+
+    EXPECT_EQ(d.run_as_active, 0);
+    EXPECT_EQ(d.run_as_uid, 0U);
+    EXPECT_EQ(d.run_as_gid, 0U);
+    EXPECT_STREQ(d.run_as_user, "");
+    EXPECT_STREQ(d.run_as_home, "");
+    EXPECT_EQ(d.run_as_token, nullptr);
+#ifdef _WIN32
+    EXPECT_FALSE(watch.StillOpen());
+#endif
+}
+
+TEST(RunAsReset, IsIdempotentAndNullSafe)
+{
+    taz_dispatch_t d;
+    taz_dispatch_init(&d);
+
+    taz_run_as_reset(&d);
+    taz_run_as_reset(&d);
+
+    EXPECT_EQ(d.run_as_active, 0);
+    EXPECT_EQ(d.run_as_token, nullptr);
+}
+
+TEST_F(RunAsResetOnTeardownTest, FixtureTeardownClosesAnOutstandingToken)
+{
+    // Seeded as a prior RUN_AS (or, once a real logon lands, as_user) would
+    // have left it; this fixture's TearDown (file_test_support.h) calls
+    // taz_run_as_reset itself now, so the identity - and the token - must
+    // not outlive the test even though nothing in the test body resets it.
+    Dispatch().run_as_active = 1;
+    Dispatch().run_as_uid = 4242U;
+    (void)snprintf(Dispatch().run_as_user, sizeof(Dispatch().run_as_user), "%s",
+                   "alice");
+#ifdef _WIN32
+    HANDLE token = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_NE(token, nullptr);
+    SetToken(token);
+    Dispatch().run_as_token = token;
+#endif
 }
 
 TEST_F(RunAsHandlerTest, OpcodeIsMarkedAsync)
@@ -131,22 +233,31 @@ TEST_F(RunAsHandlerTest, UndecodablePayloadIsInvalidRequestAndStreamReleased)
 }
 
 // ---------------------------------------------------------------------------
-// Privileged rows (fake-privilege seam): user lookup, storage on the
-// connection, reset with "", and NOT_FOUND for an unknown user.
-// taz_run_as_set_privileged_for_tests is a documented no-op on _WIN32 (RUN_AS
-// is deferred there regardless, so taz_run_as_privileged stays hard-0), so
-// these rows cannot run there - every request below would see NOT_SUPPORTED
-// instead of the privileged behaviour under test.
+// Privileged rows (fake-privilege seam): user lookup/S4U logon, storage on
+// the connection, reset with "", and NOT_FOUND for an unknown user. The
+// resolve runs inline, so no row takes a pool reference (RefCount()/
+// UnrefCount() stay 0). POSIX drives the lookup with ScopedPasswdPath;
+// Windows fakes the S4U logon with ScopedLogon, handing out either a
+// duplicate of the test process's own token (OwnPrimaryToken) or a canned
+// failure.
 // ---------------------------------------------------------------------------
-
-#ifndef _WIN32
 
 TEST_F(RunAsHandlerTest, PrivilegedNamedUserStoresIdentityAndRespondsSuccess)
 {
     const ScopedPrivilege privileged(1);
+#ifndef _WIN32
     const std::string passwd_path = JoinDir("passwd");
     WriteFile(passwd_path, "alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
     const ScopedPasswdPath passwd(passwd_path);
+#else
+    std::string reason;
+    const ScopedHandle own_token = OwnPrimaryToken(&reason);
+    if (!own_token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const ScopedLogon logon(own_token.get());
+#endif
 
     DispatchRequest(taz_v1_Opcode_OPCODE_RUN_AS, encode_run_as_request("alice"),
                     1U);
@@ -162,18 +273,39 @@ TEST_F(RunAsHandlerTest, PrivilegedNamedUserStoresIdentityAndRespondsSuccess)
     EXPECT_STREQ(resp.effective_user, "alice");
 
     EXPECT_EQ(Dispatch().run_as_active, 1);
+    EXPECT_STREQ(Dispatch().run_as_user, "alice");
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(UnrefCount(), 0);
+#ifndef _WIN32
     EXPECT_EQ(Dispatch().run_as_uid, 4242U);
     EXPECT_EQ(Dispatch().run_as_gid, 4243U);
-    EXPECT_STREQ(Dispatch().run_as_user, "alice");
     EXPECT_STREQ(Dispatch().run_as_home, "/home/alice");
+    EXPECT_EQ(Dispatch().run_as_token, nullptr);
+#else
+    ASSERT_NE(Dispatch().run_as_token, nullptr);
+    // TOKEN_TYPE has no zero-value enumerator, so a brace-initialized
+    // default trips clang-tidy; seed it with the value GetTokenInformation
+    // below must overwrite.
+    TOKEN_TYPE token_type = TokenImpersonation;
+    DWORD returned_len = 0;
+    EXPECT_TRUE(GetTokenInformation(
+        static_cast<HANDLE>(Dispatch().run_as_token), TokenType, &token_type,
+        sizeof(token_type), &returned_len));
+    EXPECT_EQ(token_type, TokenPrimary);
+#endif
 }
 
 TEST_F(RunAsHandlerTest, PrivilegedUnknownUserReturnsNotFound)
 {
     const ScopedPrivilege privileged(1);
+#ifndef _WIN32
     const std::string passwd_path = JoinDir("passwd");
     WriteFile(passwd_path, "alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
     const ScopedPasswdPath passwd(passwd_path);
+#else
+    const ScopedLogon logon(taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND,
+                            "LsaLogonUser(MSV1_0): no such user (fake)");
+#endif
 
     DispatchRequest(taz_v1_Opcode_OPCODE_RUN_AS, encode_run_as_request("ghost"),
                     1U);
@@ -186,10 +318,123 @@ TEST_F(RunAsHandlerTest, PrivilegedUnknownUserReturnsNotFound)
     pb_istream_t istream = pb_istream_from_buffer(body.data(), body.size());
     ASSERT_TRUE(pb_decode(&istream, taz_v1_ErrorInfo_fields, &err));
     EXPECT_EQ(err.code, taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND);
+#ifndef _WIN32
+    // POSIX's resolve leaves message "", so the handler falls back to the
+    // same literal the old inline lookup sent.
+    EXPECT_STREQ(err.message, "user not found");
+#endif
 
     // A lookup miss must not leave a stale identity on the connection.
     EXPECT_EQ(Dispatch().run_as_active, 0);
+    EXPECT_EQ(RefCount(), 0);
+    EXPECT_EQ(UnrefCount(), 0);
 }
+
+TEST_F(RunAsHandlerTest, NamedUserThenEmptyUserClosesThePreviousToken)
+{
+    // A reset after a successful named RUN_AS must close the identity
+    // it replaces, not just zero the dispatch fields - the only place this
+    // is observable is the Windows token's handle. On POSIX there is never
+    // a token, so this row still exercises the same reset path even though
+    // its handle-count assertion is a no-op there.
+    const ScopedPrivilege privileged(1);
+#ifndef _WIN32
+    const std::string passwd_path = JoinDir("passwd");
+    WriteFile(passwd_path, "alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
+    const ScopedPasswdPath passwd(passwd_path);
+#else
+    std::string reason;
+    const ScopedHandle own_token = OwnPrimaryToken(&reason);
+    if (!own_token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const ScopedLogon logon(own_token.get());
+#endif
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_RUN_AS, encode_run_as_request("alice"),
+                    1U);
+    ASSERT_EQ(Frames().size(), 1U);
+    ASSERT_EQ(Dispatch().run_as_active, 1);
+
+#ifdef _WIN32
+    HANDLE stored_token = static_cast<HANDLE>(Dispatch().run_as_token);
+    ASSERT_NE(stored_token, nullptr);
+    const HandleCloseWatch watch(stored_token);
+    ASSERT_TRUE(watch.armed());
+#endif
+
+    DispatchRequest(taz_v1_Opcode_OPCODE_RUN_AS, encode_run_as_request(""), 2U);
+
+    EXPECT_EQ(Dispatch().run_as_active, 0);
+    EXPECT_EQ(Dispatch().run_as_token, nullptr);
+#ifdef _WIN32
+    EXPECT_FALSE(watch.StillOpen());
+#endif
+}
+
+// A client may pipeline RUN_AS with the requests it governs, so each RUN_AS
+// must be in force as soon as its frame is dispatched - before the loop runs
+// and before the connection's next frame - and pipelined RUN_AS frames must
+// apply in the order they were sent.
+TEST_F(RunAsHandlerTest, NamedUserIsInForceBeforeTheLoopRuns)
+{
+    const ScopedPrivilege privileged(1);
+#ifndef _WIN32
+    const std::string passwd_path = JoinDir("passwd");
+    WriteFile(passwd_path, "alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
+    const ScopedPasswdPath passwd(passwd_path);
+#else
+    std::string reason;
+    const ScopedHandle own_token = OwnPrimaryToken(&reason);
+    if (!own_token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const ScopedLogon logon(own_token.get());
+#endif
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_RUN_AS,
+                         encode_run_as_request("alice"), 1U);
+
+    EXPECT_EQ(Frames().size(), 1U);
+    EXPECT_EQ(Dispatch().run_as_active, 1);
+    EXPECT_STREQ(Dispatch().run_as_user, "alice");
+    EXPECT_EQ(ActiveStreamCount(), 0U);
+    RunLoop();
+}
+
+TEST_F(RunAsHandlerTest, PipelinedNamedUserThenResetEndsReset)
+{
+    const ScopedPrivilege privileged(1);
+#ifndef _WIN32
+    const std::string passwd_path = JoinDir("passwd");
+    WriteFile(passwd_path, "alice:x:4242:4243:Alice:/home/alice:/bin/bash\n");
+    const ScopedPasswdPath passwd(passwd_path);
+#else
+    std::string reason;
+    const ScopedHandle own_token = OwnPrimaryToken(&reason);
+    if (!own_token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const ScopedLogon logon(own_token.get());
+#endif
+
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_RUN_AS,
+                         encode_run_as_request("alice"), 1U);
+    DispatchRequestNoRun(taz_v1_Opcode_OPCODE_RUN_AS, encode_run_as_request(""),
+                         3U);
+    RunLoop();
+
+    ASSERT_EQ(Frames().size(), 2U);
+    EXPECT_EQ(unpack_header(Frames()[0]).stream_id, 1U);
+    EXPECT_EQ(unpack_header(Frames()[1]).stream_id, 3U);
+    EXPECT_EQ(Dispatch().run_as_active, 0);
+    EXPECT_EQ(Dispatch().run_as_token, nullptr);
+}
+
+#ifndef _WIN32
 
 TEST_F(RunAsHandlerTest, PrivilegedEmptyUserResetsActiveIdentity)
 {

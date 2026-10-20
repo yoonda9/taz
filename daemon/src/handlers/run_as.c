@@ -1,5 +1,6 @@
 #include "run_as.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include <pb_decode.h>
@@ -15,7 +16,6 @@ void handle_run_as(taz_dispatch_t *d, const taz_frame_header_t *header,
                    void *ctx)
 {
     taz_v1_RunAsRequest req = taz_v1_RunAsRequest_init_zero;
-    taz_v1_RunAsResponse resp = taz_v1_RunAsResponse_init_zero;
 
     if (payload != NULL && header->length > 0U)
     {
@@ -42,11 +42,9 @@ void handle_run_as(taz_dispatch_t *d, const taz_frame_header_t *header,
 
     if (req.user[0] == '\0')
     {
-        d->run_as_active = 0;
-        d->run_as_uid = 0U;
-        d->run_as_gid = 0U;
-        d->run_as_user[0] = '\0';
-        d->run_as_home[0] = '\0';
+        taz_v1_RunAsResponse resp = taz_v1_RunAsResponse_init_zero;
+
+        taz_run_as_reset(d);
 
         resp.success = true;
         {
@@ -65,32 +63,45 @@ void handle_run_as(taz_dispatch_t *d, const taz_frame_header_t *header,
     }
 
     {
-        unsigned long uid = 0UL;
-        unsigned long gid = 0UL;
+        /* Resolved inline, on the loop thread, as for every other
+         * identity change: a client may pipeline RUN_AS with the requests
+         * it governs, so the identity must be in force before the
+         * connection's next frame is dispatched. */
+        taz_run_as_identity_t identity;
+        taz_v1_ErrorCode code = taz_v1_ErrorCode_ERROR_CODE_INTERNAL;
+        char message[256];
+        taz_v1_RunAsResponse resp = taz_v1_RunAsResponse_init_zero;
 
-        if (!taz_passwd_lookup_by_name(taz_run_as_passwd_path(), req.user, &uid,
-                                       &gid, d->run_as_home,
-                                       sizeof(d->run_as_home)))
+        (void)memset(&identity, 0, sizeof(identity));
+        if (taz_run_as_resolve(req.user, &identity, &code, message,
+                               sizeof(message)) != 0)
         {
-            taz_error_send(write_fn, ctx, header->stream_id, header->opcode,
-                           taz_v1_ErrorCode_ERROR_CODE_NOT_FOUND,
-                           "user not found", NULL);
+            /* POSIX's taz_run_as_resolve leaves message "" on a passwd
+             * miss; Windows always fills it with the real LsaLogonUser/
+             * DuplicateTokenEx failure text. */
+            taz_error_send(
+                write_fn, ctx, header->stream_id, header->opcode, code,
+                (message[0] != '\0') ? message : "user not found", NULL);
             taz_dispatch_stream_done(d, header->stream_id);
             return;
         }
 
+        taz_run_as_reset(d);
         d->run_as_active = 1;
-        d->run_as_uid = (uint32_t)uid;
-        d->run_as_gid = (uint32_t)gid;
-        taz_fsutil_sanitize_utf8(req.user, strlen(req.user), d->run_as_user,
-                                 sizeof(d->run_as_user));
+        d->run_as_uid = identity.uid;
+        d->run_as_gid = identity.gid;
+        (void)snprintf(d->run_as_user, sizeof(d->run_as_user), "%s",
+                       identity.user);
+        (void)snprintf(d->run_as_home, sizeof(d->run_as_home), "%s",
+                       identity.home);
+        d->run_as_token = identity.token;
+
+        resp.success = true;
+        (void)snprintf(resp.effective_user, sizeof(resp.effective_user), "%s",
+                       d->run_as_user);
+
+        taz_response_send(write_fn, ctx, header->stream_id, header->opcode,
+                          taz_v1_RunAsResponse_fields, &resp);
+        taz_dispatch_stream_done(d, header->stream_id);
     }
-
-    resp.success = true;
-    taz_fsutil_sanitize_utf8(d->run_as_user, strlen(d->run_as_user),
-                             resp.effective_user, sizeof(resp.effective_user));
-
-    taz_response_send(write_fn, ctx, header->stream_id, header->opcode,
-                      taz_v1_RunAsResponse_fields, &resp);
-    taz_dispatch_stream_done(d, header->stream_id);
 }

@@ -270,6 +270,15 @@ else()
     set(TAZ_PLATFORM_SRC src/platform_posix.c)
 endif()
 
+# The S4U logon module behind taz/run_as_win32.h: Windows-only, built into
+# taz_core (not just tazd) so test_run_as_win32.cpp can link it, the same
+# way TAZ_PROCESS_SRC above does for process_win32.c. Empty on POSIX, where
+# run_as.c never calls into it.
+set(TAZ_RUN_AS_WIN32_SRC "")
+if(WIN32)
+    set(TAZ_RUN_AS_WIN32_SRC src/platform/run_as_win32.c)
+endif()
+
 add_library(
     taz_core STATIC
     src/frame.c
@@ -285,12 +294,14 @@ add_library(
     src/server.c
     src/shutdown.c
     src/restart_args.c
+    src/cmdline.c
     src/work.c
     src/fsutil.c
     src/crc32c.c
     src/dispatch.c
     src/connection.c
     src/run_as.c
+    src/run_as_name.c
     src/handlers/version.c
     src/handlers/config.c
     src/handlers/command.c
@@ -309,6 +320,7 @@ add_library(
     src/platform/process_common.c
     ${TAZ_PROCESS_SRC}
     ${TAZ_PLATFORM_SRC}
+    ${TAZ_RUN_AS_WIN32_SRC}
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.c)
 target_include_directories(taz_core PUBLIC include)
 # Stop <windows.h> from including the old <winsock.h>, which clashes with the
@@ -319,6 +331,12 @@ if(WIN32)
     # GetNamedSecurityInfoW / LookupAccountSidW (handlers/file.c Windows
     # owner lookup) live in Advapi32.lib.
     target_link_libraries(taz_core PRIVATE Advapi32)
+    # CreateEnvironmentBlock/DestroyEnvironmentBlock (exec.c's token-aware
+    # env build) live in Userenv.lib.
+    target_link_libraries(taz_core PRIVATE Userenv)
+    # LsaConnectUntrusted/LsaLookupAuthenticationPackage/LsaLogonUser & co.
+    # (run_as_win32.c's S4U logon) live in Secur32.lib.
+    target_link_libraries(taz_core PRIVATE Secur32)
 endif()
 # taz_warnings is PRIVATE so C-only flags (-Wstrict-prototypes) do not leak
 # to the C++ GoogleTest target that links taz_core.

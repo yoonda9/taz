@@ -1,17 +1,29 @@
 // Unit tests for exec.c/h: the output capture buffer and the taz_exec_start
 // spawn engine.
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <iostream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 #include <uv.h>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+
+#include "win32_token_test_support.h"
+#endif
 
 #include "taz/exec.h"
 
@@ -23,6 +35,8 @@ namespace
 // value of the env var it names and exit immediately, before main()/gtest
 // ever runs — static init order makes this safe regardless of what argv or
 // gtest's own startup would otherwise do with a re-spawned test binary.
+// On Windows, "*" prints every variable's name instead, one per line, in
+// the order the child's environment block holds them.
 struct EchoEnvOnStartup
 {
     EchoEnvOnStartup() noexcept
@@ -32,11 +46,49 @@ struct EchoEnvOnStartup
         {
             return;
         }
+#ifdef _WIN32
+        if (std::strcmp(var_name, "*") == 0)
+        {
+            PrintEnvNamesInBlockOrder();
+            std::exit(0);
+        }
+#endif
         const char *value = std::getenv(var_name);
         (void)std::fputs(value != nullptr ? value : "", stdout);
         (void)std::fflush(stdout);
         std::exit(0);
     }
+
+#ifdef _WIN32
+    static void PrintEnvNamesInBlockOrder() noexcept
+    {
+        LPWCH block = GetEnvironmentStringsW();
+        if (block == nullptr)
+        {
+            return;
+        }
+        for (const wchar_t *entry = block; *entry != L'\0';
+             entry += std::wcslen(entry) + 1U)
+        {
+            // The hidden per-drive "=C:=C:\dir" entries start with '='.
+            const wchar_t *eq =
+                std::wcschr(entry + ((entry[0] == L'=') ? 1 : 0), L'=');
+            const size_t len = (eq != nullptr) ? static_cast<size_t>(eq - entry)
+                                               : std::wcslen(entry);
+            char name[512];
+            const int n = WideCharToMultiByte(
+                CP_UTF8, 0, entry, static_cast<int>(len), name,
+                static_cast<int>(sizeof(name)) - 1, nullptr, nullptr);
+            if (n > 0)
+            {
+                name[n] = '\0';
+                (void)std::printf("%s\n", name);
+            }
+        }
+        (void)FreeEnvironmentStringsW(block);
+        (void)std::fflush(stdout);
+    }
+#endif
 };
 
 const EchoEnvOnStartup echo_env_on_startup{};
@@ -181,9 +233,10 @@ TEST(ExecApplyIdentityTest, SwitchSetAppliesUidGidAndFlagsOnPosix)
 {
     taz_exec_spec_t spec{};
     spec.switch_identity = true;
-    // uv_uid_t/uv_gid_t is a 1-byte stub on Windows (unused there - RUN_AS
-    // is deferred - but this TU still compiles for that target), so this
-    // value must fit an unsigned char on every platform.
+    // uv_uid_t/uv_gid_t is a 1-byte stub on Windows (unused there: Windows
+    // switches identity with a token instead, but this TU still compiles
+    // for that target), so this value must fit an unsigned char on every
+    // platform.
     spec.uid = 99;
     spec.gid = 99;
     uv_process_options_t options{};
@@ -334,6 +387,242 @@ TEST(ExecBuildEnvTest, NoIdentityKeepsTheDaemonsOwnValues)
     taz_exec_free_env(env);
 }
 
+#ifdef _WIN32
+
+namespace
+{
+
+// The current process's own value for a wide env var name, converted to
+// UTF-8; empty when it is unset.
+std::string OwnEnvVarUtf8(const wchar_t *name)
+{
+    wchar_t buf[1024];
+    const DWORD n =
+        GetEnvironmentVariableW(name, buf, static_cast<DWORD>(std::size(buf)));
+    if ((n == 0) || (n >= std::size(buf)))
+    {
+        return std::string();
+    }
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(n),
+                                           nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<size_t>(needed), '\0');
+    (void)WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(n), out.data(),
+                              needed, nullptr, nullptr);
+    return out;
+}
+
+std::wstring Utf8ToWide(const std::string &utf8)
+{
+    const int needed = MultiByteToWideChar(
+        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    (void)MultiByteToWideChar(CP_UTF8, 0, utf8.data(),
+                              static_cast<int>(utf8.size()), out.data(),
+                              needed);
+    return out;
+}
+
+// The directory containing the ASan runtime DLL already loaded into this
+// process, or empty when this binary isn't ASan-instrumented. Named
+// candidates, not a search, since clang-cl's handful of ASan runtime DLL
+// names (debug/release) are the only ones that can be mapped into this
+// process - no other component here is a DLL.
+std::string LoadedAsanRuntimeDirUtf8()
+{
+    static const wchar_t *const candidates[] = {
+        L"clang_rt.asan_dynamic-x86_64.dll",
+        L"clang_rt.asan_dbg_dynamic-x86_64.dll",
+    };
+    for (const wchar_t *name : candidates)
+    {
+        const HMODULE mod = GetModuleHandleW(name);
+        if (mod == nullptr)
+        {
+            continue;
+        }
+        wchar_t path[MAX_PATH];
+        const DWORD len =
+            GetModuleFileNameW(mod, path, static_cast<DWORD>(std::size(path)));
+        if ((len == 0) || (len >= std::size(path)))
+        {
+            continue;
+        }
+        std::wstring dir(path, len);
+        const size_t slash = dir.find_last_of(L"\\/");
+        if (slash == std::wstring::npos)
+        {
+            continue;
+        }
+        dir.resize(slash);
+
+        const int needed = WideCharToMultiByte(CP_UTF8, 0, dir.data(),
+                                               static_cast<int>(dir.size()),
+                                               nullptr, 0, nullptr, nullptr);
+        std::string out(static_cast<size_t>(needed), '\0');
+        (void)WideCharToMultiByte(CP_UTF8, 0, dir.data(),
+                                  static_cast<int>(dir.size()), out.data(),
+                                  needed, nullptr, nullptr);
+        return out;
+    }
+    return std::string();
+}
+
+// A fresh, empty directory under the system temp path, as both its wide
+// path (for RemoveDirectoryW) and UTF-8 path (for a PATH override). The
+// not-found row needs a real, empty directory so the lookup's failure
+// comes from an exhausted search, not an invalid path.
+struct EmptyTempDir
+{
+    std::wstring wide;
+    std::string utf8;
+    bool valid = false;
+};
+
+EmptyTempDir MakeEmptyTempDir()
+{
+    EmptyTempDir result;
+    wchar_t temp[MAX_PATH];
+    const DWORD temp_len =
+        GetTempPathW(static_cast<DWORD>(std::size(temp)), temp);
+    if ((temp_len == 0) || (temp_len >= std::size(temp)))
+    {
+        return result;
+    }
+    // The counter keeps two calls within one tick from colliding.
+    static unsigned serial = 0;
+    result.wide = std::wstring(temp, temp_len) + L"taz-test-empty-" +
+                  std::to_wstring(GetCurrentProcessId()) + L"-" +
+                  std::to_wstring(GetTickCount64()) + L"-" +
+                  std::to_wstring(serial++);
+    if (CreateDirectoryW(result.wide.c_str(), nullptr) == 0)
+    {
+        result.wide.clear();
+        return result;
+    }
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, result.wide.data(),
+                                           static_cast<int>(result.wide.size()),
+                                           nullptr, 0, nullptr, nullptr);
+    result.utf8.resize(static_cast<size_t>(needed));
+    (void)WideCharToMultiByte(CP_UTF8, 0, result.wide.data(),
+                              static_cast<int>(result.wide.size()),
+                              result.utf8.data(), needed, nullptr, nullptr);
+    result.valid = true;
+    return result;
+}
+
+// Splits a captured "cmd /c set" stdout into its NAME=VALUE lines (CRLF or
+// LF terminated, blanks dropped).
+std::vector<std::string> SplitEnvLines(const std::string &text)
+{
+    std::vector<std::string> lines;
+    size_t start = 0U;
+    while (start <= text.size())
+    {
+        const size_t end = text.find('\n', start);
+        std::string line = (end == std::string::npos)
+                               ? text.substr(start)
+                               : text.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        if (!line.empty())
+        {
+            lines.push_back(line);
+        }
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        start = end + 1U;
+    }
+    return lines;
+}
+
+bool AnyLineStartsWith(const std::vector<std::string> &lines,
+                       const std::string &prefix)
+{
+    return std::any_of(lines.begin(), lines.end(),
+                       [&prefix](const std::string &line)
+                       { return line.rfind(prefix, 0) == 0; });
+}
+
+} // namespace
+
+// These rows duplicate the test process's own token (no second account
+// exists on the host yet), so the token's environment block is expected
+// to equal the current process's own session values.
+class ExecBuildEnvTokenTest : public ::testing::Test
+{
+  protected:
+    void SetUp() override
+    {
+        std::string reason;
+        token_ = OwnPrimaryToken(&reason);
+        if (!token_.valid())
+        {
+            GTEST_SKIP() << reason;
+        }
+    }
+
+    HANDLE Token() const
+    {
+        return token_.get();
+    }
+
+  private:
+    ScopedHandle token_;
+};
+
+TEST_F(ExecBuildEnvTokenTest, BaseComesFromTheTokensOwnEnvironmentBlock)
+{
+    set_parent_env("TAZ_ONLY_IN_DAEMON", "yes");
+    taz_exec_spec_t spec{};
+    spec.token = Token();
+    char **env = nullptr;
+
+    const int rc = taz_exec_build_env(&spec, &env);
+    unset_parent_env("TAZ_ONLY_IN_DAEMON");
+    ASSERT_EQ(rc, 0);
+
+    EXPECT_EQ(EnvValues(env, "USERPROFILE"),
+              std::vector<std::string>{OwnEnvVarUtf8(L"USERPROFILE")});
+    EXPECT_EQ(EnvValues(env, "USERNAME"),
+              std::vector<std::string>{OwnEnvVarUtf8(L"USERNAME")});
+    EXPECT_TRUE(EnvValues(env, "TAZ_ONLY_IN_DAEMON").empty());
+    EXPECT_TRUE(EnvValues(env, "USER").empty());
+    EXPECT_TRUE(EnvValues(env, "LOGNAME").empty());
+    EXPECT_TRUE(EnvValues(env, "HOME").empty());
+    // CreateEnvironmentBlock's machine-wide half doesn't carry SystemRoot on
+    // every host; ensure_system_root backfills it (CreateProcessAsUserW's
+    // child otherwise dies immediately with STATUS_DLL_NOT_FOUND).
+    EXPECT_EQ(EnvValues(env, "SystemRoot"),
+              std::vector<std::string>{OwnEnvVarUtf8(L"SystemRoot")});
+    taz_exec_free_env(env);
+}
+
+TEST_F(ExecBuildEnvTokenTest, RequestEnvOverridesTheTokenBase)
+{
+    taz_exec_spec_t spec{};
+    spec.token = Token();
+    taz_v1_KeyValue extra{};
+    (void)std::snprintf(extra.key, sizeof(extra.key), "%s", "USERPROFILE");
+    (void)std::snprintf(extra.value, sizeof(extra.value), "%s", "C:\\custom");
+    spec.env = &extra;
+    spec.env_count = 1U;
+    char **env = nullptr;
+
+    ASSERT_EQ(taz_exec_build_env(&spec, &env), 0);
+
+    EXPECT_EQ(EnvValues(env, "USERPROFILE"),
+              std::vector<std::string>{"C:\\custom"});
+    EXPECT_EQ(EnvValues(env, "USERNAME"),
+              std::vector<std::string>{OwnEnvVarUtf8(L"USERNAME")});
+    taz_exec_free_env(env);
+}
+
+#endif // _WIN32
+
 // --- taz_exec_start -------------------------------------------------------
 //
 // The cross-platform child under test is the test binary itself, re-invoked
@@ -423,6 +712,9 @@ TEST_F(ExecSpawnTest, SuccessfulSpawnCallsOnDoneOnceWithOutput)
     ExecOutcome outcome;
     taz_exec_t *x = nullptr;
     ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+    // x is only valid up to uv_run below (on_done's close_all frees it), so
+    // taz_exec_as_user must be read now, not after.
+    EXPECT_FALSE(taz_exec_as_user(x));
 
     ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
 
@@ -478,6 +770,952 @@ TEST_F(ExecSpawnTest, NonexistentCwdReturnsError)
     EXPECT_NE(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
     EXPECT_FALSE(outcome.called);
 }
+
+// --- a non-NULL token ---------------------------------------------------
+//
+// On POSIX taz_exec_start still has no token-aware spawn path, so this stays
+// purely defensive: close whatever it was handed and refuse it, rather than
+// spawn with it ignored or leak it.
+//
+// On Windows a non-NULL token enters spawn_as_user. A handle
+// that is not a real token (here, a plain event) makes LoadUserProfileW fail
+// before anything is spawned, so the row instead proves: a non-UV_ENOTSUP
+// UV_E* code, no callback, nothing spawned, and the token closed once the
+// loop has run the close callbacks close_all schedules
+// (close_all -> on_handle_closed -> taz_run_as_token_close).
+
+#ifdef _WIN32
+TEST_F(ExecSpawnTest, NonNullTokenFailsSpawnAsUserAndClosesTheToken)
+{
+    HANDLE token = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_NE(token, nullptr);
+    const HandleCloseWatch watch(token);
+    ASSERT_TRUE(watch.armed());
+
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.token = token;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    EXPECT_NE(rc, 0);
+    EXPECT_NE(rc, UV_ENOTSUP);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_FALSE(watch.StillOpen());
+}
+
+TEST_F(ExecSpawnTest, OwnTokenSpawnSucceedsAndMarksAsUser)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+
+    // The spawned child is this same test binary, so under an ASan build it
+    // needs the ASan runtime DLL's directory on its PATH; the duplicated
+    // token's own default profile PATH (the child's base environment comes
+    // from the token alone) has no reason to carry it. Request
+    // env overrides the token base, same as any other caller supplying a
+    // PATH the target identity should use.
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+    }
+
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1U << 20;
+    spec.token = token.release();
+    if (!asan_dir.empty())
+    {
+        spec.env = env;
+        spec.env_count = 1;
+    }
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+    // x is only valid up to uv_run below (on_done's close_all frees it), so
+    // taz_exec_as_user/taz_exec_pid must be read now, not after.
+    EXPECT_TRUE(taz_exec_as_user(x));
+    EXPECT_NE(taz_exec_pid(x), 0U);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.exit_status, 0);
+    EXPECT_FALSE(outcome.out.empty());
+    EXPECT_FALSE(outcome.timed_out);
+    EXPECT_FALSE(outcome.truncated);
+}
+
+// --- failure before/at CreateProcessAsUserW -----------------------------
+
+// The child is created suspended and only resumed once it is in its Job
+// Object, so a failed assignment must end it before it ever runs: the
+// marker file its command line would write must never appear.
+TEST_F(ExecSpawnTest, JobAssignmentFailureNeverRunsTheChild)
+{
+    std::string reason;
+    ScopedHandle owned = OwnPrimaryToken(&reason);
+    if (!owned.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string system_root = OwnEnvVarUtf8(L"SystemRoot");
+    ASSERT_FALSE(system_root.empty());
+    const EmptyTempDir dir = MakeEmptyTempDir();
+    ASSERT_TRUE(dir.valid);
+    const std::wstring marker = dir.wide + L"\\ran.txt";
+    const std::string cmd = system_root + "\\System32\\cmd.exe";
+    const std::string script = "echo ran> \"" + dir.utf8 + "\\ran.txt\"";
+    const char *const args[] = {"/c", script.c_str()};
+    const HandleCloseWatch watch(owned.get());
+    ASSERT_TRUE(watch.armed());
+
+    struct ScopedAssignJobFailure
+    {
+        ScopedAssignJobFailure()
+        {
+            taz_exec_set_assign_job_for_tests(
+                [](void *, void *) -> int
+                {
+                    SetLastError(ERROR_ACCESS_DENIED);
+                    return 0;
+                });
+        }
+        ~ScopedAssignJobFailure()
+        {
+            taz_exec_set_assign_job_for_tests(nullptr);
+        }
+        ScopedAssignJobFailure(const ScopedAssignJobFailure &) = delete;
+        ScopedAssignJobFailure &
+        operator=(const ScopedAssignJobFailure &) = delete;
+    };
+    const ScopedAssignJobFailure failure;
+
+    taz_exec_spec_t spec{};
+    spec.file = cmd.c_str();
+    spec.args = args;
+    spec.args_count = 2;
+    spec.max_output_bytes = 1024;
+    spec.token = owned.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    EXPECT_EQ(rc, uv_translate_sys_error(ERROR_ACCESS_DENIED));
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    EXPECT_FALSE(watch.StillOpen());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(GetFileAttributesW(marker.c_str()), INVALID_FILE_ATTRIBUTES);
+    (void)DeleteFileW(marker.c_str());
+    (void)RemoveDirectoryW(dir.wide.c_str());
+}
+
+TEST_F(ExecSpawnTest, NonexistentFileFailsSpawnAsUserAndClosesTheToken)
+{
+    std::string reason;
+    ScopedHandle owned = OwnPrimaryToken(&reason);
+    if (!owned.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const HandleCloseWatch watch(owned.get());
+    ASSERT_TRUE(watch.armed());
+
+    const std::string missing = Exe() + "-taz-test-does-not-exist";
+    taz_exec_spec_t spec{};
+    spec.file = missing.c_str();
+    spec.max_output_bytes = 1024;
+    spec.token = owned.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    EXPECT_EQ(rc, UV_ENOENT);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_FALSE(watch.StillOpen());
+}
+
+// --- file resolution along the child's own PATH -----------------------
+
+TEST_F(ExecSpawnTest, BareNameResolvesAlongTheChildsOwnPathNotTheDaemons)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string system_root = OwnEnvVarUtf8(L"SystemRoot");
+    ASSERT_FALSE(system_root.empty());
+    const std::string system32 = system_root + "\\System32";
+
+    taz_v1_KeyValue env[1];
+    (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+    (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                        system32.c_str());
+
+    taz_exec_spec_t spec{};
+    spec.file = "whoami";
+    spec.env = env;
+    spec.env_count = 1;
+    spec.max_output_bytes = 1024;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.exit_status, 0);
+    EXPECT_FALSE(outcome.out.empty());
+}
+
+TEST_F(ExecSpawnTest, BareNameNotOnChildsPathIsEnoent)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const EmptyTempDir empty_dir = MakeEmptyTempDir();
+    ASSERT_TRUE(empty_dir.valid);
+
+    taz_v1_KeyValue env[1];
+    (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+    (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                        empty_dir.utf8.c_str());
+
+    taz_exec_spec_t spec{};
+    spec.file = "whoami";
+    spec.env = env;
+    spec.env_count = 1;
+    spec.max_output_bytes = 1024;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    EXPECT_EQ(rc, UV_ENOENT);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    (void)RemoveDirectoryW(empty_dir.wide.c_str());
+}
+
+// cmd.exe copied to <fresh temp dir>\<rel>, for the working-directory rows
+// below (cmd.exe, not whoami.exe: "/c exit 7" needs none of the MUI
+// resources a copy outside System32 loses). The copy and the directories
+// made for it are removed on scope exit.
+class ScopedProgramCopy
+{
+  public:
+    explicit ScopedProgramCopy(const std::wstring &rel)
+    {
+        const EmptyTempDir root = MakeEmptyTempDir();
+        if (!root.valid)
+        {
+            return;
+        }
+        root_ = root.wide;
+        root_utf8_ = root.utf8;
+        std::wstring dir = root_;
+        size_t start = 0;
+        for (size_t sep = rel.find(L'\\'); sep != std::wstring::npos;
+             sep = rel.find(L'\\', start))
+        {
+            dir += L"\\" + rel.substr(start, sep - start);
+            if (CreateDirectoryW(dir.c_str(), nullptr) == 0)
+            {
+                return;
+            }
+            dirs_.push_back(dir);
+            start = sep + 1;
+        }
+        wchar_t system32[MAX_PATH];
+        const UINT len = GetSystemDirectoryW(
+            system32, static_cast<UINT>(std::size(system32)));
+        if ((len == 0) || (len >= std::size(system32)))
+        {
+            return;
+        }
+        file_ = root_ + L"\\" + rel;
+        valid_ = CopyFileW((std::wstring(system32, len) + L"\\cmd.exe").c_str(),
+                           file_.c_str(), TRUE) != 0;
+    }
+    ~ScopedProgramCopy()
+    {
+        if (valid_)
+        {
+            (void)DeleteFileW(file_.c_str());
+        }
+        for (auto it = dirs_.rbegin(); it != dirs_.rend(); ++it)
+        {
+            (void)RemoveDirectoryW(it->c_str());
+        }
+        if (!root_.empty())
+        {
+            (void)RemoveDirectoryW(root_.c_str());
+        }
+    }
+    ScopedProgramCopy(const ScopedProgramCopy &) = delete;
+    ScopedProgramCopy &operator=(const ScopedProgramCopy &) = delete;
+
+    bool valid() const
+    {
+        return valid_;
+    }
+    const std::string &RootUtf8() const
+    {
+        return root_utf8_;
+    }
+
+  private:
+    std::wstring root_;
+    std::string root_utf8_;
+    std::vector<std::wstring> dirs_;
+    std::wstring file_;
+    bool valid_ = false;
+};
+
+// Both spawn paths must find the same program: like uv_spawn, a bare name
+// is looked up in the working directory before the child's PATH, and a
+// relative path is taken relative to the working directory.
+void ExpectAsUserRunsCopyFromWorkingDir(uv_loop_t *loop, const char *file,
+                                        const ScopedProgramCopy &copy)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    ASSERT_TRUE(copy.valid());
+    const EmptyTempDir empty_dir = MakeEmptyTempDir();
+    ASSERT_TRUE(empty_dir.valid);
+
+    taz_v1_KeyValue env[1];
+    (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+    (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                        empty_dir.utf8.c_str());
+    const char *const args[] = {"/c", "exit", "7"};
+
+    taz_exec_spec_t spec{};
+    spec.file = file;
+    spec.args = args;
+    spec.args_count = 3;
+    spec.cwd = copy.RootUtf8().c_str();
+    spec.env = env;
+    spec.env_count = 1;
+    spec.max_output_bytes = 1024;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(loop, &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(uv_run(loop, UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.exit_status, 7);
+}
+
+TEST_F(ExecSpawnTest, BareNameResolvesInTheWorkingDirectoryFirst)
+{
+    const ScopedProgramCopy copy(L"taz-cwd-probe.exe");
+    ExpectAsUserRunsCopyFromWorkingDir(Loop(), "taz-cwd-probe", copy);
+}
+
+TEST_F(ExecSpawnTest, RelativePathResolvesAgainstTheWorkingDirectory)
+{
+    const ScopedProgramCopy copy(L"bin\\taz-cwd-probe.exe");
+    ExpectAsUserRunsCopyFromWorkingDir(Loop(), "bin\\taz-cwd-probe.exe", copy);
+}
+
+// --- quoting/command-line overflow -------------------------------------
+
+TEST_F(ExecSpawnTest, HugeArgumentFailsSpawnAsUserWithE2bigAndClosesTheToken)
+{
+    std::string reason;
+    ScopedHandle owned = OwnPrimaryToken(&reason);
+    if (!owned.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const HandleCloseWatch watch(owned.get());
+    ASSERT_TRUE(watch.armed());
+
+    const std::string huge(40000, 'a');
+    const char *const args[] = {huge.c_str()};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1024;
+    spec.token = owned.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    EXPECT_EQ(rc, UV_E2BIG);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_FALSE(watch.StillOpen());
+}
+
+// --- env rows through a real child -------------------------------------
+
+TEST_F(ExecSpawnTest, ChildEnvReflectsTokenBaseOverrideAndSystemRootBackfill)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string system_root = OwnEnvVarUtf8(L"SystemRoot");
+    ASSERT_FALSE(system_root.empty());
+    const std::string own_userprofile = OwnEnvVarUtf8(L"USERPROFILE");
+    ASSERT_FALSE(own_userprofile.empty());
+    const std::string cmd_exe = system_root + "\\System32\\cmd.exe";
+
+    taz_v1_KeyValue env[1];
+    (void)std::snprintf(env[0].key, sizeof(env[0].key), "USERPROFILE");
+    (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s", "C:\\custom");
+
+    const char *const args[] = {"/c", "set"};
+    taz_exec_spec_t spec{};
+    spec.file = cmd_exe.c_str();
+    spec.args = args;
+    spec.args_count = std::size(args);
+    spec.env = env;
+    spec.env_count = 1;
+    spec.max_output_bytes = 1U << 16;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    ASSERT_TRUE(outcome.called);
+    ASSERT_EQ(outcome.exit_status, 0);
+    const std::vector<std::string> lines = SplitEnvLines(outcome.out);
+    EXPECT_TRUE(std::find(lines.begin(), lines.end(),
+                          "USERPROFILE=C:\\custom") != lines.end());
+    EXPECT_FALSE(AnyLineStartsWith(lines, "USER="));
+    EXPECT_TRUE(AnyLineStartsWith(lines, "SystemRoot="));
+}
+
+// CreateProcess documents that an environment block must be sorted by name,
+// case-insensitively. The token's own block already is; request entries
+// that sort before and after it must land in order too, not appended.
+TEST_F(ExecSpawnTest, ChildEnvBlockIsSortedByName)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+
+    // The child is this test binary again (see EchoEnvOnStartup); under ASan
+    // it needs the runtime DLL's directory on its PATH.
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    std::vector<taz_v1_KeyValue> env(3);
+    (void)std::snprintf(env[0].key, sizeof(env[0].key),
+                        "TAZ_TEST_ECHO_ENV_VAR");
+    (void)std::snprintf(env[0].value, sizeof(env[0].value), "*");
+    (void)std::snprintf(env[1].key, sizeof(env[1].key), "zzz_taz_sort_last");
+    (void)std::snprintf(env[1].value, sizeof(env[1].value), "1");
+    (void)std::snprintf(env[2].key, sizeof(env[2].key), "AAA_TAZ_SORT_FIRST");
+    (void)std::snprintf(env[2].value, sizeof(env[2].value), "1");
+    if (!asan_dir.empty())
+    {
+        taz_v1_KeyValue path{};
+        (void)std::snprintf(path.key, sizeof(path.key), "PATH");
+        (void)std::snprintf(path.value, sizeof(path.value), "%s",
+                            asan_dir.c_str());
+        env.push_back(path);
+    }
+
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.env = env.data();
+    spec.env_count = env.size();
+    spec.max_output_bytes = 1U << 16;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    ASSERT_TRUE(outcome.called);
+    ASSERT_EQ(outcome.exit_status, 0);
+
+    std::vector<std::wstring> names;
+    for (const std::string &line : SplitEnvLines(outcome.out))
+    {
+        names.push_back(Utf8ToWide(line));
+    }
+    EXPECT_NE(std::find(names.begin(), names.end(), L"AAA_TAZ_SORT_FIRST"),
+              names.end());
+    EXPECT_NE(std::find(names.begin(), names.end(), L"zzz_taz_sort_last"),
+              names.end());
+    for (size_t i = 1; i < names.size(); i++)
+    {
+        EXPECT_NE(CompareStringOrdinal(names[i - 1].c_str(),
+                                       static_cast<int>(names[i - 1].size()),
+                                       names[i].c_str(),
+                                       static_cast<int>(names[i].size()), TRUE),
+                  CSTR_GREATER_THAN)
+            << "out of order at " << i;
+    }
+}
+
+// A daemon started without std handles has CRT fds 0-2 free, so a pipe's
+// daemon end gets one of them; uv_pipe_open duplicates such a handle and
+// leaves the fd open, which the spawn must close again rather than leak
+// (and keep, say, stdin aliased to a closed pipe).
+TEST_F(ExecSpawnTest, AsUserSpawnHandsBackAFreeStdioFd)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string system_root = OwnEnvVarUtf8(L"SystemRoot");
+    ASSERT_FALSE(system_root.empty());
+    const std::string cmd_exe = system_root + "\\System32\\cmd.exe";
+    const char *const args[] = {"/c", "exit", "0"};
+
+    const int saved_stdin = _dup(0);
+    ASSERT_GE(saved_stdin, 0);
+    ASSERT_EQ(_close(0), 0);
+
+    taz_exec_spec_t spec{};
+    spec.file = cmd_exe.c_str();
+    spec.args = args;
+    spec.args_count = std::size(args);
+    spec.max_output_bytes = 1024;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    const int rc = taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x);
+    if (rc == 0)
+    {
+        EXPECT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    }
+
+    // fd 0 is free again exactly when the next new fd takes it.
+    const int probe = _open("NUL", _O_RDONLY);
+    EXPECT_EQ(probe, 0);
+    if (probe >= 0)
+    {
+        (void)_close(probe);
+    }
+    EXPECT_EQ(_dup2(saved_stdin, 0), 0);
+    (void)_close(saved_stdin);
+
+    ASSERT_EQ(rc, 0);
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.exit_status, 0);
+}
+
+// --- timeout, cancel and tree kill on the as-user path ------------------
+//
+// taz_test_sleeper sleeps 60 s with no shell involved. tree_kill and the
+// timeout timer only ever touch x->job, which is set up identically for
+// this path and the plain uv_spawn path - these rows prove that sharing
+// actually holds for a CreateProcessAsUserW child, not just that the mechanism
+// exists elsewhere.
+
+TEST_F(ExecSpawnTest, TimeoutKillsAsUserChildAndSetsTimedOut)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    // taz_test_sleeper.exe is built with the same flags as this binary, so
+    // under windows-asan it needs the ASan runtime DLL's directory on its
+    // PATH too (see OwnTokenSpawnSucceedsAndMarksAsUser) - without
+    // it the child dies at once with STATUS_DLL_NOT_FOUND, which finishes
+    // (and so un-arms the timer) long before timeout_ms ever elapses.
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
+
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+    spec.timeout_ms = 300;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.timed_out);
+    EXPECT_FALSE(outcome.cancelled);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+TEST_F(ExecSpawnTest, CancelKillsAsUserChildAndSetsCancelled)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
+
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_SLEEPER_PATH;
+    spec.max_output_bytes = 1024;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    taz_exec_cancel(x);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.cancelled);
+    EXPECT_FALSE(outcome.timed_out);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+TEST_F(ExecSpawnTest, TimeoutKillsAsUserGrandchildToo)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string system_root = OwnEnvVarUtf8(L"SystemRoot");
+    ASSERT_FALSE(system_root.empty());
+    const std::string cmd_exe = system_root + "\\System32\\cmd.exe";
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
+
+    // cmd.exe waits for its own child before it exits, so if on_done fires
+    // quickly rather than after the sleeper's full 60 s, the job took the
+    // whole tree down together - cmd.exe and the sleeper it spawned - not
+    // just the immediate child.
+    const char *const args[] = {"/c", TAZ_TEST_SLEEPER_PATH};
+    taz_exec_spec_t spec{};
+    spec.file = cmd_exe.c_str();
+    spec.args = args;
+    spec.args_count = std::size(args);
+    spec.max_output_bytes = 1024;
+    spec.timeout_ms = 300;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.timed_out);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+// --- output cap on the as-user path -------------------------------------
+
+TEST_F(ExecSpawnTest, OutputCapTruncatesButAsUserChildIsStillReaped)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
+
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 5;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.truncated);
+    EXPECT_LE(outcome.out.size() + outcome.err.size(), 5U);
+}
+
+// --- handle-count leak oracle for the as-user path ---------------------
+//
+// GetProcessHandleCount covers every kind of handle this path opens (token,
+// profile, process, wait registration, pipe ends) - ASan does not catch any
+// of them. Each spawn below duplicates a fresh token of its own, the way a
+// real caller gets a fresh logon or duplicate per spawn, rather than
+// reusing one handle across the whole batch.
+
+TEST_F(ExecSpawnTest, HandleCountIsStableAcrossAsUserSpawnBatches)
+{
+    std::string reason;
+    {
+        const ScopedHandle probe = OwnPrimaryToken(&reason);
+        if (!probe.valid())
+        {
+            GTEST_SKIP() << reason;
+        }
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    const char *const gtest_args[] = {"--gtest_filter=NoSuchSuite.*"};
+
+    auto spawn_ok = [&](const char *file, uint32_t timeout_ms)
+    {
+        std::string local_reason;
+        ScopedHandle token = OwnPrimaryToken(&local_reason);
+        ASSERT_TRUE(token.valid()) << local_reason;
+
+        taz_v1_KeyValue env[1];
+        taz_exec_spec_t spec{};
+        spec.file = file;
+        spec.args = gtest_args;
+        spec.args_count = 1;
+        spec.max_output_bytes = 1U << 16;
+        spec.token = token.release();
+        spec.timeout_ms = timeout_ms;
+        (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user),
+                            "%s", username.c_str());
+        if (!asan_dir.empty())
+        {
+            (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+            (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                                asan_dir.c_str());
+            spec.env = env;
+            spec.env_count = 1;
+        }
+
+        ExecOutcome outcome;
+        taz_exec_t *x = nullptr;
+        ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x),
+                  0);
+        ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+        EXPECT_TRUE(outcome.called);
+    };
+
+    auto spawn_fails = [&]()
+    {
+        std::string local_reason;
+        ScopedHandle token = OwnPrimaryToken(&local_reason);
+        ASSERT_TRUE(token.valid()) << local_reason;
+        const std::string missing = Exe() + "-taz-test-does-not-exist";
+
+        taz_exec_spec_t spec{};
+        spec.file = missing.c_str();
+        spec.max_output_bytes = 1024;
+        spec.token = token.release();
+        (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user),
+                            "%s", username.c_str());
+
+        ExecOutcome outcome;
+        taz_exec_t *x = nullptr;
+        EXPECT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x),
+                  UV_ENOENT);
+        EXPECT_FALSE(outcome.called);
+        ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+    };
+
+    // Warm-up: the first-ever LoadUserProfileW/DuplicateTokenEx/module-load
+    // path in this process can allocate one-time state, so the baseline is
+    // measured only once that has already happened once.
+    spawn_ok(Exe().c_str(), 0U);
+
+    DWORD baseline = 0;
+    ASSERT_TRUE(GetProcessHandleCount(GetCurrentProcess(), &baseline));
+
+    for (int i = 0; i < 10; i++)
+    {
+        spawn_ok(Exe().c_str(), 0U);
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        spawn_fails();
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        spawn_ok(TAZ_TEST_SLEEPER_PATH, 300U);
+    }
+
+    DWORD after = 0;
+    ASSERT_TRUE(GetProcessHandleCount(GetCurrentProcess(), &after));
+    // Printed unconditionally (not only on failure) so a win-gate run always
+    // leaves the actual counts in the log for the task's evidence trail.
+    std::cerr << "HandleCountIsStableAcrossAsUserSpawnBatches: baseline="
+              << baseline << " after=" << after << '\n';
+    EXPECT_EQ(after, baseline);
+}
+#else
+TEST_F(ExecSpawnTest, NonNullTokenReturnsNotSupported)
+{
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.token = reinterpret_cast<void *>(1);
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    EXPECT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x),
+              UV_ENOTSUP);
+    EXPECT_FALSE(outcome.called);
+    EXPECT_EQ(x, nullptr);
+}
+#endif
 
 // --- env merge --------------------------------------------------------
 //
@@ -764,7 +2002,6 @@ void record_on_exit_order(uint32_t pid, uint64_t start_time,
     probe->order.emplace_back("on_exit");
 }
 
-#ifndef _WIN32
 void record_on_done_order(const taz_exec_result_t *result, void *arg)
 {
     (void)result;
@@ -773,11 +2010,64 @@ void record_on_done_order(const taz_exec_result_t *result, void *arg)
     probe->order.emplace_back("on_done");
 }
 
+#ifndef _WIN32
 TEST_F(ExecSpawnTest, OnExitHookFiresBeforeOnDoneWhenGrandchildHoldsStdout)
 {
     taz_exec_spec_t spec{};
     spec.file = TAZ_TEST_GRANDCHILD_PATH;
     spec.max_output_bytes = 1024;
+
+    OnExitOrderProbe probe;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_on_done_order, &probe, &x),
+              0);
+    taz_exec_set_on_exit(x, record_on_exit_order, &probe);
+    const uint32_t pid = taz_exec_pid(x);
+
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    ASSERT_EQ(probe.on_exit_calls, 1);
+    ASSERT_EQ(probe.order.size(), 2U);
+    EXPECT_EQ(probe.order[0], "on_exit");
+    EXPECT_EQ(probe.order[1], "on_done");
+    EXPECT_EQ(probe.pid, pid);
+    EXPECT_GT(probe.start_time, 0U);
+}
+#else
+// taz_test_grandchild compiles as a no-op on Windows (see grandchild.c), so
+// the ordering half of the POSIX row above cannot be reproduced here; this
+// row instead proves the hook itself works on the as-user path: it fires
+// once, with the real pid and a non-zero start key.
+TEST_F(ExecSpawnTest, OnExitHookFiresWithRealPidAndStartKeyOnAsUserPath)
+{
+    std::string reason;
+    ScopedHandle token = OwnPrimaryToken(&reason);
+    if (!token.valid())
+    {
+        GTEST_SKIP() << reason;
+    }
+    const std::string username = OwnEnvVarUtf8(L"USERNAME");
+    ASSERT_FALSE(username.empty());
+    const std::string asan_dir = LoadedAsanRuntimeDirUtf8();
+    taz_v1_KeyValue env[1];
+
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1U << 20;
+    spec.token = token.release();
+    (void)std::snprintf(spec.identity_user, sizeof(spec.identity_user), "%s",
+                        username.c_str());
+    if (!asan_dir.empty())
+    {
+        (void)std::snprintf(env[0].key, sizeof(env[0].key), "PATH");
+        (void)std::snprintf(env[0].value, sizeof(env[0].value), "%s",
+                            asan_dir.c_str());
+        spec.env = env;
+        spec.env_count = 1;
+    }
 
     OnExitOrderProbe probe;
     taz_exec_t *x = nullptr;

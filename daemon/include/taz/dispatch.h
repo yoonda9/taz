@@ -97,14 +97,18 @@ extern "C"
          * process-spawning operations on this connection (uid + primary gid
          * only - see taz_exec_apply_identity), run_as_user holds the
          * sanitized username RUN_AS echoes back, and run_as_home the
-         * passwd home directory (the child's HOME). RUN_AS with an empty
-         * user resets all five fields. Zeroed by taz_dispatch_init, which is
-         * what pure unit tests see. */
+         * passwd home directory (the child's HOME). run_as_token is the
+         * Windows half: a primary token (HANDLE) owned by this connection,
+         * always NULL on POSIX; a per-call as_user duplicates it rather
+         * than taking it. RUN_AS with an empty user, or taz_run_as_reset
+         * directly, zeroes all five of the above and closes run_as_token.
+         * Zeroed by taz_dispatch_init, which is what pure unit tests see. */
         int run_as_active;
         uint32_t run_as_uid;
         uint32_t run_as_gid;
         char run_as_user[TAZ_EXEC_USER_MAX];
         char run_as_home[TAZ_EXEC_HOME_MAX];
+        void *run_as_token;
         /* Loop async handlers (e.g. COMMAND_EXEC) spawn on. Set by
          * connection.c right after taz_dispatch_init; left NULL by
          * taz_dispatch_init itself, which is what pure unit tests see. */

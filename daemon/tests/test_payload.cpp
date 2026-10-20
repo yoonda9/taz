@@ -96,10 +96,9 @@ TEST(Payload, CapabilityRoundTrip)
     EXPECT_STREQ(cap.compression[0], "NONE");
 }
 
-#ifndef _WIN32
-// taz_run_as_set_privileged_for_tests is a documented no-op on _WIN32 (RUN_AS
-// is deferred there regardless, so taz_run_as_privileged stays hard-0), so
-// this row cannot run there - the count would stay 21 with RUN_AS absent.
+// taz_run_as_set_privileged_for_tests overrides taz_run_as_privileged() on
+// both platforms (the real Windows answer is still a constant 0 - the probe
+// that makes it real is a later step), so this row runs everywhere.
 TEST(Payload, CapabilityAdvertisesRunAsOnlyWhenPrivileged)
 {
     uint8_t buf[TAZ_FRAME_MAX_PAYLOAD_CAPABILITY];
@@ -126,7 +125,6 @@ TEST(Payload, CapabilityAdvertisesRunAsOnlyWhenPrivileged)
         ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_TASK_CANCEL)));
     EXPECT_TRUE(ops.count(static_cast<uint32_t>(taz_v1_Opcode_OPCODE_RESTART)));
 }
-#endif /* !_WIN32 */
 
 TEST(Payload, CapabilityFitsInFrameLimit)
 {

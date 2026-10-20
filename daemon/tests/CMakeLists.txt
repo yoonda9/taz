@@ -35,6 +35,8 @@ add_executable(
     test_task.cpp
     test_timeout.cpp
     test_run_as.cpp
+    test_run_as_name.cpp
+    test_run_as_win32.cpp
     test_error.cpp
     test_response.cpp
     test_exec.cpp
@@ -46,6 +48,7 @@ add_executable(
     test_shutdown.cpp
     test_restart.cpp
     test_restart_args.cpp
+    test_cmdline.cpp
     test_work.cpp
     test_fsutil.cpp
     test_crc32c.cpp

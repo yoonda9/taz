@@ -83,10 +83,21 @@ extern "C"
         uv_uid_t uid; /* only used when switch_identity is set */
         uv_gid_t gid; /* only used when switch_identity is set */
         bool switch_identity;
-        /* Only used when switch_identity is set: the target user's name and
-         * home directory, which become the child's USER/LOGNAME and HOME. */
+        /* Only used when switch_identity is set, except identity_user also
+         * doubles, on Windows when token is non-NULL, as the name
+         * LoadUserProfileW loads the profile for (it must name the token's
+         * own account - the spawn path reads it unconditionally in that
+         * case, switch_identity or not). Home directory and USER/LOGNAME/
+         * HOME still only come from switch_identity. */
         char identity_user[TAZ_EXEC_USER_MAX];
         char identity_home[TAZ_EXEC_HOME_MAX];
+        /* Windows: a primary token (HANDLE) for a CreateProcessAsUserW
+         * spawn, duplicated per call by the caller; always NULL on POSIX.
+         * taz_exec_start takes ownership on entry - closed on every path
+         * (failure, success, and once the child exits). On POSIX a
+         * non-NULL token is simply closed and refused with UV_ENOTSUP, since
+         * there is nothing there to spawn it with. */
+        void *token;
     } taz_exec_spec_t;
 
     /* Outcome of a finished exec. out/err point into buffers owned by the
@@ -120,10 +131,15 @@ extern "C"
 
     /* Build the child's NULL-terminated NAME=VALUE environment in three
      * layers, a later one overriding an earlier one on a name match
-     * (case-insensitive on Windows): the daemon's own environment; then,
-     * when spec->switch_identity is set, USER and LOGNAME set to
-     * identity_user and HOME to identity_home ("/" when empty), as su and
-     * sudo set them; then spec->env. Returns 0 and stores the result in
+     * (case-insensitive on Windows): a base environment; then, when
+     * spec->switch_identity is set, USER and LOGNAME set to identity_user
+     * and HOME to identity_home ("/" when empty), as su and sudo set them;
+     * then spec->env. The base is the daemon's own environment
+     * (uv_os_environ), except on Windows when spec->token is non-NULL: there
+     * it is that token's own environment (CreateEnvironmentBlock(token,
+     * FALSE) - never the daemon's own environment), and the USER/LOGNAME/
+     * HOME trio is skipped entirely (POSIX-only; the target's loaded
+     * profile sets its own equivalents). Returns 0 and stores the result in
      * *out_env (free it with taz_exec_free_env), or a UV_E* code. Spawns
      * nothing, so tests can call it directly. */
     int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env);
@@ -148,6 +164,11 @@ extern "C"
     /* x's child pid, matching uv_process_t.pid, or 0 once on_done has fired
      * (the process is reaped and its pid may be reused by something else). */
     uint32_t taz_exec_pid(const taz_exec_t *x);
+
+    /* True when x was spawned through the CreateProcessAsUserW path (a
+     * non-NULL token was given to taz_exec_start), false for the plain
+     * uv_spawn path. Always false on POSIX. */
+    bool taz_exec_as_user(const taz_exec_t *x);
 
     /* An on-exit hook: fn(pid, start_key, exit_status, term_signal, arg). */
     typedef void (*taz_exec_on_exit_fn_t)(uint32_t pid, uint64_t start_key,
@@ -179,6 +200,16 @@ extern "C"
      * its own signal 0 to taz_exec_cancel instead of calling this. Returns
      * a UV_E* code. */
     int taz_exec_signal(taz_exec_t *x, int signum);
+
+#ifdef _WIN32
+    /* Test-only replacement for AssignProcessToJobObject on the
+     * CreateProcessAsUserW path (job and process are HANDLEs; returns
+     * nonzero on success, else 0 with the thread's last error set), to
+     * drive its failure: the child must then never run. NULL restores the
+     * real call. Process-global; callers must restore NULL when done. */
+    typedef int (*taz_exec_assign_job_fn_t)(void *job, void *process);
+    void taz_exec_set_assign_job_for_tests(taz_exec_assign_job_fn_t fn);
+#endif
 
 #ifdef __cplusplus
 }

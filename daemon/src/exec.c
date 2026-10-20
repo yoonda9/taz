@@ -7,9 +7,16 @@
 #include <string.h>
 
 #include "taz/process.h"
+#include "taz/run_as.h"
 
 #ifdef _WIN32
+#include <wchar.h>
+
+#include <io.h>
+#include <userenv.h>
 #include <windows.h>
+
+#include "taz/cmdline.h"
 #else
 #include <signal.h>
 #endif
@@ -174,10 +181,25 @@ struct taz_exec_s
     uv_pipe_t err_pipe;
     uv_timer_t timer;
 #ifdef _WIN32
-    /* Per-exec Job Object the child is assigned to right after uv_spawn, so
+    /* Per-exec Job Object the child is assigned to right after spawn, so
      * that killing the job (KILL_ON_JOB_CLOSE) takes the whole tree with it.
-     * NULL if creation failed before a process was ever spawned. */
+     * NULL if creation failed before a process was ever spawned. Shared by
+     * both spawn paths below. */
     HANDLE job;
+    /* The CreateProcessAsUserW path (spec->token != NULL): signalled by
+     * on_process_wait (a system thread pool callback that does nothing
+     * else) once the child exits, so the real work - reading the exit code
+     * and firing the on-exit hook/finish_if_ready - happens on the loop
+     * thread instead. close_all closes this instead of `process` on this
+     * path; `process`'s own fields (pid aside) are never touched, since
+     * uv_spawn is never called for it. */
+    uv_async_t exit_async;
+    HANDLE process_handle;
+    HANDLE wait;    /* RegisterWaitForSingleObject's handle; NULL once
+                     * unregistered or never registered */
+    HANDLE profile; /* LoadUserProfileW's hProfile; NULL if never loaded */
+    HANDLE token;   /* spec->token, ownership moved in; closed on teardown */
+    bool as_user;   /* true once the CreateProcessAsUserW path is taken */
 #endif
     taz_exec_capture_t capture;
     taz_exec_done_fn_t on_done;
@@ -210,6 +232,27 @@ static void on_handle_closed(uv_handle_t *handle)
     {
         (void)CloseHandle(x->job);
     }
+    if (x->as_user)
+    {
+        /* On_exit_async already unregisters the wait before this point is
+         * ever reachable through the normal (post-spawn) lifecycle; this
+         * second check only matters for a setup failure that parked the
+         * token/profile/process handle in x but never got as far as
+         * registering a wait. */
+        if (x->wait != NULL)
+        {
+            (void)UnregisterWaitEx(x->wait, NULL);
+        }
+        if (x->process_handle != NULL)
+        {
+            (void)CloseHandle(x->process_handle);
+        }
+        if (x->profile != NULL)
+        {
+            (void)UnloadUserProfile(x->token, x->profile);
+        }
+        taz_run_as_token_close(x->token);
+    }
 #endif
     taz_exec_capture_free(&x->capture);
     free(x);
@@ -217,12 +260,25 @@ static void on_handle_closed(uv_handle_t *handle)
 
 /* Close every handle belonging to x. Safe to call for a spawn that never
  * started (uv_spawn always initializes the process handle before it can
- * fail) as well as for one that ran to completion; on_handle_closed frees x
- * once all close callbacks have fired. */
+ * fail, and on the CreateProcessAsUserW path exit_async is always
+ * initialized before anything else fallible is attempted - see
+ * spawn_as_user) as well as for one that ran to completion; on_handle_closed
+ * frees x once all close callbacks have fired. */
 static void close_all(taz_exec_t *x)
 {
     x->closing = TAZ_EXEC_HANDLE_COUNT;
+#ifdef _WIN32
+    if (x->as_user)
+    {
+        uv_close((uv_handle_t *)&x->exit_async, on_handle_closed);
+    }
+    else
+    {
+        uv_close((uv_handle_t *)&x->process, on_handle_closed);
+    }
+#else
     uv_close((uv_handle_t *)&x->process, on_handle_closed);
+#endif
     uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);
     uv_close((uv_handle_t *)&x->err_pipe, on_handle_closed);
     uv_close((uv_handle_t *)&x->timer, on_handle_closed);
@@ -297,6 +353,58 @@ static void on_process_exit(uv_process_t *process, int64_t exit_status,
     finish_if_ready(x);
 }
 
+#ifdef _WIN32
+/* RegisterWaitForSingleObject's callback: runs on a system thread pool
+ * thread, so it must do as little as possible and nothing that is not
+ * thread-safe - just wake the loop. The real work (reading the exit code,
+ * firing the on-exit hook, finish_if_ready) happens in on_exit_async below,
+ * on the loop thread. */
+static void CALLBACK on_process_wait(void *context, BOOLEAN timed_out)
+{
+    (void)timed_out;
+    taz_exec_t *x = (taz_exec_t *)context;
+
+    (void)uv_async_send(&x->exit_async);
+}
+
+/* Loop-thread counterpart of on_process_exit for the CreateProcessAsUserW
+ * path: x->process.pid is already set (spawn_as_user sets it right after
+ * CreateProcessAsUserW returns, since the child can exit before
+ * ResumeThread even returns), so taz_exec_pid/taz_exec_set_on_exit work the
+ * same as on the uv_spawn path once this fires. */
+static void on_exit_async(uv_async_t *async)
+{
+    taz_exec_t *x = (taz_exec_t *)async->data;
+    DWORD exit_code = 0;
+
+    (void)GetExitCodeProcess(x->process_handle, &exit_code);
+    x->exit_status = (int64_t)exit_code;
+    x->term_signal = 0;
+
+    /* Must run before x->process_handle is closed (on_handle_closed, once
+     * finish_if_ready's close_all finishes), and never from inside
+     * on_process_wait itself - this runs on the loop thread, after that
+     * callback has already returned. */
+    if (x->wait != NULL)
+    {
+        (void)UnregisterWaitEx(x->wait, NULL);
+        x->wait = NULL;
+    }
+
+    if (x->on_exit != NULL)
+    {
+        taz_exec_on_exit_fn_t fn = x->on_exit;
+        void *fn_arg = x->on_exit_arg;
+
+        x->on_exit = NULL;
+        fn((uint32_t)x->process.pid, x->start_key, x->exit_status,
+           x->term_signal, fn_arg);
+    }
+
+    finish_if_ready(x);
+}
+#endif /* _WIN32 */
+
 static void on_timeout(uv_timer_t *timer)
 {
     taz_exec_t *x = (taz_exec_t *)timer->data;
@@ -327,6 +435,19 @@ uint32_t taz_exec_pid(const taz_exec_t *x)
     }
     return (uint32_t)x->process.pid;
 }
+
+#ifdef _WIN32
+bool taz_exec_as_user(const taz_exec_t *x)
+{
+    return x->as_user;
+}
+#else
+bool taz_exec_as_user(const taz_exec_t *x)
+{
+    (void)x;
+    return false;
+}
+#endif
 
 void taz_exec_set_on_exit(taz_exec_t *x, taz_exec_on_exit_fn_t fn, void *arg)
 {
@@ -469,6 +590,15 @@ static void free_env(char **env)
     {
         return;
     }
+    /* False positive: when merge_env's base/identity/extra counts are all 0
+     * (an empty token block, no request env), its one-element calloc'd
+     * terminator-only array is exactly what env points at here, but
+     * clang-analyzer's ArrayBound checker loses that binding crossing back
+     * out through the out-param chain (taz_exec_build_env/
+     * build_env_from_token) and assumes env[0] could be a real entry, then
+     * flags the next index as past the one-element allocation. Walking a
+     * NULL-terminated envp is this file's whole convention. */
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
     for (size_t i = 0U; env[i] != NULL; i++)
     {
         /* Free through a copy: MSVC /analyze treats every env[i] as one
@@ -489,6 +619,17 @@ void taz_exec_free_env(char **env)
 /* The variables taz_exec_build_env sets for a switched identity. */
 #define TAZ_EXEC_IDENTITY_ENV_COUNT 3U
 
+/* One NAME/VALUE pair from an environment source: either the daemon's own
+ * process environment (uv_os_environ, on every platform), or - on Windows,
+ * when spawning as another user - that user's own environment block
+ * (CreateEnvironmentBlock). Neither pointer is owned by the pair; it just
+ * lets the merge below treat both sources the same way. */
+typedef struct
+{
+    const char *name;
+    const char *value;
+} env_pair_t;
+
 static int env_name_in_extra(const char *name, const taz_v1_KeyValue *extra,
                              size_t extra_count)
 {
@@ -501,6 +642,293 @@ static int env_name_in_extra(const char *name, const taz_v1_KeyValue *extra,
     }
     return 0;
 }
+
+/* Merges base (identity_count later entries override a same-named base
+ * entry, extra overrides both) into a NULL-terminated NAME=VALUE array.
+ * identity_names/identity_values may be NULL when identity_count is 0. */
+static int merge_env(const env_pair_t *base, size_t base_count,
+                     const char *const *identity_names,
+                     const char *const *identity_values, size_t identity_count,
+                     const taz_v1_KeyValue *extra, size_t extra_count,
+                     char ***out_env)
+{
+    char **merged = (char **)calloc(
+        base_count + identity_count + extra_count + 1U, sizeof(*merged));
+    if (merged == NULL)
+    {
+        return UV_ENOMEM;
+    }
+
+    size_t n = 0U;
+    for (size_t i = 0U; i < base_count; i++)
+    {
+        int overridden = env_name_in_extra(base[i].name, extra, extra_count);
+        for (size_t k = 0U; (overridden == 0) && (k < identity_count); k++)
+        {
+            if (TAZ_EXEC_ENV_NAME_CMP(base[i].name, identity_names[k]) == 0)
+            {
+                overridden = 1;
+            }
+        }
+        if (overridden)
+        {
+            continue;
+        }
+
+        merged[n] = join_name_value(base[i].name, base[i].value);
+        if (merged[n] == NULL)
+        {
+            free_env(merged);
+            return UV_ENOMEM;
+        }
+        n++;
+    }
+
+    for (size_t k = 0U; k < identity_count; k++)
+    {
+        if (env_name_in_extra(identity_names[k], extra, extra_count))
+        {
+            continue;
+        }
+        merged[n] = join_name_value(identity_names[k], identity_values[k]);
+        if (merged[n] == NULL)
+        {
+            free_env(merged);
+            return UV_ENOMEM;
+        }
+        n++;
+    }
+
+    for (size_t j = 0U; j < extra_count; j++)
+    {
+        merged[n] = join_name_value(extra[j].key, extra[j].value);
+        if (merged[n] == NULL)
+        {
+            free_env(merged);
+            return UV_ENOMEM;
+        }
+        n++;
+    }
+    merged[n] = NULL;
+
+    *out_env = merged;
+    return 0;
+}
+
+#ifdef _WIN32
+/* The value half of the first entry in envp (UTF-8 "NAME=VALUE", as built by
+ * taz_exec_build_env) whose name matches name case-insensitively, or NULL.
+ * Points into envp; not owned. */
+static const char *find_env_value(char *const *envp, const char *name)
+{
+    size_t len = strlen(name);
+    /* False positive, same root cause as free_env's guard above: the
+     * terminator-only array merge_env produces when every count is 0 loses
+     * its NULL binding for this checker across the out-param chain. */
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
+    for (size_t i = 0U; envp[i] != NULL; i++)
+    {
+        if ((_strnicmp(envp[i], name, len) == 0) && (envp[i][len] == '='))
+        {
+            return envp[i] + len + 1U;
+        }
+    }
+    return NULL;
+}
+
+/* Converts one entry ("NAME=VALUE", or a handful of pseudo-variables whose
+ * own name starts with '=' - the per-drive cwd entries, "=ExitCode" - that
+ * libuv's uv_os_environ skips the same way) from a double-NUL-terminated
+ * wide multi-string into a single malloc'd, NUL-split UTF-8 buffer: *out
+ * points at NAME, *out_value at VALUE, both inside that one allocation.
+ * Returns UV_EINVAL (not a real error, just "skip this entry") when there
+ * is no '=' to split on. */
+static int wide_env_entry_to_utf8(const WCHAR *entry, char **out,
+                                  const char **out_value)
+{
+    int needed =
+        WideCharToMultiByte(CP_UTF8, 0, entry, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0)
+    {
+        return uv_translate_sys_error((int)GetLastError());
+    }
+
+    char *buf = (char *)malloc((size_t)needed);
+    if (buf == NULL)
+    {
+        return UV_ENOMEM;
+    }
+    (void)WideCharToMultiByte(CP_UTF8, 0, entry, -1, buf, needed, NULL, NULL);
+
+    /* Search from offset 1: those pseudo-variables have a name that itself
+     * starts with '=', so the first '=' in the string is not the
+     * separator. */
+    char *eq = strchr(buf + 1, '=');
+    if (eq == NULL)
+    {
+        free(buf);
+        return UV_EINVAL;
+    }
+    *eq = '\0';
+
+    *out = buf;
+    *out_value = eq + 1;
+    return 0;
+}
+
+/* CreateEnvironmentBlock composes its machine-wide half from
+ * HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment, which
+ * on every host observed so far carries windir but not SystemRoot - yet the
+ * loader looks for SystemRoot specifically while starting a process with a
+ * custom environment block, and a child silently dying with
+ * STATUS_DLL_NOT_FOUND right after CreateProcessAsUserW otherwise succeeds
+ * is the documented symptom. SystemRoot is machine-wide, not per-user, so
+ * the daemon's own value is always the right one to borrow. */
+static int ensure_system_root(char ***envp_ptr)
+{
+    if (find_env_value(*envp_ptr, "SystemRoot") != NULL)
+    {
+        return 0;
+    }
+
+    wchar_t value_w[MAX_PATH];
+    DWORD len = GetEnvironmentVariableW(
+        L"SystemRoot", value_w, (DWORD)(sizeof(value_w) / sizeof(value_w[0])));
+    if (len == 0U || len >= (sizeof(value_w) / sizeof(value_w[0])))
+    {
+        return 0; /* Nothing to borrow; leave it to the OS to cope. */
+    }
+
+    int needed =
+        WideCharToMultiByte(CP_UTF8, 0, value_w, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0)
+    {
+        return 0;
+    }
+
+    static const char prefix[] = "SystemRoot=";
+    char *entry = (char *)malloc(sizeof(prefix) - 1U + (size_t)needed);
+    if (entry == NULL)
+    {
+        return UV_ENOMEM;
+    }
+    (void)memcpy(entry, prefix, sizeof(prefix) - 1U);
+    (void)WideCharToMultiByte(CP_UTF8, 0, value_w, -1,
+                              entry + (sizeof(prefix) - 1U), needed, NULL,
+                              NULL);
+
+    char **envp = *envp_ptr;
+    size_t count = 0U;
+    /* False positive, same root cause as free_env's guard above. */
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
+    for (; envp[count] != NULL; count++)
+    {
+    }
+    char **grown =
+        (char **)realloc((void *)envp, (count + 2U) * sizeof(*grown));
+    if (grown == NULL)
+    {
+        free(entry);
+        return UV_ENOMEM;
+    }
+    grown[count] = entry;
+    grown[count + 1U] = NULL;
+    *envp_ptr = grown;
+    return 0;
+}
+
+/* The target's own environment: CreateEnvironmentBlock(token,
+ * FALSE) - never the daemon's own uv_os_environ - with no USER/LOGNAME/
+ * HOME trio (those are POSIX-only; the target's own profile sets its
+ * equivalents), request env on top. */
+static int build_env_from_token(void *token, const taz_v1_KeyValue *extra,
+                                size_t extra_count, char ***out_env)
+{
+    LPVOID block = NULL;
+    if (!CreateEnvironmentBlock(&block, (HANDLE)token, FALSE))
+    {
+        return uv_translate_sys_error((int)GetLastError());
+    }
+
+    size_t count = 0U;
+    for (const WCHAR *p = (const WCHAR *)block; *p != L'\0';
+         p += wcslen(p) + 1U)
+    {
+        count++;
+    }
+
+    /* +1 so pairs/owned are never NULL when count is 0 - see the matching
+     * comment in taz_exec_build_env. */
+    env_pair_t *pairs = (env_pair_t *)calloc(count + 1U, sizeof(*pairs));
+    char **owned = (char **)calloc(count + 1U, sizeof(*owned));
+    if ((pairs == NULL) || (owned == NULL))
+    {
+        free(pairs);
+        free((void *)owned);
+        (void)DestroyEnvironmentBlock(block);
+        return UV_ENOMEM;
+    }
+
+    size_t n = 0U;
+    int rc = 0;
+    for (const WCHAR *p = (const WCHAR *)block; *p != L'\0';
+         p += wcslen(p) + 1U)
+    {
+        char *name = NULL;
+        const char *value = NULL;
+        int entry_rc = wide_env_entry_to_utf8(p, &name, &value);
+        if (entry_rc == UV_EINVAL)
+        {
+            continue; /* no '=': not a real entry, skip it */
+        }
+        if (entry_rc != 0)
+        {
+            rc = entry_rc;
+            break;
+        }
+
+        /* Can't happen: this loop walks the same multi-string the count
+         * above already walked once, so it fills at most `count` slots.
+         * MSVC /analyze cannot see that across the two loops (C6386), so
+         * spell it out. */
+        if (n >= count)
+        {
+            free(name);
+            break;
+        }
+
+        owned[n] = name;
+        pairs[n].name = name;
+        pairs[n].value = value;
+        n++;
+    }
+
+    if (rc == 0)
+    {
+        rc = merge_env(pairs, n, NULL, NULL, 0U, extra, extra_count, out_env);
+    }
+    if (rc == 0)
+    {
+        rc = ensure_system_root(out_env);
+        if (rc != 0)
+        {
+            taz_exec_free_env(*out_env);
+            *out_env = NULL;
+        }
+    }
+
+    for (size_t i = 0U; i < n; i++)
+    {
+        /* Free through a copy, same reason as free_env. */
+        char *entry = owned[i];
+        free(entry);
+    }
+    free((void *)owned);
+    free(pairs);
+    (void)DestroyEnvironmentBlock(block);
+    return rc;
+}
+#endif /* _WIN32 */
 
 int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env)
 {
@@ -521,6 +949,13 @@ int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env)
         identity_count = TAZ_EXEC_IDENTITY_ENV_COUNT;
     }
 
+#ifdef _WIN32
+    if (spec->token != NULL)
+    {
+        return build_env_from_token(spec->token, extra, extra_count, out_env);
+    }
+#endif
+
     uv_env_item_t *base = NULL;
     int base_count = 0;
     int rc = uv_os_environ(&base, &base_count);
@@ -529,73 +964,30 @@ int taz_exec_build_env(const taz_exec_spec_t *spec, char ***out_env)
         return rc;
     }
 
-    char **merged =
-        (char **)calloc((size_t)base_count + identity_count + extra_count + 1U,
-                        sizeof(*merged));
-    if (merged == NULL)
+    /* +1 and calloc (not malloc) so pairs is never NULL when base_count is
+     * 0 and every slot starts zeroed - GCC 13's -fanalyzer (unlike local
+     * GCC 16) cannot otherwise tell, across the merge_env call below, that
+     * a NULL pairs always pairs with a zero count, or that the loop below
+     * always fills indices [0, base_count) before merge_env reads them. */
+    env_pair_t *pairs =
+        (env_pair_t *)calloc((size_t)base_count + 1U, sizeof(*pairs));
+    if (pairs == NULL)
     {
         uv_os_free_environ(base, base_count);
         return UV_ENOMEM;
     }
-
-    size_t n = 0U;
     for (int i = 0; i < base_count; i++)
     {
-        int overridden = env_name_in_extra(base[i].name, extra, extra_count);
-        for (size_t k = 0U; (overridden == 0) && (k < identity_count); k++)
-        {
-            if (TAZ_EXEC_ENV_NAME_CMP(base[i].name, identity_names[k]) == 0)
-            {
-                overridden = 1;
-            }
-        }
-        if (overridden)
-        {
-            continue;
-        }
-
-        merged[n] = join_name_value(base[i].name, base[i].value);
-        if (merged[n] == NULL)
-        {
-            uv_os_free_environ(base, base_count);
-            free_env(merged);
-            return UV_ENOMEM;
-        }
-        n++;
+        pairs[i].name = base[i].name;
+        pairs[i].value = base[i].value;
     }
 
-    for (size_t k = 0U; k < identity_count; k++)
-    {
-        if (env_name_in_extra(identity_names[k], extra, extra_count))
-        {
-            continue;
-        }
-        merged[n] = join_name_value(identity_names[k], identity_values[k]);
-        if (merged[n] == NULL)
-        {
-            uv_os_free_environ(base, base_count);
-            free_env(merged);
-            return UV_ENOMEM;
-        }
-        n++;
-    }
+    rc = merge_env(pairs, (size_t)base_count, identity_names, identity_values,
+                   identity_count, extra, extra_count, out_env);
 
-    for (size_t j = 0U; j < extra_count; j++)
-    {
-        merged[n] = join_name_value(extra[j].key, extra[j].value);
-        if (merged[n] == NULL)
-        {
-            uv_os_free_environ(base, base_count);
-            free_env(merged);
-            return UV_ENOMEM;
-        }
-        n++;
-    }
-    merged[n] = NULL;
-
+    free(pairs);
     uv_os_free_environ(base, base_count);
-    *out_env = merged;
-    return 0;
+    return rc;
 }
 
 #ifdef _WIN32
@@ -643,12 +1035,856 @@ void taz_exec_apply_identity(uv_process_options_t *options,
 #endif
 }
 
+#ifdef _WIN32
+
+/* Windows' own hard limit for a CreateProcess command line, matching
+ * taz_platform_reexec's TAZ_REEXEC_CMDLINE_MAX. Heap, not stack, for the
+ * same MSVC /analyze C6262 large-stack-frame reason that constant is heap
+ * allocated there. */
+#define TAZ_EXEC_CMDLINE_MAX 32768U
+
+/* Converts a UTF-8 NUL-terminated string into a heap wchar_t buffer. NULL
+ * and *out_rc a UV_E* code on failure. */
+static wchar_t *utf8_to_wide(const char *s, int *out_rc)
+{
+    int needed = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (needed <= 0)
+    {
+        *out_rc = uv_translate_sys_error((int)GetLastError());
+        return NULL;
+    }
+
+    wchar_t *w = (wchar_t *)malloc((size_t)needed * sizeof(wchar_t));
+    if (w == NULL)
+    {
+        *out_rc = UV_ENOMEM;
+        return NULL;
+    }
+    (void)MultiByteToWideChar(CP_UTF8, 0, s, -1, w, needed);
+    *out_rc = 0;
+    return w;
+}
+
+/* Length of the name in a wide "NAME=VALUE" entry; a leading '=' (the
+ * hidden "=C:=C:\\dir" per-drive entries) belongs to the name. */
+static int env_name_len(const wchar_t *entry)
+{
+    const wchar_t *eq = wcschr(entry + ((entry[0] == L'=') ? 1 : 0), L'=');
+
+    return (int)((eq != NULL) ? (size_t)(eq - entry) : wcslen(entry));
+}
+
+/* qsort order for an environment block: by name, case-insensitively, as
+ * CreateProcess documents and uv_spawn builds its own blocks. */
+static int compare_env_entries(const void *a, const void *b)
+{
+    const wchar_t *entry_a = *(const wchar_t *const *)a;
+    const wchar_t *entry_b = *(const wchar_t *const *)b;
+
+    return CompareStringOrdinal(entry_a, env_name_len(entry_a), entry_b,
+                                env_name_len(entry_b), TRUE) -
+           CSTR_EQUAL;
+}
+
+/* Converts envp (UTF-8 "NAME=VALUE", NULL-terminated, as built by
+ * taz_exec_build_env) into a Windows environment block for
+ * CreateProcessAsUserW's lpEnvironment: every entry's wide form back to
+ * back, sorted by name, each NUL-terminated, the whole block additionally
+ * NUL-terminated (a double NUL at the end, including the empty-envp
+ * case). This is never a
+ * block from CreateEnvironmentBlock (taz_exec_build_env already consumed
+ * and destroyed that one) - just a plain heap buffer, freed with free(). */
+static int build_wide_env_block(char *const *envp, wchar_t **out_block)
+{
+    size_t count = 0U;
+    /* False positive, same root cause as free_env's guard above. */
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
+    for (; envp[count] != NULL; count++)
+    {
+    }
+
+    wchar_t **wide = NULL;
+    if (count > 0U)
+    {
+        wide = (wchar_t **)calloc(count, sizeof(*wide));
+        if (wide == NULL)
+        {
+            return UV_ENOMEM;
+        }
+    }
+
+    int rc = 0;
+    size_t converted = 0U;
+    size_t total = 0U;
+    for (; converted < count; converted++)
+    {
+        wide[converted] = utf8_to_wide(envp[converted], &rc);
+        if (wide[converted] == NULL)
+        {
+            break;
+        }
+        total += wcslen(wide[converted]) + 1U;
+    }
+
+    wchar_t *block = NULL;
+    if ((rc == 0) && (converted > 1U))
+    {
+        qsort((void *)wide, converted, sizeof(*wide), compare_env_entries);
+    }
+    if (rc == 0)
+    {
+        block = (wchar_t *)malloc((total + 1U) * sizeof(wchar_t));
+        if (block == NULL)
+        {
+            rc = UV_ENOMEM;
+        }
+    }
+    if (rc == 0)
+    {
+        size_t pos = 0U;
+        for (size_t i = 0U; i < converted; i++)
+        {
+            size_t len = wcslen(wide[i]) + 1U;
+            (void)memcpy(block + pos, wide[i], len * sizeof(wchar_t));
+            pos += len;
+        }
+        block[pos] = L'\0';
+    }
+
+    for (size_t i = 0U; i < converted; i++)
+    {
+        /* Free through a copy, same reason as free_env. */
+        wchar_t *entry = wide[i];
+        free(entry);
+    }
+    free((void *)wide);
+
+    if (rc == 0)
+    {
+        *out_block = block;
+    }
+    return rc;
+}
+
+/* Joins cwd, dir and name (plus "." ext unless ext is "") into a new
+ * string, resolving dir against cwd as uv_spawn does: a UNC dir ignores
+ * cwd, a rooted dir ("\\x") keeps only cwd's drive, a drive-relative dir
+ * ("D:x") uses cwd only when cwd is on that drive, and an absolute dir uses
+ * no cwd at all. NULL when out of memory. */
+static wchar_t *join_candidate(const wchar_t *cwd, size_t cwd_len,
+                               const wchar_t *dir, size_t dir_len,
+                               const wchar_t *name, size_t name_len,
+                               const wchar_t *ext)
+{
+    const size_t ext_len = wcslen(ext);
+    const int rooted =
+        (dir_len >= 1U) && ((dir[0] == L'\\') || (dir[0] == L'/'));
+    const int unc =
+        rooted && (dir_len > 2U) && ((dir[1] == L'\\') || (dir[1] == L'/'));
+    const int has_drive = (dir_len >= 2U) && (dir[1] == L':');
+    const int drive_relative =
+        has_drive &&
+        ((dir_len == 2U) || ((dir[2] != L'\\') && (dir[2] != L'/')));
+    wchar_t *out;
+    wchar_t *p;
+
+    if (unc || (has_drive && !drive_relative))
+    {
+        cwd_len = 0U;
+    }
+    else if (rooted)
+    {
+        cwd_len = (cwd_len < 2U) ? cwd_len : 2U;
+    }
+    else if (drive_relative)
+    {
+        if ((cwd_len < 2U) || (_wcsnicmp(cwd, dir, 2U) != 0))
+        {
+            cwd_len = 0U;
+        }
+        else
+        {
+            dir += 2;
+            dir_len -= 2U;
+        }
+    }
+
+    out = (wchar_t *)malloc(
+        (cwd_len + 1U + dir_len + 1U + name_len + 1U + ext_len + 1U) *
+        sizeof(wchar_t));
+    if (out == NULL)
+    {
+        return NULL;
+    }
+    p = out;
+    (void)wmemcpy(p, cwd, cwd_len);
+    p += cwd_len;
+    if ((cwd_len > 0U) && (wcschr(L"\\/:", p[-1]) == NULL))
+    {
+        *p++ = L'\\';
+    }
+    (void)wmemcpy(p, dir, dir_len);
+    p += dir_len;
+    if ((dir_len > 0U) && (wcschr(L"\\/:", p[-1]) == NULL))
+    {
+        *p++ = L'\\';
+    }
+    (void)wmemcpy(p, name, name_len);
+    p += name_len;
+    if (ext_len > 0U)
+    {
+        if ((name_len > 0U) && (p[-1] != L'.'))
+        {
+            *p++ = L'.';
+        }
+        (void)wmemcpy(p, ext, ext_len);
+        p += ext_len;
+    }
+    *p = L'\0';
+    return out;
+}
+
+/* Tries name in dir as given (only when it already has an extension), then
+ * with ".com", then ".exe"; returns the first that exists and is not a
+ * directory, or NULL. Sets *rc to UV_ENOMEM on an allocation failure. */
+static wchar_t *try_extensions(const wchar_t *cwd, size_t cwd_len,
+                               const wchar_t *dir, size_t dir_len,
+                               const wchar_t *name, size_t name_len,
+                               int name_has_ext, int *rc)
+{
+    static const wchar_t *const exts[] = {L"", L"com", L"exe"};
+    size_t i;
+
+    for (i = (name_has_ext != 0) ? 0U : 1U;
+         i < (sizeof(exts) / sizeof(exts[0])); i++)
+    {
+        wchar_t *candidate =
+            join_candidate(cwd, cwd_len, dir, dir_len, name, name_len, exts[i]);
+        DWORD attrs;
+
+        if (candidate == NULL)
+        {
+            *rc = UV_ENOMEM;
+            return NULL;
+        }
+        attrs = GetFileAttributesW(candidate);
+        if ((attrs != INVALID_FILE_ATTRIBUTES) &&
+            ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0U))
+        {
+            return candidate;
+        }
+        free(candidate);
+    }
+    return NULL;
+}
+
+/* Resolves file_w with the same rules uv_spawn uses on the plain path, so
+ * both spawn paths find the same program: a name with a directory part is
+ * taken relative to cwd_w (the child's working directory, or the daemon's
+ * own when NULL); a bare name is looked up in that working directory first
+ * (unless NoDefaultCurrentDirectoryInExePath is set), then along path_w -
+ * the child's own PATH, never the daemon's. Not found -> UV_ENOENT. */
+static int search_path_as_user(const wchar_t *file_w, const wchar_t *path_w,
+                               const wchar_t *cwd_w, wchar_t **out_resolved)
+{
+    const size_t file_len = wcslen(file_w);
+    const wchar_t *name = file_w + file_len;
+    const wchar_t *dot;
+    const wchar_t *cwd = cwd_w;
+    wchar_t *cwd_buf = NULL;
+    wchar_t *found = NULL;
+    size_t cwd_len;
+    int name_has_ext;
+    int rc = 0;
+
+    if ((file_len == 0U) || ((file_len == 1U) && (file_w[0] == L'.')))
+    {
+        return UV_ENOENT;
+    }
+    while ((name > file_w) && (name[-1] != L'\\') && (name[-1] != L'/') &&
+           (name[-1] != L':'))
+    {
+        name--;
+    }
+    dot = wcschr(name, L'.');
+    name_has_ext = (dot != NULL) && (dot[1] != L'\0');
+
+    if (cwd == NULL)
+    {
+        const DWORD needed = GetCurrentDirectoryW(0U, NULL);
+
+        cwd_buf = (needed > 0U)
+                      ? (wchar_t *)malloc((size_t)needed * sizeof(wchar_t))
+                      : NULL;
+        if ((cwd_buf == NULL) || (GetCurrentDirectoryW(needed, cwd_buf) == 0U))
+        {
+            free(cwd_buf);
+            return UV_ENOMEM;
+        }
+        cwd = cwd_buf;
+    }
+    cwd_len = wcslen(cwd);
+
+    if (name != file_w)
+    {
+        found = try_extensions(cwd, cwd_len, file_w, (size_t)(name - file_w),
+                               name, file_len - (size_t)(name - file_w),
+                               name_has_ext, &rc);
+    }
+    else
+    {
+        const wchar_t *p = path_w;
+
+        if (NeedCurrentDirectoryForExePathW(L"") != FALSE)
+        {
+            found = try_extensions(cwd, cwd_len, L"", 0U, file_w, file_len,
+                                   name_has_ext, &rc);
+        }
+        while ((found == NULL) && (rc == 0) && (p != NULL) && (*p != L'\0'))
+        {
+            const wchar_t *dir = p;
+            const wchar_t *seek = p;
+            const wchar_t *end;
+            size_t dir_len;
+
+            if ((*p == L'"') || (*p == L'\''))
+            {
+                const wchar_t *close = wcschr(p + 1, *p);
+
+                seek = (close != NULL) ? close : p + wcslen(p);
+            }
+            end = wcschr(seek, L';');
+            if (end == NULL)
+            {
+                end = seek + wcslen(seek);
+            }
+            p = (*end == L';') ? end + 1 : end;
+
+            dir_len = (size_t)(end - dir);
+            if ((dir_len > 0U) && ((dir[0] == L'"') || (dir[0] == L'\'')))
+            {
+                dir++;
+                dir_len--;
+            }
+            if ((dir_len > 0U) &&
+                ((dir[dir_len - 1U] == L'"') || (dir[dir_len - 1U] == L'\'')))
+            {
+                dir_len--;
+            }
+            if (dir_len == 0U)
+            {
+                continue;
+            }
+            found = try_extensions(cwd, cwd_len, dir, dir_len, file_w, file_len,
+                                   name_has_ext, &rc);
+        }
+    }
+    free(cwd_buf);
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    if (found == NULL)
+    {
+        return UV_ENOENT;
+    }
+    *out_resolved = found;
+    return 0;
+}
+
+static taz_exec_assign_job_fn_t g_assign_job_override = NULL;
+
+void taz_exec_set_assign_job_for_tests(taz_exec_assign_job_fn_t fn)
+{
+    g_assign_job_override = fn;
+}
+
+static BOOL assign_job(HANDLE job, HANDLE process)
+{
+    if (g_assign_job_override != NULL)
+    {
+        return (g_assign_job_override(job, process) != 0) ? TRUE : FALSE;
+    }
+    return AssignProcessToJobObject(job, process);
+}
+
+static LONG g_exec_pipe_serial = 0;
+
+/* One end of a pipe the child will write into and the daemon will read from
+ * (as-user path): *daemon_end is the overlapped server end, never
+ * inheritable,
+ * wrapped with uv_pipe_open by the caller; *child_end is a plain,
+ * inheritable client end, closed by the caller as soon as
+ * CreateProcessAsUserW has its own copy. */
+static int make_output_pipe(HANDLE *daemon_end, HANDLE *child_end)
+{
+    wchar_t name[64];
+    LONG serial = InterlockedIncrement(&g_exec_pipe_serial);
+
+    (void)swprintf(name, sizeof(name) / sizeof(name[0]),
+                   L"\\\\.\\pipe\\taz-exec-%lu-%ld",
+                   (unsigned long)GetCurrentProcessId(), (long)serial);
+
+    HANDLE server =
+        CreateNamedPipeW(name,
+                         PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED |
+                             FILE_FLAG_FIRST_PIPE_INSTANCE,
+                         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
+                             PIPE_REJECT_REMOTE_CLIENTS,
+                         1, 0, 65536, 0, NULL);
+    if (server == INVALID_HANDLE_VALUE)
+    {
+        return uv_translate_sys_error((int)GetLastError());
+    }
+
+    /* FILE_READ_ATTRIBUTES as libuv gives its own child pipe ends: a child
+     * may query its stdout/stderr handle (GetFileInformationByHandle,
+     * GetFileType through the CRT) and must not be refused. */
+    HANDLE client =
+        CreateFileW(name, GENERIC_WRITE | FILE_READ_ATTRIBUTES, 0, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (client == INVALID_HANDLE_VALUE)
+    {
+        int rc = uv_translate_sys_error((int)GetLastError());
+        (void)CloseHandle(server);
+        return rc;
+    }
+
+    if (!SetHandleInformation(client, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT))
+    {
+        int rc = uv_translate_sys_error((int)GetLastError());
+        (void)CloseHandle(server);
+        (void)CloseHandle(client);
+        return rc;
+    }
+
+    *daemon_end = server;
+    *child_end = client;
+    return 0;
+}
+
+/* The as-user child's stdin: an inheritable, read-only handle on NUL -
+ * the daemon never writes to the child, so there is no daemon-side pipe to
+ * wrap here, unlike the output streams above. */
+static int make_null_stdin(HANDLE *out)
+{
+    HANDLE h =
+        CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return uv_translate_sys_error((int)GetLastError());
+    }
+    if (!SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT))
+    {
+        int rc = uv_translate_sys_error((int)GetLastError());
+        (void)CloseHandle(h);
+        return rc;
+    }
+    *out = h;
+    return 0;
+}
+
+/* stdin, stdout, stderr: the only handles PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+ * is ever given below. */
+#define TAZ_EXEC_STD_HANDLE_COUNT 3U
+
+/* The second spawn path: spec->token != NULL. Takes ownership of
+ * spec->token into x (x->as_user, x->token) as its very first action after
+ * x->exit_async itself is live - from that point on, every failure in here
+ * is reported the same way a uv_spawn failure is on the plain path: the
+ * caller's close_all tears x down, closing whatever of job/token/profile/
+ * process_handle/wait this function got around to setting. Only resources
+ * that never made it into x (the four local-only handles, the various
+ * wide-string/environment-block conversions) are this function's own job to
+ * release, in the `fail` block below. argv is only read here, never
+ * modified or freed - the caller owns it. */
+static int spawn_as_user(uv_loop_t *loop, const taz_exec_spec_t *spec,
+                         taz_exec_t *x, char *const *argv)
+{
+    char profile_user[TAZ_EXEC_USER_MAX];
+    wchar_t *user_w = NULL;
+    char **envp = NULL;
+    wchar_t *path_w = NULL;
+    wchar_t *file_w = NULL;
+    wchar_t *app_w = NULL;
+    char *cmdline_utf8 = NULL;
+    wchar_t *cmdline_w = NULL;
+    wchar_t *env_block_w = NULL;
+    wchar_t *cwd_w = NULL;
+    HANDLE stdin_h = NULL;
+    HANDLE out_daemon = NULL;
+    HANDLE out_child = NULL;
+    HANDLE err_daemon = NULL;
+    HANDLE err_child = NULL;
+    int out_fd = -1;
+    int err_fd = -1;
+    LPPROC_THREAD_ATTRIBUTE_LIST attr_list = NULL;
+    SIZE_T attr_list_size = 0U;
+    /* Must stay valid from UpdateProcThreadAttribute through
+     * DeleteProcThreadAttributeList (MS docs): a nested block that closed
+     * before that call let the compiler reuse this stack slot. */
+    HANDLE handles[TAZ_EXEC_STD_HANDLE_COUNT];
+    PROCESS_INFORMATION pi;
+    STARTUPINFOEXW si;
+    PROFILEINFOW profile_info;
+    BOOL created = FALSE;
+    int rc;
+
+    (void)memset(&pi, 0, sizeof(pi));
+    (void)memset(&si, 0, sizeof(si));
+    (void)memset(&profile_info, 0, sizeof(profile_info));
+
+    rc = uv_async_init(loop, &x->exit_async, on_exit_async);
+    if (rc != 0)
+    {
+        return rc;
+    }
+    x->exit_async.data = x;
+    x->as_user = true;
+    x->token = (HANDLE)spec->token;
+
+    /* A new profile's directory is named after lpUserName, so it gets the
+     * bare account name, whichever form the client used. */
+    user_w =
+        utf8_to_wide(taz_run_as_bare_user(spec->identity_user, profile_user,
+                                          sizeof(profile_user)),
+                     &rc);
+    if (user_w == NULL)
+    {
+        goto fail;
+    }
+    profile_info.dwSize = sizeof(profile_info);
+    profile_info.dwFlags = PI_NOUI;
+    profile_info.lpUserName = user_w;
+    if (!LoadUserProfileW(x->token, &profile_info))
+    {
+        rc = uv_translate_sys_error((int)GetLastError());
+        goto fail;
+    }
+    x->profile = profile_info.hProfile;
+    free(user_w);
+    user_w = NULL;
+
+    rc = taz_exec_build_env(spec, &envp);
+    if (rc != 0)
+    {
+        envp = NULL;
+        goto fail;
+    }
+    if (envp == NULL)
+    {
+        /* Can't happen: merge_env always sets *out_env on a 0 return, and
+         * every taz_exec_build_env path returns 0 only via merge_env - the
+         * analyzer can't see that across two calls. */
+        rc = UV_EINVAL;
+        goto fail;
+    }
+
+    {
+        const char *path_value = find_env_value(envp, "PATH");
+        if (path_value != NULL)
+        {
+            path_w = utf8_to_wide(path_value, &rc);
+            if (path_w == NULL)
+            {
+                goto fail;
+            }
+        }
+    }
+
+    if (spec->cwd != NULL && spec->cwd[0] != '\0')
+    {
+        cwd_w = utf8_to_wide(spec->cwd, &rc);
+        if (cwd_w == NULL)
+        {
+            goto fail;
+        }
+    }
+
+    file_w = utf8_to_wide(spec->file, &rc);
+    if (file_w == NULL)
+    {
+        goto fail;
+    }
+    rc = search_path_as_user(file_w, path_w, cwd_w, &app_w);
+    if (rc != 0)
+    {
+        goto fail;
+    }
+    free(file_w);
+    file_w = NULL;
+    free(path_w);
+    path_w = NULL;
+
+    cmdline_utf8 = (char *)malloc(TAZ_EXEC_CMDLINE_MAX);
+    cmdline_w = (wchar_t *)malloc(TAZ_EXEC_CMDLINE_MAX * sizeof(wchar_t));
+    if (cmdline_utf8 == NULL || cmdline_w == NULL)
+    {
+        rc = UV_ENOMEM;
+        goto fail;
+    }
+    if (taz_cmdline_build(argv, cmdline_utf8, TAZ_EXEC_CMDLINE_MAX) != 0)
+    {
+        rc = UV_E2BIG;
+        goto fail;
+    }
+    if (MultiByteToWideChar(CP_UTF8, 0, cmdline_utf8, -1, cmdline_w,
+                            (int)TAZ_EXEC_CMDLINE_MAX) == 0)
+    {
+        rc = uv_translate_sys_error((int)GetLastError());
+        goto fail;
+    }
+    free(cmdline_utf8);
+    cmdline_utf8 = NULL;
+
+    rc = build_wide_env_block(envp, &env_block_w);
+    if (rc != 0)
+    {
+        goto fail;
+    }
+    taz_exec_free_env(envp);
+    envp = NULL;
+
+    rc = make_null_stdin(&stdin_h);
+    if (rc != 0)
+    {
+        goto fail;
+    }
+    rc = make_output_pipe(&out_daemon, &out_child);
+    if (rc != 0)
+    {
+        goto fail;
+    }
+    rc = make_output_pipe(&err_daemon, &err_child);
+    if (rc != 0)
+    {
+        goto fail;
+    }
+
+    /* uv_pipe_open takes ownership of the CRT fd from _open_osfhandle: from
+     * here on the daemon-side HANDLE is released through the fd (_close) or
+     * through the uv_pipe_t (uv_close), never through a direct CloseHandle -
+     * doing both would double-close it. */
+    out_fd = _open_osfhandle((intptr_t)out_daemon, 0);
+    if (out_fd < 0)
+    {
+        rc = UV_EINVAL;
+        goto fail;
+    }
+    out_daemon = NULL;
+    rc = uv_pipe_open(&x->out_pipe, out_fd);
+    if (rc != 0)
+    {
+        goto fail;
+    }
+    /* For fd 0-2 (handed out when the daemon runs without std handles)
+     * uv_pipe_open duplicates the handle and leaves the fd itself open, so
+     * close it here rather than leak it and keep a stdio fd aliased to the
+     * pipe. */
+    if (out_fd <= 2)
+    {
+        (void)_close(out_fd);
+    }
+    out_fd = -1;
+
+    err_fd = _open_osfhandle((intptr_t)err_daemon, 0);
+    if (err_fd < 0)
+    {
+        rc = UV_EINVAL;
+        goto fail;
+    }
+    err_daemon = NULL;
+    rc = uv_pipe_open(&x->err_pipe, err_fd);
+    if (rc != 0)
+    {
+        goto fail;
+    }
+    if (err_fd <= 2)
+    {
+        (void)_close(err_fd);
+    }
+    err_fd = -1;
+
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_list_size);
+    if (attr_list_size == 0U)
+    {
+        rc = uv_translate_sys_error((int)GetLastError());
+        goto fail;
+    }
+    attr_list = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0,
+                                                        attr_list_size);
+    if (attr_list == NULL)
+    {
+        rc = UV_ENOMEM;
+        goto fail;
+    }
+    if (!InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_list_size))
+    {
+        rc = uv_translate_sys_error((int)GetLastError());
+        goto fail;
+    }
+
+    /* Exactly these three, so no other inheritable handle in this
+     * process (there are none right now, but a future caller's choice
+     * is not this function's to make) rides along. */
+    handles[0] = stdin_h;
+    handles[1] = out_child;
+    handles[2] = err_child;
+    if (!UpdateProcThreadAttribute(
+            attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, (void *)handles,
+            sizeof(handles), NULL, NULL))
+    {
+        rc = uv_translate_sys_error((int)GetLastError());
+        goto fail;
+    }
+
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = stdin_h;
+    si.StartupInfo.hStdOutput = out_child;
+    si.StartupInfo.hStdError = err_child;
+    si.StartupInfo.lpDesktop = L"";
+    si.lpAttributeList = attr_list;
+
+    {
+        DWORD flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT |
+                      CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
+        created = CreateProcessAsUserW(x->token, app_w, cmdline_w, NULL, NULL,
+                                       TRUE, flags, env_block_w, cwd_w,
+                                       &si.StartupInfo, &pi);
+        if (!created)
+        {
+            rc = uv_translate_sys_error((int)GetLastError());
+        }
+    }
+
+    /* Needed on neither outcome from here on: attr_list and the three child
+     * handle copies are the daemon's own, separate from whatever the child
+     * inherited on success. */
+    DeleteProcThreadAttributeList(attr_list);
+    HeapFree(GetProcessHeap(), 0, attr_list);
+    attr_list = NULL;
+    (void)CloseHandle(stdin_h);
+    stdin_h = NULL;
+    (void)CloseHandle(out_child);
+    out_child = NULL;
+    (void)CloseHandle(err_child);
+    err_child = NULL;
+    free(cmdline_w);
+    cmdline_w = NULL;
+    free(app_w);
+    app_w = NULL;
+    free(env_block_w);
+    env_block_w = NULL;
+    free(cwd_w);
+    cwd_w = NULL;
+
+    if (!created)
+    {
+        return rc;
+    }
+
+    /* Set before ResumeThread: the child can exit before that call even
+     * returns, and taz_exec_pid/taz_exec_set_on_exit must see the real pid
+     * regardless. */
+    x->process.pid = (int)pi.dwProcessId;
+    x->process_handle = pi.hProcess;
+
+    if (!assign_job(x->job, pi.hProcess))
+    {
+        /* Unlike the uv_spawn path (which cannot stop a child once spawned),
+         * the child is still suspended here: no child ever runs outside the
+         * job. x->process_handle is already set, so the normal
+         * teardown (close_all -> on_handle_closed) still closes it. */
+        rc = uv_translate_sys_error((int)GetLastError());
+        (void)TerminateProcess(pi.hProcess, 1U);
+        (void)CloseHandle(pi.hThread);
+        return rc;
+    }
+
+    if (!RegisterWaitForSingleObject(&x->wait, pi.hProcess, on_process_wait, x,
+                                     INFINITE, WT_EXECUTEONLYONCE))
+    {
+        rc = uv_translate_sys_error((int)GetLastError());
+        (void)TerminateJobObject(x->job, 1);
+        (void)ResumeThread(pi.hThread);
+        (void)CloseHandle(pi.hThread);
+        return rc;
+    }
+
+    (void)ResumeThread(pi.hThread);
+    (void)CloseHandle(pi.hThread);
+    return 0;
+
+fail:
+    free(user_w);
+    taz_exec_free_env(envp);
+    free(path_w);
+    free(file_w);
+    free(app_w);
+    free(cmdline_utf8);
+    free(cmdline_w);
+    free(env_block_w);
+    free(cwd_w);
+    if (attr_list != NULL)
+    {
+        DeleteProcThreadAttributeList(attr_list);
+        HeapFree(GetProcessHeap(), 0, attr_list);
+    }
+    if (stdin_h != NULL)
+    {
+        (void)CloseHandle(stdin_h);
+    }
+    if (out_child != NULL)
+    {
+        (void)CloseHandle(out_child);
+    }
+    if (err_child != NULL)
+    {
+        (void)CloseHandle(err_child);
+    }
+    if (out_fd >= 0)
+    {
+        (void)_close(out_fd);
+    }
+    else if (out_daemon != NULL)
+    {
+        (void)CloseHandle(out_daemon);
+    }
+    if (err_fd >= 0)
+    {
+        (void)_close(err_fd);
+    }
+    else if (err_daemon != NULL)
+    {
+        (void)CloseHandle(err_daemon);
+    }
+    return rc;
+}
+
+#endif /* _WIN32 */
+
 int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
                    taz_exec_done_fn_t on_done, void *arg, taz_exec_t **out)
 {
+#ifndef _WIN32
+    /* On POSIX there is no token-aware spawn path: refuse and close it
+     * right away, on every platform this is ever reached on. */
+    if (spec->token != NULL)
+    {
+        taz_run_as_token_close(spec->token);
+        return UV_ENOTSUP;
+    }
+#endif
+
     taz_exec_t *x = (taz_exec_t *)calloc(1U, sizeof(*x));
     if (x == NULL)
     {
+#ifdef _WIN32
+        taz_run_as_token_close(spec->token);
+#endif
         return UV_ENOMEM;
     }
     x->on_done = on_done;
@@ -659,6 +1895,9 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     int rc = uv_pipe_init(loop, &x->out_pipe, 0);
     if (rc != 0)
     {
+#ifdef _WIN32
+        taz_run_as_token_close(spec->token);
+#endif
         taz_exec_capture_free(&x->capture);
         free(x);
         return rc;
@@ -668,6 +1907,9 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     rc = uv_pipe_init(loop, &x->err_pipe, 0);
     if (rc != 0)
     {
+#ifdef _WIN32
+        taz_run_as_token_close(spec->token);
+#endif
         x->closing = 1;
         uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);
         return rc;
@@ -677,6 +1919,9 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     rc = uv_timer_init(loop, &x->timer);
     if (rc != 0)
     {
+#ifdef _WIN32
+        taz_run_as_token_close(spec->token);
+#endif
         x->closing = 2;
         uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);
         uv_close((uv_handle_t *)&x->err_pipe, on_handle_closed);
@@ -685,12 +1930,7 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     x->timer.data = x;
 
     char **argv = NULL;
-    char **envp = NULL;
     rc = build_argv(spec, &argv);
-    if (rc == 0)
-    {
-        rc = taz_exec_build_env(spec, &envp);
-    }
 #ifdef _WIN32
     if (rc == 0)
     {
@@ -699,7 +1939,60 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
 #endif
     if (rc != 0)
     {
-        free_env(envp);
+#ifdef _WIN32
+        taz_run_as_token_close(spec->token);
+#endif
+        free((void *)argv);
+        x->closing = TAZ_EXEC_PRESPAWN_HANDLE_COUNT;
+        uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);
+        uv_close((uv_handle_t *)&x->err_pipe, on_handle_closed);
+        uv_close((uv_handle_t *)&x->timer, on_handle_closed);
+        return rc;
+    }
+
+#ifdef _WIN32
+    if (spec->token != NULL)
+    {
+        rc = spawn_as_user(loop, spec, x, argv);
+        free((void *)argv);
+        if (rc != 0)
+        {
+            if (x->as_user)
+            {
+                /* spawn_as_user already parked the token/profile/process
+                 * handle it acquired into x; close_all's as_user branch
+                 * (exit_async is live by now too) tears all of it down. */
+                close_all(x);
+            }
+            else
+            {
+                /* The only spawn_as_user failure before it takes ownership
+                 * of spec->token: its own uv_async_init call. */
+                taz_run_as_token_close(spec->token);
+                x->closing = TAZ_EXEC_PRESPAWN_HANDLE_COUNT;
+                uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);
+                uv_close((uv_handle_t *)&x->err_pipe, on_handle_closed);
+                uv_close((uv_handle_t *)&x->timer, on_handle_closed);
+            }
+            return rc;
+        }
+
+        (void)uv_read_start((uv_stream_t *)&x->out_pipe, on_alloc, on_read_out);
+        (void)uv_read_start((uv_stream_t *)&x->err_pipe, on_alloc, on_read_err);
+        if (spec->timeout_ms != 0U)
+        {
+            (void)uv_timer_start(&x->timer, on_timeout, spec->timeout_ms, 0U);
+        }
+
+        *out = x;
+        return 0;
+    }
+#endif
+
+    char **envp = NULL;
+    rc = taz_exec_build_env(spec, &envp);
+    if (rc != 0)
+    {
         free((void *)argv);
         x->closing = TAZ_EXEC_PRESPAWN_HANDLE_COUNT;
         uv_close((uv_handle_t *)&x->out_pipe, on_handle_closed);

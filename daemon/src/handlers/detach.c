@@ -296,19 +296,9 @@ void handle_detach(taz_dispatch_t *d, const taz_frame_header_t *header,
     spec.timeout_ms = inner->timeout_ms;
     spec.max_output_bytes = taz_config_exec_max_output_bytes();
 
-    {
-        taz_v1_ErrorCode as_user_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
-        const char *as_user_message = NULL;
-
-        if (taz_command_resolve_as_user(d, inner, &spec, &as_user_code,
-                                        &as_user_message) != 0)
-        {
-            detach_fail(d, header, write_fn, ctx, req, as_user_code,
-                        as_user_message, NULL);
-            return;
-        }
-    }
-
+    /* Allocated before as_user is resolved, so no failure between the two
+     * can hold a token that nothing would close: from the resolve on,
+     * taz_exec_start owns spec.token on every path. */
     dctx = (detach_ctx_t *)malloc(sizeof(*dctx));
     if (dctx == NULL)
     {
@@ -316,6 +306,22 @@ void handle_detach(taz_dispatch_t *d, const taz_frame_header_t *header,
                     taz_v1_ErrorCode_ERROR_CODE_INTERNAL, "out of memory",
                     NULL);
         return;
+    }
+
+    {
+        taz_v1_ErrorCode as_user_code = taz_v1_ErrorCode_ERROR_CODE_UNKNOWN;
+        const char *as_user_message = NULL;
+        char as_user_message_buf[256];
+
+        if (taz_command_resolve_as_user(d, inner, &spec, &as_user_code,
+                                        &as_user_message, as_user_message_buf,
+                                        sizeof(as_user_message_buf)) != 0)
+        {
+            free(dctx);
+            detach_fail(d, header, write_fn, ctx, req, as_user_code,
+                        as_user_message, NULL);
+            return;
+        }
     }
     dctx->d = d;
     dctx->write_fn = write_fn;
