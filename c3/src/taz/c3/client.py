@@ -264,11 +264,12 @@ class TazClient:
 
         Returns the ``effective_user`` now in effect: ``user``, or after a
         reset the daemon's own user. Applies only to subsequent COMMAND_EXEC
-        calls that do not pass their own ``as_user``; the child also gets
-        that user's ``USER``, ``LOGNAME`` and ``HOME`` unless ``env`` sets
-        them. Raises
-        ``TazError(NOT_SUPPORTED)`` locally, without sending anything, if the
-        daemon does not advertise RUN_AS (unprivileged or Windows).
+        calls that do not pass their own ``as_user``. The child also gets
+        that user's environment unless ``env`` overrides it: ``USER``,
+        ``LOGNAME`` and ``HOME`` on POSIX, the user's own profile
+        environment on Windows. Raises ``TazError(NOT_SUPPORTED)`` locally,
+        without sending anything, if the daemon does not advertise RUN_AS
+        (it runs neither as root nor, on Windows, as SYSTEM).
         """
         req = advanced_pb2.RunAsRequest(user=user)
         resp = self._call(

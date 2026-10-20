@@ -581,6 +581,10 @@ Daemons MAY limit `RUN_AS` to process-spawning operations; file and process-mana
 
 Per-request `as_user` on `COMMAND_EXEC` and `SHELL_OPEN` overrides this for a single call. `RUN_AS` is convenience for "run a batch of things as X without repeating `as_user` every call."
 
+`RUN_AS` takes effect in request order: it applies to every request sent after it on the connection, including requests sent before its response arrives.
+
+The child starts from the target's environment, with the request's `env` entries on top. On POSIX the reference daemon sets the target's `USER`, `LOGNAME` and `HOME`. On Windows it starts from the target's own profile environment (`USERNAME`, `USERPROFILE`, …) and switches identity with a Services-for-User (S4U) logon: no password is involved, and the token carries no network credentials, so the child reaches only what the account can reach locally. Accepted Windows `user` forms are `user`, `.\user` and `COMPUTER\user` for local accounts, and `DOMAIN\user` and `user@realm` for domain accounts, which need a reachable domain controller. The reference daemon's domain-account logon has not yet been tested against one. Each logon completes before the daemon handles the connection's next request, so a domain logon waiting on a slow domain controller holds up the daemon meanwhile. `effective_user` echoes `user` as sent; after a reset the daemon reports its own account, e.g. `NT AUTHORITY\SYSTEM` (localized on non-English systems).
+
 **Request (`RUN_AS`):**
 
 | Field  | Type   | Description                                                                |

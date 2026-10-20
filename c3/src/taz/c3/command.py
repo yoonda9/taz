@@ -74,10 +74,11 @@ class CommandNamespace:
         """Run ``command`` on the daemon and wait for it to finish.
 
         ``timeout_ms`` of 0 falls back to the connection's default timeout.
-        ``env`` entries are merged into (not a replacement for) the daemon's
-        own environment. ``as_user`` overrides the connection's RUN_AS
-        identity for this call only; the daemon answers NOT_SUPPORTED unless
-        it is privileged.
+        ``env`` entries are merged into (not a replacement for) the child's
+        base environment: the daemon's own, or under a Windows RUN_AS or
+        ``as_user`` identity, that user's. ``as_user`` overrides the
+        connection's RUN_AS identity for this call only; the daemon answers
+        NOT_SUPPORTED unless it is privileged.
         """
         req = self.build_exec_request(
             command, args, env, working_dir, timeout_ms, as_user
