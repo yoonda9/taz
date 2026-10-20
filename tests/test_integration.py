@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import ntpath
 import os
 import re
 import shutil
@@ -13,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ import google_crc32c
 import psutil
 import pytest
 from google.protobuf import empty_pb2
+from google.protobuf.message import Message
 from taz.c3 import (
     CommandResult,
     FileTransfer,
@@ -34,7 +36,9 @@ from taz.c3 import (
     TazError,
     TazPriorityError,
 )
+from taz.c3 import connection as c3_connection
 from taz.c3.file import Kind
+from taz.c3.protocol.frame import Frame, pack_header
 from taz.v1 import (
     advanced_pb2,
     command_pb2,
@@ -44,7 +48,7 @@ from taz.v1 import (
     process_pb2,
 )
 
-from tests.conftest import Daemon, _check_exit, _launch
+from tests.conftest import Daemon, _check_exit, _launch, process_is_system
 
 _PROCESS_OPCODES = {
     common_pb2.OPCODE_PROCESS_LIST,
@@ -548,17 +552,19 @@ class TestConnectionTimeout:
         assert taz_client.timeout(500) == 0
         assert taz_client.timeout(1000) == 500
 
-    def test_capabilities_advertise_timeout_set_and_log_and_run_as_only_as_root(
+    def test_capabilities_advertise_timeout_set_and_log_and_run_as_only_when_privileged(
         self, taz_client: TazClient
     ) -> None:
         ops = set(taz_client.capabilities().operations)
         assert common_pb2.OPCODE_TIMEOUT_SET in ops
         assert common_pb2.OPCODE_LOG in ops
-        assert (common_pb2.OPCODE_RUN_AS in ops) == _DAEMON_IS_ROOT
+        assert (common_pb2.OPCODE_RUN_AS in ops) == _DAEMON_IS_PRIVILEGED
 
 
 # The fixture's daemon inherits the test process's identity.
 _DAEMON_IS_ROOT = sys.platform != "win32" and os.geteuid() == 0
+_DAEMON_IS_SYSTEM = sys.platform == "win32" and process_is_system()
+_DAEMON_IS_PRIVILEGED = _DAEMON_IS_ROOT or _DAEMON_IS_SYSTEM
 
 _ROOT_ONLY = pytest.mark.skipif(
     not _DAEMON_IS_ROOT,
@@ -568,21 +574,154 @@ _ROOT_ONLY = pytest.mark.skipif(
 )
 
 _UNPRIVILEGED_ONLY = pytest.mark.skipif(
-    _DAEMON_IS_ROOT,
-    reason="a daemon started as root advertises RUN_AS; the test_root_* "
-    "rows cover it instead",
+    _DAEMON_IS_PRIVILEGED,
+    reason="a privileged daemon advertises RUN_AS; the test_root_*/"
+    "test_system_* rows cover it instead",
 )
+
+_SYSTEM_ONLY = pytest.mark.skipif(
+    not _DAEMON_IS_SYSTEM,
+    reason="RUN_AS's Windows rows need a daemon started as SYSTEM; "
+    "`just test-py-system` runs them",
+)
+
+_TEST_USER = os.environ.get("TAZ_TEST_USER")
+
+
+def _test_user() -> str:
+    """``TAZ_TEST_USER``, required by every ``system``-marked row."""
+    if _TEST_USER is None:
+        pytest.fail("TAZ_TEST_USER is required for RUN_AS's SYSTEM rows")
+    return _TEST_USER
+
 
 # A program the RUN_AS target can always execute: sys.executable may sit
 # under a home directory (e.g. a 0700 /home/<user>) the target cannot
 # traverse.
 _ID = "id"
 
+# Windows equivalents: a plain taz-runas account cannot read the mise
+# Python under C:\Users\user\AppData, so the Windows RUN_AS rows run only
+# %SystemRoot%\System32 programs, for the same reason.
+_WHOAMI = os.path.expandvars(r"%SystemRoot%\System32\whoami.exe")
+_CMD = os.path.expandvars(r"%SystemRoot%\System32\cmd.exe")
+_PING = os.path.expandvars(r"%SystemRoot%\System32\ping.exe")
+_POWERSHELL = os.path.expandvars(
+    r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+)
+
+# STATUS_DLL_INIT_FAILED: a child's exit code when user32 cannot open the
+# window station or desktop its token was given.
+_STATUS_DLL_INIT_FAILED = 0xC0000142
+
+_PRIVILEGED_ONLY = pytest.mark.skipif(
+    not _DAEMON_IS_PRIVILEGED,
+    reason="RUN_AS needs a privileged daemon: root on POSIX, or SYSTEM on "
+    "Windows (`just test-py-system`)",
+)
+
+
+def _ran_as(whoami_output: bytes, user: str) -> bool:
+    """True iff whoami.exe's ``DOMAIN\\user`` output names ``user``."""
+    return whoami_output.decode().strip().lower().endswith(f"\\{user.lower()}")
+
+
+def _privileged_target_user() -> str:
+    """The RUN_AS target of a row that runs on both privileged lanes."""
+    if sys.platform == "win32":
+        return _test_user()
+    return os.environ.get("TAZ_TEST_USER", "nobody")
+
+
+def _daemon_user() -> str:
+    """The short name of the identity the fixture's daemon runs as."""
+    if sys.platform == "win32":
+        return "SYSTEM"
+    import pwd
+
+    return pwd.getpwuid(os.geteuid()).pw_name
+
+
+def _identity_probe() -> tuple[str, list[str]]:
+    """A program (and its args) the RUN_AS target can always run, which
+    prints the user it runs as."""
+    if sys.platform == "win32":
+        return _WHOAMI, []
+    return _ID, ["-un"]
+
+
+def _probe_names(output: bytes, user: str) -> bool:
+    """True iff :func:`_identity_probe`'s output names ``user``."""
+    if sys.platform == "win32":
+        return _ran_as(output, user)
+    return output.decode().strip() == user
+
+
+def _send_pipelined(
+    client: TazClient, requests: Sequence[tuple[int, bytes]]
+) -> list[int]:
+    """Put several REQUEST frames on the wire in a single socket write,
+    without waiting for any reply, so the daemon reads them from one buffer.
+    ``send_request`` still assigns each stream id and runs its own checks;
+    only its socket writes are held back and joined."""
+    held: list[bytes] = []
+
+    def hold(_sock: socket.socket, frame: Frame) -> None:
+        held.append(pack_header(frame) + frame.payload)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(c3_connection, "_send_frame", hold)
+        stream_ids = [
+            client._conn.send_request(op, payload) for op, payload in requests
+        ]
+    sock = client._conn._sock
+    assert sock is not None
+    sock.sendall(b"".join(held))
+    return stream_ids
+
+
+def _reply[M: Message](
+    client: TazClient, stream_id: int, opcode: int, response_type: type[M]
+) -> M:
+    """The RESPONSE to a request sent by :func:`_send_pipelined`; an ERROR
+    reply fails the test with its code and message."""
+    frame = client._dispatcher.recv_response(
+        stream_id,
+        client._keepalive,
+        expected_opcode=opcode,
+        response_type=response_type,
+    )
+    if frame.type == common_pb2.FRAME_TYPE_ERROR:
+        info = common_pb2.ErrorInfo()
+        info.ParseFromString(frame.payload)
+        pytest.fail(f"stream {stream_id}: error {info.code}: {info.message}")
+    resp = response_type()
+    resp.ParseFromString(frame.payload)
+    return resp
+
+
+def _detach_and_cancel(
+    client: TazClient, command: str, args: list[str], **kwargs: Any
+) -> None:
+    """DETACH a long-running ``command``, CANCEL it, and wait until the task
+    is CANCELLED and its process is gone."""
+    task = client.task.detach(client.command.exec, command, args, **kwargs)
+    assert client.task.cancel(task.task_id) is True
+    deadline = time.monotonic() + 10
+    status = client.task.status(task.task_id)
+    while status.state == TaskState.RUNNING:
+        assert time.monotonic() < deadline, "task never finished"
+        time.sleep(0.05)
+        status = client.task.status(task.task_id)
+    assert status.state == TaskState.CANCELLED
+    assert _wait_process_gone(task.pid), f"detached pid {task.pid} still exists"
+
 
 class TestRunAs:
-    """``RUN_AS`` (0x0040) is POSIX-only, gated by the daemon's *real*
-    privilege (not a client-side switch), and deferred entirely on
-    Windows. Most of this class only runs when euid is 0."""
+    """``RUN_AS`` (0x0040) is gated by the daemon's *real* privilege (not a
+    client-side switch): root on POSIX, SYSTEM on Windows. Most of this
+    class only runs when the daemon is privileged; the Windows rows are
+    ``TestRunAsSystem`` below, run by ``just test-py-system``."""
 
     @pytest.mark.valgrind
     @_UNPRIVILEGED_ONLY
@@ -739,6 +878,50 @@ class TestRunAs:
             taz_client.run_as("definitely-no-such-user")
         assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
 
+    # Kept ahead of every other `system` row: on an account the lane has
+    # just created (each CI run), this is the logon that creates its
+    # profile, through a qualified name.
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_qualified_names_run_as_and_as_user(
+        self, taz_client: TazClient
+    ) -> None:
+        if sys.platform != "win32":
+            return  # unreachable at runtime; gives mypy the platform narrowing
+        import winreg
+
+        user = _test_user()
+        computer = os.environ.get("COMPUTERNAME")
+        if not computer:
+            pytest.fail("COMPUTERNAME is not set")
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
+        ) as key:
+            profiles_dir = os.path.expandvars(
+                winreg.QueryValueEx(key, "ProfilesDirectory")[0]
+            )
+
+        try:
+            for name in (f"{computer}\\{user}", f".\\{user}"):
+                assert taz_client.run_as(name).lower().endswith(user.lower())
+                assert _ran_as(taz_client.command.exec(_WHOAMI).stdout, user), name
+                env = taz_client.command.exec(_CMD, args=["/c", "set"]).stdout.decode()
+                assert re.search(rf"(?im)^USERNAME={re.escape(user)}\r?$", env), name
+                profile = re.search(r"(?im)^USERPROFILE=(.*?)\r?$", env)
+                assert profile is not None, name
+                # The profile is the account's own directory under the
+                # profiles directory, whichever name form created it.
+                assert ntpath.dirname(profile[1]).lower() == profiles_dir.lower()
+                assert ntpath.basename(profile[1]).lower().startswith(user.lower())
+
+                assert taz_client.run_as("") == "NT AUTHORITY\\SYSTEM"
+                output = taz_client.command.exec(_WHOAMI, as_user=name).stdout
+                assert _ran_as(output, user), name
+        finally:
+            taz_client.run_as("")
+
+    @pytest.mark.system
     def test_demo_timeout_run_as_and_log(self, taz_client: TazClient) -> None:
         taz_client.timeout(5000)
         if sys.platform != "win32" and os.geteuid() == 0:
@@ -749,10 +932,475 @@ class TestRunAs:
             result = taz_client.command.exec("whoami")
             assert result.stdout.strip() == target_user.encode()
             assert taz_client.run_as("") == pwd.getpwuid(os.geteuid()).pw_name
+        elif _DAEMON_IS_SYSTEM:
+            target_user = _test_user()
+            assert taz_client.run_as(target_user) == target_user
+            result = taz_client.command.exec(_WHOAMI)
+            assert (
+                result.stdout.decode()
+                .strip()
+                .lower()
+                .endswith(f"\\{target_user.lower()}")
+            )
+            assert taz_client.run_as("") == "NT AUTHORITY\\SYSTEM"
         result = taz_client.command.exec(PY, args=_py("print('demo')"))
         assert result.exit_code == 0
         entries = taz_client.log(lines=10)
         assert len(entries) >= 1
+
+    @pytest.mark.system
+    @_PRIVILEGED_ONLY
+    def test_privileged_pipelined_run_as_applies_before_the_next_request(
+        self, taz_client: TazClient
+    ) -> None:
+        # Requests written together, without waiting for the RUN_AS reply
+        # (the protocol allows pipelining): each must see the identity every
+        # RUN_AS before it set, in send order.
+        target_user = _privileged_target_user()
+        probe, probe_args = _identity_probe()
+        run_as_op = common_pb2.OPCODE_RUN_AS
+        exec_op = common_pb2.OPCODE_COMMAND_EXEC
+        run_as = advanced_pb2.RunAsRequest(user=target_user).SerializeToString()
+        reset = advanced_pb2.RunAsRequest(user="").SerializeToString()
+        exec_req = taz_client.command.build_exec_request(probe, probe_args)
+        exec_payload = exec_req.SerializeToString()
+        try:
+            run_as_id, exec_id = _send_pipelined(
+                taz_client, [(run_as_op, run_as), (exec_op, exec_payload)]
+            )
+            reply = _reply(taz_client, run_as_id, run_as_op, advanced_pb2.RunAsResponse)
+            assert reply.effective_user == target_user
+            output = _reply(
+                taz_client, exec_id, exec_op, command_pb2.CommandExecResponse
+            ).stdout_data
+            assert _probe_names(output, target_user), output
+
+            # A reset right behind a named RUN_AS must win.
+            first_id, reset_id, exec_id = _send_pipelined(
+                taz_client,
+                [(run_as_op, run_as), (run_as_op, reset), (exec_op, exec_payload)],
+            )
+            for stream_id in (first_id, reset_id):
+                reply = _reply(
+                    taz_client, stream_id, run_as_op, advanced_pb2.RunAsResponse
+                )
+                assert reply.success
+            output = _reply(
+                taz_client, exec_id, exec_op, command_pb2.CommandExecResponse
+            ).stdout_data
+            assert _probe_names(output, _daemon_user()), output
+        finally:
+            taz_client.run_as("")
+
+
+class TestRunAsSystem:
+    """``RUN_AS``'s Windows rows: the daemon must be started as SYSTEM
+    through a scheduled task (``just test-py-system``'s lane), which is
+    what makes the real S4U logon/``CreateProcessAsUserW`` path
+    reachable. Every row here carries both ``@pytest.mark.system`` (the
+    lane's own selection) and ``@_SYSTEM_ONLY`` (so it skips, rather than
+    fails, off the lane - the lane's own junit check is what turns a skip
+    into a failure under CI)."""
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_run_as_switches_and_resets_command_exec_identity(
+        self, taz_client: TazClient
+    ) -> None:
+        target_user = _test_user()
+        assert taz_client.run_as(target_user) == target_user
+        result = taz_client.command.exec(_WHOAMI)
+        assert (
+            result.stdout.decode().strip().lower().endswith(f"\\{target_user.lower()}")
+        )
+
+        assert taz_client.run_as("") == "NT AUTHORITY\\SYSTEM"
+        result = taz_client.command.exec(_WHOAMI)
+        assert result.stdout.decode().strip().lower() == "nt authority\\system"
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_per_call_as_user_overrides_connection_identity(
+        self, taz_client: TazClient
+    ) -> None:
+        target_user = _test_user()
+
+        def whoami() -> str:
+            result = taz_client.command.exec(_WHOAMI)
+            return result.stdout.decode().strip().lower()
+
+        def whoami_as(user: str) -> str:
+            result = taz_client.command.exec(_WHOAMI, as_user=user)
+            return result.stdout.decode().strip().lower()
+
+        # No connection identity yet: the override runs as the target,
+        # a plain call runs as SYSTEM.
+        assert whoami_as(target_user).endswith(f"\\{target_user.lower()}")
+        assert whoami() == "nt authority\\system"
+
+        assert taz_client.run_as(target_user) == target_user
+        assert whoami().endswith(f"\\{target_user.lower()}")
+
+        assert taz_client.run_as("") == "NT AUTHORITY\\SYSTEM"
+        assert whoami() == "nt authority\\system"
+        assert whoami_as(target_user).endswith(f"\\{target_user.lower()}")
+        # The override applies to that call only.
+        assert whoami() == "nt authority\\system"
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_detach_runs_as_the_connection_identity_or_as_user(
+        self, taz_client: TazClient
+    ) -> None:
+        target_user = _test_user()
+
+        def detached_output(**kwargs: Any) -> bytes:
+            task = taz_client.task.detach(taz_client.command.exec, _WHOAMI, **kwargs)
+            deadline = time.monotonic() + 10
+            status = taz_client.task.status(task.task_id)
+            while status.state == TaskState.RUNNING:
+                assert time.monotonic() < deadline, "task never finished"
+                time.sleep(0.05)
+                status = taz_client.task.status(task.task_id)
+            assert status.state == TaskState.COMPLETED
+            assert status.result is not None
+            return status.result.stdout
+
+        assert (
+            detached_output(as_user=target_user)
+            .decode()
+            .strip()
+            .lower()
+            .endswith(f"\\{target_user.lower()}")
+        )
+        assert taz_client.run_as(target_user) == target_user
+        assert (
+            detached_output()
+            .decode()
+            .strip()
+            .lower()
+            .endswith(f"\\{target_user.lower()}")
+        )
+
+        task = taz_client.task.detach(
+            taz_client.command.exec, _PING, ["-n", "31", "127.0.0.1"]
+        )
+        status = taz_client.task.status(task.task_id)
+        assert status.state == TaskState.RUNNING
+        assert taz_client.task.cancel(task.task_id) is True
+        deadline = time.monotonic() + 10
+        while status.state == TaskState.RUNNING:
+            assert time.monotonic() < deadline, "task never finished"
+            time.sleep(0.05)
+            status = taz_client.task.status(task.task_id)
+        assert status.state == TaskState.CANCELLED
+        assert _wait_process_gone(task.pid), f"detached pid {task.pid} still exists"
+
+        taz_client.run_as("")
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_child_sees_target_username_and_userprofile(
+        self, taz_client: TazClient
+    ) -> None:
+        target_user = _test_user()
+        try:
+            assert taz_client.run_as(target_user) == target_user
+            result = taz_client.command.exec(_WHOAMI)
+            assert (
+                result.stdout.decode()
+                .strip()
+                .lower()
+                .endswith(f"\\{target_user.lower()}")
+            )
+
+            result = taz_client.command.exec(_CMD, args=["/c", "set"])
+            text = result.stdout.decode()
+            assert re.search(rf"(?im)^USERNAME={re.escape(target_user)}\r?$", text)
+            assert re.search(
+                rf"(?im)^USERPROFILE=C:\\Users\\{re.escape(target_user)}", text
+            )
+            assert re.search(r"(?im)^USER=", text) is None
+            assert re.search(r"(?im)^LOGNAME=", text) is None
+
+            result = taz_client.command.exec(
+                _CMD, args=["/c", "set"], env={"USERPROFILE": r"C:\custom"}
+            )
+            text = result.stdout.decode()
+            assert re.search(r"(?im)^USERPROFILE=C:\\custom\r?$", text)
+            assert re.search(rf"(?im)^USERNAME={re.escape(target_user)}\r?$", text)
+        finally:
+            taz_client.run_as("")
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_timeout_and_output_cap_on_the_as_user_path(
+        self, taz_client: TazClient
+    ) -> None:
+        target_user = _test_user()
+        start = time.monotonic()
+        result = taz_client.command.exec(
+            _PING,
+            args=["-n", "31", "127.0.0.1"],
+            as_user=target_user,
+            timeout_ms=500,
+        )
+        assert result.timed_out is True
+        assert time.monotonic() - start < 5.0
+
+        result = taz_client.command.exec(
+            _CMD,
+            args=["/c", "for /l %i in (1,1,200000) do @echo xxxxxxxxxxxxxxxx"],
+            as_user=target_user,
+        )
+        assert result.truncated is True
+        assert len(result.stdout) <= 1 << 20
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_timeout_kills_the_grandchild(self, taz_client: TazClient) -> None:
+        target_user = _test_user()
+        # Watched while the exec runs: the row proves something only if a
+        # grandchild ping.exe really ran as the target before the kill.
+        seen: dict[int, psutil.Process] = {}
+        unidentified: set[int] = set()
+        stop = threading.Event()
+
+        def watch() -> None:
+            while not stop.is_set():
+                for proc in psutil.process_iter(["name"]):
+                    name = (proc.info["name"] or "").lower()
+                    if name != "ping.exe" or proc.pid in seen:
+                        continue
+                    try:
+                        username = proc.username()
+                    except psutil.NoSuchProcess:
+                        continue
+                    except psutil.AccessDenied:
+                        unidentified.add(proc.pid)
+                        continue
+                    if username.lower().endswith(f"\\{target_user.lower()}"):
+                        seen[proc.pid] = proc
+                time.sleep(0.05)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        try:
+            result = taz_client.command.exec(
+                _CMD,
+                args=["/c", "ping -n 31 127.0.0.1"],
+                as_user=target_user,
+                timeout_ms=3000,
+            )
+        finally:
+            stop.set()
+            watcher.join(timeout=5)
+        assert result.timed_out is True
+        assert seen, (
+            f"no ping.exe running as {target_user} was seen before the timeout "
+            f"(ping.exe pids whose user could not be read: {sorted(unidentified)})"
+        )
+        for pid in seen:
+            assert _wait_process_gone(pid), f"grandchild ping.exe {pid} survived"
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_unknown_user_returns_not_found_and_nodomain_is_defined(
+        self, taz_client: TazClient
+    ) -> None:
+        target_user = _test_user()
+        with pytest.raises(TazError) as exc_info:
+            taz_client.run_as("definitely-no-such-user")
+        assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+        taz_client.ping()
+
+        with pytest.raises(TazError) as exc_info:
+            taz_client.run_as("NODOMAIN\\x")
+        assert exc_info.value.code in (
+            common_pb2.ERROR_CODE_NOT_FOUND,
+            common_pb2.ERROR_CODE_INTERNAL,
+        )
+        assert "LsaLogonUser" in exc_info.value.message
+        taz_client.ping()
+
+        assert taz_client.run_as(target_user) == target_user
+        taz_client.run_as("")
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_no_handle_leak_across_run_as_spawns(
+        self, taz_client: TazClient, daemon: Daemon
+    ) -> None:
+        if sys.platform != "win32":
+            return  # unreachable at runtime; gives mypy the platform narrowing
+        target_user = _test_user()
+        proc = psutil.Process(daemon.pid)
+        ping = ["-n", "31", "127.0.0.1"]
+
+        def spawn_paths() -> None:
+            # Every as-user spawn path once: success under RUN_AS and per
+            # call, a failed spawn, a timeout, and DETACH + CANCEL.
+            assert taz_client.run_as(target_user) == target_user
+            assert _ran_as(taz_client.command.exec(_WHOAMI).stdout, target_user)
+            with pytest.raises(TazError):
+                taz_client.command.exec("no-such-program-7f3a.exe")
+            result = taz_client.command.exec(_PING, args=ping, timeout_ms=200)
+            assert result.timed_out is True
+            _detach_and_cancel(taz_client, _PING, ping)
+            assert taz_client.run_as("") == "NT AUTHORITY\\SYSTEM"
+            output = taz_client.command.exec(_WHOAMI, as_user=target_user).stdout
+            assert _ran_as(output, target_user)
+            _detach_and_cancel(taz_client, _PING, ping, as_user=target_user)
+
+        # The first RUN_AS logons, and the first use of each path, grow the
+        # daemon's worker pool, LSA client state and caches once. A full
+        # warm-up pass keeps that out of the baseline, so the tolerance
+        # below is real headroom.
+        for _ in range(6):
+            with TazClient("127.0.0.1", daemon.port) as warm:
+                assert warm.run_as(target_user) == target_user
+        spawn_paths()
+        time.sleep(0.5)
+        baseline = proc.num_handles()
+
+        # Five passes: a leak of a single handle per operation on any one
+        # path ends up past the tolerance.
+        for _ in range(5):
+            spawn_paths()
+
+        time.sleep(1.0)
+        after = proc.num_handles()
+        print(f"handles baseline={baseline} after={after}")
+        assert after <= baseline + 2, f"baseline={baseline} after={after}"
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_no_handle_leak_across_failed_and_replaced_run_as(
+        self, taz_client: TazClient, daemon: Daemon
+    ) -> None:
+        if sys.platform != "win32":
+            return  # unreachable at runtime; gives mypy the platform narrowing
+        target_user = _test_user()
+        proc = psutil.Process(daemon.pid)
+
+        def run_as_paths() -> None:
+            # A name that does not exist, a domain logon that fails in LSA,
+            # an identity replaced by itself, and a reset.
+            with pytest.raises(TazError) as exc_info:
+                taz_client.run_as("definitely-no-such-user")
+            assert exc_info.value.code == common_pb2.ERROR_CODE_NOT_FOUND
+            with pytest.raises(TazError):
+                taz_client.run_as("NODOMAIN\\x")
+            assert taz_client.run_as(target_user) == target_user
+            assert taz_client.run_as(target_user) == target_user
+            assert taz_client.run_as("") == "NT AUTHORITY\\SYSTEM"
+
+        run_as_paths()  # warm-up, as in the spawn-path row
+        time.sleep(0.5)
+        baseline = proc.num_handles()
+
+        for _ in range(5):
+            run_as_paths()
+
+        time.sleep(1.0)
+        after = proc.num_handles()
+        print(f"handles baseline={baseline} after={after}")
+        assert after <= baseline + 2, f"baseline={baseline} after={after}"
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_capabilities_advertise_run_as(self, taz_client: TazClient) -> None:
+        ops = set(taz_client.capabilities().operations)
+        assert common_pb2.OPCODE_RUN_AS in ops
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_run_as_child_can_initialise_user32(
+        self, taz_client: TazClient
+    ) -> None:
+        # A child started for another user from session 0 dies at start-up
+        # with STATUS_DLL_INIT_FAILED when user32 cannot open the window
+        # station or desktop it is given. WinForms' UserInteractive reads the
+        # window station through user32.
+        target_user = _test_user()
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "[Environment]::UserName; "
+            "[System.Windows.Forms.SystemInformation]::UserInteractive"
+        )
+        assert taz_client.run_as(target_user) == target_user
+        try:
+            result = taz_client.command.exec(
+                _POWERSHELL,
+                args=["-NoProfile", "-NonInteractive", "-Command", script],
+                timeout_ms=120_000,
+            )
+        finally:
+            taz_client.run_as("")
+        assert result.exit_code not in (
+            _STATUS_DLL_INIT_FAILED,
+            _STATUS_DLL_INIT_FAILED - (1 << 32),
+        ), "the child could not initialise user32 (STATUS_DLL_INIT_FAILED)"
+        assert result.exit_code == 0, result.stderr
+        lines = result.stdout.decode(errors="replace").split()
+        assert len(lines) == 2, result.stdout
+        assert lines[0].lower() == target_user.lower()
+        assert lines[1] in ("True", "False")
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_run_as_still_allows_system_only_file_stat(
+        self, taz_client: TazClient
+    ) -> None:
+        target_user = _test_user()
+        sam = r"C:\Windows\System32\config\SAM"
+        # The row's premise: SYSTEM can stat the file and the target cannot,
+        # so a successful stat under RUN_AS can only mean the daemon kept its
+        # own identity. cmd's `if exist` reads the file's attributes, as a
+        # stat does; a changed ACL fails here instead of letting the row
+        # pass for the wrong reason.
+        assert os.stat(sam).st_size >= 0  # pytest itself runs as SYSTEM
+        probe = ["/c", f"if exist {sam} (exit 0) else (exit 3)"]
+        assert taz_client.command.exec(_CMD, args=probe).exit_code == 0
+        denied = taz_client.command.exec(_CMD, args=probe, as_user=target_user)
+        assert denied.exit_code == 3, (
+            f"{target_user} can stat {sam}: pick a path only SYSTEM can stat"
+        )
+
+        assert taz_client.run_as(target_user) == target_user
+        try:
+            info = taz_client.file.stat(sam)
+            assert info.size >= 0
+        finally:
+            taz_client.run_as("")
+
+    @pytest.mark.system
+    @_SYSTEM_ONLY
+    def test_system_connection_close_with_identity_leaves_no_token(
+        self, taz_client: TazClient, daemon: Daemon
+    ) -> None:
+        if sys.platform != "win32":
+            return  # unreachable at runtime; gives mypy the platform narrowing
+        target_user = _test_user()
+        proc = psutil.Process(daemon.pid)
+        # The first few RUN_AS logons grow the daemon's worker pool and the
+        # LSA client state once; warm them up so the baseline is steady.
+        for _ in range(6):
+            with TazClient("127.0.0.1", daemon.port) as warm:
+                assert warm.run_as(target_user) == target_user
+        time.sleep(0.5)
+        baseline = proc.num_handles()
+
+        # A per-close token/profile leak is 1-2 handles; ten closes put it
+        # well past the tolerance.
+        for _ in range(10):
+            with TazClient("127.0.0.1", daemon.port) as other:
+                assert other.run_as(target_user) == target_user
+
+        time.sleep(0.5)
+        after = proc.num_handles()
+        print(f"handles baseline={baseline} after={after}")
+        assert after <= baseline + 2, f"baseline={baseline} after={after}"
 
 
 @pytest.mark.slow

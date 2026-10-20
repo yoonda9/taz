@@ -89,6 +89,13 @@ TAZ layer.
 - `just test-sanitizers` — ASan+UBSan, TSan (Linux); ASan (Windows)
 - `just test-valgrind` — Valgrind memcheck
 - `just test-py-valgrind` — the marked Valgrind integration subset (Linux only)
+- `just test-py-system` — Windows only: the RUN_AS integration rows (`-m system`)
+  with pytest running as SYSTEM through a one-shot scheduled task; creates (or
+  repairs) the local account `taz-runas` (random password, never stored) and
+  leaves it in place; a privileged row that skips fails the lane under `CI=1`.
+  Extra arguments go to pytest; a stuck or abandoned run's process tree is
+  killed. `just preset=windows-release test-py-system --daemon
+daemon/build/windows-release/tazd.exe` runs it against the static binary
 - `just analyze` — compiler static analyzer (GCC -fanalyzer / MSVC /analyze)
 - `just coverage` — gcov + pytest-cov, reports under `out/coverage/`
 - `just test-c linux-musl-release` — the C unit tests built against musl
@@ -108,15 +115,19 @@ GitHub Actions (`.github/workflows/ci.yml`). One job per toolchain: Linux GCC
 (build, test, lint, ASan, TSan, Valgrind, static analysis, coverage), Linux
 Clang, Linux release (musl static `tazd`), Windows MSVC (build, test, lint),
 Windows ASan + static analysis, and Windows release (static `tazd.exe`).
-Every check is a `just` recipe and runs even when an earlier one fails. The
-Conan package cache is restored only on an exact key match
+The Windows MSVC job also runs `just test-py-system`, the RUN_AS rows as
+SYSTEM (CI sets `CI=1`, so a privileged row that skips fails it).
+Every check is a `just` recipe and runs even when an earlier one fails, unless
+it needs the build or dependency step that failed. The Conan package cache is
+restored only on an exact key match
 (`tools/dev.py conan-cache-key`); the musl entry caches its own Conan home
 (`~/.cache/taz/conan-musl/p`) and the Bootlin toolchain
 (`~/.cache/taz/toolchains`, keyed on `musl-toolchain --print-key`) separately
 from the glibc presets' `~/.conan2/p` (the job sets `TAZ_CACHE_DIR` to match).
 Each release entry builds its preset, runs the full test suite against the
-static binary and `just verify-static`; only if all of them pass does `just
-release-bundle` run and its result get uploaded as a workflow artifact
+static binary (on Windows, the SYSTEM lane too) and `just verify-static`; only
+if all of them pass does `just release-bundle` run and its result get uploaded
+as a workflow artifact
 (`taz-linux-x64` / `taz-windows-x64`) on every push — no GitHub Release is
 created.
 

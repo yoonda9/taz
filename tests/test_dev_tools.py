@@ -14,9 +14,10 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
-from collections.abc import Callable
-from pathlib import Path
+from collections.abc import Callable, Sequence
+from pathlib import Path, PureWindowsPath
 from types import ModuleType
 from typing import Any
 
@@ -824,6 +825,435 @@ def test_third_party_notices_mentions_every_musl_toolchain() -> None:
         assert toolchain.name in notices, (
             f"{toolchain.name} missing from THIRD_PARTY_NOTICES"
         )
+
+
+# --- test-py-system (SYSTEM lane) --------------------------------------------
+
+
+def test_random_password_has_every_class_and_never_repeats() -> None:
+    passwords = {dev.random_password() for _ in range(50)}
+    assert len(passwords) == 50
+    for password in passwords:
+        assert len(password) == 24
+        assert any(c.islower() for c in password)
+        assert any(c.isupper() for c in password)
+        assert any(c.isdigit() for c in password)
+        assert any(not c.isalnum() for c in password)
+
+
+def test_system_lane_user_flags_repairs_and_keeps_the_account_type() -> None:
+    normal_account = 0x0200
+    wanted = 0x0001 | 0x0040 | 0x10000  # script, can't change, never expires
+    assert dev.system_lane_user_flags(0) == wanted
+    broken = normal_account | 0x0002 | 0x0010 | 0x800000  # disabled, locked, expired
+    assert dev.system_lane_user_flags(broken) == normal_account | wanted
+    healthy = normal_account | wanted
+    assert dev.system_lane_user_flags(healthy) == healthy
+
+
+class _FakeAccounts:
+    """Fakes the NetUser* wrappers and run() for _ensure_system_lane_user."""
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, get: tuple[int, int | None]
+    ) -> None:
+        self.get = get
+        self.added: list[tuple[str, str]] = []
+        self.set: list[tuple[str, int, int]] = []
+        self.commands: list[list[str]] = []
+        self.add_status = 0
+        monkeypatch.setattr(dev, "_net_user_flags", lambda _name: self.get)
+        monkeypatch.setattr(dev, "_net_user_add", self._add)
+        monkeypatch.setattr(dev, "_net_user_set_dword", self._set)
+        monkeypatch.setattr(dev, "run", self._run)
+
+    def _add(self, name: str, password: str) -> tuple[int, int]:
+        self.added.append((name, password))
+        return self.add_status, 0
+
+    def _set(self, name: str, level: int, value: int) -> int:
+        self.set.append((name, level, value))
+        return 0
+
+    def _run(self, cmd: Sequence[str | Path], **_kwargs: Any) -> int:
+        self.commands.append([str(c) for c in cmd])
+        return 0
+
+
+def test_ensure_system_lane_user_creates_a_missing_account_in_process(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _FakeAccounts(monkeypatch, (2221, None))  # NERR_UserNotFound
+
+    dev._ensure_system_lane_user()
+
+    [(name, password)] = fake.added
+    assert name == "taz-runas"
+    assert len(password) == 24
+    assert fake.set == [("taz-runas", 1017, 0xFFFFFFFF)]  # never expires
+    [join] = fake.commands
+    assert "Add-LocalGroupMember -SID S-1-5-32-545 -Member taz-runas" in join[-1]
+    assert "MemberExists" in join[-1]
+    assert not any(password in arg for cmd in fake.commands for arg in cmd)
+    printed = capsys.readouterr()
+    assert password not in printed.out + printed.err
+
+
+def test_ensure_system_lane_user_repairs_a_disabled_locked_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flags = 0x0200 | 0x0002 | 0x0010
+    fake = _FakeAccounts(monkeypatch, (0, flags))
+
+    dev._ensure_system_lane_user()
+
+    assert fake.added == []
+    assert fake.set == [
+        ("taz-runas", 1008, dev.system_lane_user_flags(flags)),
+        ("taz-runas", 1017, 0xFFFFFFFF),
+    ]
+    assert len(fake.commands) == 1  # the Users join runs every time
+
+
+def test_ensure_system_lane_user_leaves_a_healthy_account_flags_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeAccounts(monkeypatch, (0, dev.system_lane_user_flags(0x0200)))
+
+    dev._ensure_system_lane_user()
+
+    assert fake.added == []
+    assert fake.set == [("taz-runas", 1017, 0xFFFFFFFF)]
+
+
+def test_ensure_system_lane_user_reports_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeAccounts(monkeypatch, (2221, None))
+    fake.add_status = 2245
+    with pytest.raises(SystemExit, match=r"NetUserAdd returned 2245 \(parm_err 0\)"):
+        dev._ensure_system_lane_user()
+
+    _FakeAccounts(monkeypatch, (5, None))
+    with pytest.raises(SystemExit, match="NetUserGetInfo returned 5"):
+        dev._ensure_system_lane_user()
+
+
+@pytest.mark.parametrize(
+    "wrapper", ["_net_user_add", "_net_user_flags", "_net_user_set_dword"]
+)
+def test_netapi_wrappers_refuse_off_windows(
+    monkeypatch: pytest.MonkeyPatch, wrapper: str
+) -> None:
+    monkeypatch.setattr(dev.sys, "platform", "linux")
+    args: dict[str, tuple[Any, ...]] = {
+        "_net_user_add": ("taz-runas", "x"),
+        "_net_user_flags": ("taz-runas",),
+        "_net_user_set_dword": ("taz-runas", 1017, 0),
+    }
+    with pytest.raises(OSError, match="Windows-only"):
+        getattr(dev, wrapper)(*args[wrapper])
+
+
+def test_batch_quote_doubles_percent_and_refuses_quotes() -> None:
+    assert dev.batch_quote(r"C:\R&D\%x%\a b") == r'"C:\R&D\%%x%%\a b"'
+    for bad in ('C:\\a"b', "a\nb", "a\rb"):
+        with pytest.raises(ValueError, match="batch-file line"):
+            dev.batch_quote(bad)
+
+
+def test_system_lane_wrapper_quotes_every_path_and_writes_exit_last() -> None:
+    text = dev.system_lane_wrapper(
+        python=PureWindowsPath(r"C:\R&D\taz\.venv\Scripts\python.exe"),
+        launcher=PureWindowsPath(r"C:\R&D\%x%\launch.py"),
+        out_dir=PureWindowsPath(r"C:\R&D\%x%"),
+    )
+    assert text.endswith("\r\n")
+    lines = text.split("\r\n")
+    assert lines[0] == "@echo off"
+    assert lines[1] == (
+        r'"C:\R&D\taz\.venv\Scripts\python.exe" -u -B "C:\R&D\%%x%%\launch.py"'
+        r' > "C:\R&D\%%x%%\log.txt" 2>&1'
+    )
+    assert lines[2] == r'echo %ERRORLEVEL% > "C:\R&D\%%x%%\exit.txt"'
+    with pytest.raises(ValueError, match="batch-file line"):
+        dev.system_lane_wrapper(
+            python=PureWindowsPath("C:/py/python.exe"),
+            launcher=PureWindowsPath('C:/a"b/launch.py'),
+            out_dir=PureWindowsPath("C:/out"),
+        )
+
+
+def test_system_lane_path_problem() -> None:
+    assert dev.system_lane_path_problem(PureWindowsPath(r"C:\taz\out\run.cmd")) is None
+    assert dev.system_lane_path_problem(PureWindowsPath(r"C:\a b\run.cmd")) == (
+        "contains ' '"
+    )
+    problem = dev.system_lane_path_problem(PureWindowsPath(r"C:\R&D\%x%\run.cmd"))
+    assert problem == "contains '%' '&'"
+
+
+def test_system_lane_launcher_runs_its_command_verbatim(tmp_path: Path) -> None:
+    root = tmp_path / "R&D %x% root"
+    root.mkdir()
+    pid_file = tmp_path / "pid.txt"
+    command = [
+        "-c",
+        "import json, os, sys; "
+        "print(json.dumps([os.getcwd(), os.environ['TAZ_X'], sys.argv[1:]])); "
+        "sys.exit(3)",
+        "-k",
+        "a and not b",
+        "%x%",
+        'quo"te',
+    ]
+    launcher = tmp_path / "launch.py"
+    launcher.write_text(
+        dev.system_lane_launcher(
+            root=root, pid_file=pid_file, env={"TAZ_X": "1"}, command=command
+        )
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(launcher)], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 3, result.stderr
+    cwd, taz_x, argv = json.loads(result.stdout)
+    assert Path(cwd) == root
+    assert taz_x == "1"
+    assert argv == ["-k", "a and not b", "%x%", 'quo"te']
+    assert dev.read_lane_pid(pid_file) is not None
+
+
+def test_system_lane_pytest_command_and_env() -> None:
+    out = PureWindowsPath(r"C:\taz\out\test-py-system")
+    command = dev.system_lane_pytest_command(out, ["-k", "run as"])
+    assert command[:5] == ["-m", "pytest", "-m", "system", "-rA"]
+    assert rf"--junit-xml={out}\junit.xml" in command
+    assert command[-3:] == ["tests\\test_integration.py", "-k", "run as"]
+    daemon = PureWindowsPath(r"C:\taz\daemon\build\windows-debug\tazd.exe")
+    env = dev.system_lane_env(daemon=daemon, out_dir=out, ci=False)
+    assert env["TAZ_DAEMON"] == str(daemon)
+    assert env["TAZ_TEST_USER"] == "taz-runas"
+    assert env["TEMP"] == env["TMP"] == rf"{out}\tmp"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert "CI" not in env
+    assert dev.system_lane_env(daemon=daemon, out_dir=out, ci=True)["CI"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("argv", "daemon", "timeout", "rest"),
+    [
+        (["-s"], None, 900, ["-s"]),
+        ([], None, 900, []),
+        (["--daemon", "x.exe", "--timeout=5", "-k", "a"], "x.exe", 5, ["-k", "a"]),
+        (["--timeout", "7", "--", "--daemon"], None, 7, ["--daemon"]),
+        (["-k", "x", "--daemon", "y"], None, 900, ["-k", "x", "--daemon", "y"]),
+        (["tests", "-s"], None, 900, ["tests", "-s"]),
+    ],
+)
+def test_split_system_lane_args(
+    argv: list[str], daemon: str | None, timeout: int, rest: list[str]
+) -> None:
+    assert dev.split_system_lane_args(argv) == (
+        None if daemon is None else Path(daemon),
+        timeout,
+        rest,
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--daemon"], "--daemon needs a value"),
+        (["--timeout", "soon"], "whole number of seconds"),
+    ],
+)
+def test_split_system_lane_args_rejects(argv: list[str], message: str) -> None:
+    with pytest.raises(SystemExit, match=message):
+        dev.split_system_lane_args(argv)
+
+
+def test_main_passes_a_leading_pytest_flag_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Path | None, int, list[str]]] = []
+    monkeypatch.setattr(dev, "cmd_test_py_system", lambda *args: calls.append(args))
+    dev.main(["test-py-system", "-s", "-k", "run as"])
+    assert calls == [(None, 900, ["-s", "-k", "run as"])]
+
+
+def test_is_lane_process_rejects_a_reused_pid() -> None:
+    image = r"C:\Python\python.exe"
+    assert dev.is_lane_process(image, created=100.0, pid_written=100.5)
+    assert dev.is_lane_process(image.upper(), created=100.0, pid_written=100.5)
+    assert not dev.is_lane_process(image, created=200.0, pid_written=100.5)
+    assert not dev.is_lane_process(r"C:\x\notepad.exe", 100.0, 100.5)
+
+
+def test_log_follower_relays_chunks_and_joins_split_sequences(tmp_path: Path) -> None:
+    log = tmp_path / "log.txt"
+    out = io.StringIO()
+    follower = dev.LogFollower(log, out)
+    follower.pump()  # not created yet
+    assert out.getvalue() == ""
+    data = "one\r\ntwo é\r\nthree".encode()
+    split = data.index(b"\xa9")  # inside "é", and the next \r\n is split too
+    log.write_bytes(data[:split])
+    follower.pump()
+    with log.open("ab") as f:
+        f.write(data[split : split + 2])
+    follower.pump()
+    with log.open("ab") as f:
+        f.write(data[split + 2 :])
+    follower.pump(final=True)
+    assert out.getvalue() == "one\ntwo é\nthree"
+
+
+def test_read_lane_exit_retries_until_it_parses(tmp_path: Path) -> None:
+    f = tmp_path / "exit.txt"
+    f.write_text("")
+    with pytest.raises(SystemExit):
+        dev.read_lane_exit(f, wait=0.3)
+    f.write_text("3 \r\n")
+    assert dev.read_lane_exit(f) == 3
+
+
+def test_read_lane_pid(tmp_path: Path) -> None:
+    f = tmp_path / "pid.txt"
+    assert dev.read_lane_pid(f) is None
+    f.write_text("")
+    assert dev.read_lane_pid(f) is None
+    f.write_text("4242")
+    assert dev.read_lane_pid(f) == 4242
+
+
+class _LaneClock:
+    """Drives _wait_for_lane without real time: each sleep advances it."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.now = 0.0
+        monkeypatch.setattr(dev.time, "monotonic", lambda: self.now)
+        monkeypatch.setattr(dev.time, "sleep", self._sleep)
+
+    def _sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_wait_for_lane_gives_up_on_a_task_that_never_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _LaneClock(monkeypatch)
+    follower = dev.LogFollower(tmp_path / "log.txt", io.StringIO())
+    with pytest.raises(SystemExit, match="did not start"):
+        dev._wait_for_lane(follower, tmp_path / "pid.txt", tmp_path / "exit.txt", 900)
+
+
+def test_wait_for_lane_gives_up_on_a_launcher_that_died(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _LaneClock(monkeypatch)
+    (tmp_path / "pid.txt").write_text("4242")
+    monkeypatch.setattr(dev, "_process_query", lambda _pid: (False, None))
+    follower = dev.LogFollower(tmp_path / "log.txt", io.StringIO())
+    with pytest.raises(SystemExit, match="exited without an exit code"):
+        dev._wait_for_lane(follower, tmp_path / "pid.txt", tmp_path / "exit.txt", 900)
+
+
+def test_wait_for_lane_times_out_and_relays_the_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _LaneClock(monkeypatch)
+    (tmp_path / "pid.txt").write_text("4242")
+    (tmp_path / "log.txt").write_text("collected 12 items\n")
+    monkeypatch.setattr(dev, "_process_query", lambda _pid: (True, None))
+    out = io.StringIO()
+    follower = dev.LogFollower(tmp_path / "log.txt", out)
+    with pytest.raises(SystemExit, match="timed out after 30s"):
+        dev._wait_for_lane(follower, tmp_path / "pid.txt", tmp_path / "exit.txt", 30)
+    assert out.getvalue() == "collected 12 items\n"
+
+
+def test_wait_for_lane_returns_once_exit_txt_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clock = _LaneClock(monkeypatch)
+    exit_file = tmp_path / "exit.txt"
+
+    def query(_pid: int) -> tuple[bool, None]:
+        if clock.now >= 5:
+            exit_file.write_text("0\r\n")
+        return True, None
+
+    (tmp_path / "pid.txt").write_text("4242")
+    monkeypatch.setattr(dev, "_process_query", query)
+    follower = dev.LogFollower(tmp_path / "log.txt", io.StringIO())
+    dev._wait_for_lane(follower, tmp_path / "pid.txt", exit_file, 900)
+    assert clock.now < 10
+
+
+def test_kill_lane_tree_kills_only_the_launcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pid_file = tmp_path / "pid.txt"
+    pid_file.write_text("4242")
+    written = pid_file.stat().st_mtime
+    killed: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        killed.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(dev.subprocess, "run", fake_run)
+    identities: dict[str, tuple[bool, tuple[str, float] | None]] = {
+        "gone": (False, None),
+        "unreadable": (True, None),
+        "reused": (True, (r"C:\py\python.exe", written + 60)),
+        "other image": (True, (r"C:\x\notepad.exe", written - 5)),
+        "launcher": (True, (r"C:\py\python.exe", written - 5)),
+    }
+    for identity in identities.values():
+        monkeypatch.setattr(dev, "_process_query", lambda _pid, i=identity: i)
+        dev._kill_lane_tree(pid_file)
+    assert killed == [["taskkill", "/F", "/T", "/PID", "4242"]]
+
+    dev._kill_lane_tree(tmp_path / "missing.txt")  # no pid file: nothing to do
+    assert len(killed) == 1
+
+
+JUNIT_NO_SKIPS = (
+    "<testsuites><testsuite>"
+    '<testcase classname="a.B" name="t1"/>'
+    "</testsuite></testsuites>"
+)
+JUNIT_TWO_SKIPS = (
+    "<testsuites>"
+    "<testsuite>"
+    '<testcase classname="a.B" name="t1"><skipped message="x"/></testcase>'
+    "</testsuite>"
+    "<testsuite><testsuite>"
+    '<testcase classname="a.C" name="t2"><skipped/></testcase>'
+    '<testcase classname="a.C" name="t3"/>'
+    "</testsuite></testsuite>"
+    "</testsuites>"
+)
+
+
+def test_skipped_rows() -> None:
+    assert dev.skipped_rows(JUNIT_NO_SKIPS) == []
+    assert dev.skipped_rows(JUNIT_TWO_SKIPS) == ["a.B::t1", "a.C::t2"]
+    assert dev.skipped_rows(
+        "<testsuite><testcase name='x'><skipped/></testcase></testsuite>"
+    ) == ["::x"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="asserts the off-Windows refusal")
+def test_test_py_system_refuses_off_windows(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        dev.cmd_test_py_system(None, 1, [])
+    assert raised.value.code == 2
+    assert "Windows-only" in capsys.readouterr().err
 
 
 # --- fuzz ---------------------------------------------------------------------

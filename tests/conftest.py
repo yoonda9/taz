@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import dataclasses
+import functools
 import os
 import re
 import shlex
@@ -59,6 +60,58 @@ def _pdeathsig_preexec(parent_pid: int) -> Callable[[], None]:
             os._exit(1)
 
     return _apply
+
+
+@functools.cache
+def process_is_system() -> bool:
+    """True iff this process's primary token's user is the well-known
+    SYSTEM account (SID ``S-1-5-18``), checked locale-independently;
+    Windows-only, always False elsewhere. Gates RUN_AS rows that need a
+    daemon started as SYSTEM through a scheduled task
+    (``just test-py-system``)."""
+    if sys.platform != "win32":
+        return False
+    advapi32 = ctypes.windll.advapi32
+    kernel32 = ctypes.windll.kernel32
+    token_query = 0x0008
+    token_user = 1
+    win_local_system_sid = 22
+
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    advapi32.OpenProcessToken.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetTokenInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    advapi32.IsWellKnownSid.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    token = ctypes.c_void_p()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
+    ):
+        return False
+    try:
+        size = ctypes.c_ulong(0)
+        advapi32.GetTokenInformation(token, token_user, None, 0, ctypes.byref(size))
+        buf = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(
+            token, token_user, buf, size, ctypes.byref(size)
+        ):
+            return False
+        # TOKEN_USER has one field, a SID_AND_ATTRIBUTES whose first member
+        # is the PSID.
+        sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+        return bool(advapi32.IsWellKnownSid(sid, win_local_system_sid))
+    finally:
+        kernel32.CloseHandle(token)
 
 
 @pytest.fixture(scope="session")

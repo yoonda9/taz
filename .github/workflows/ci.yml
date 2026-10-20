@@ -166,16 +166,17 @@ jobs:
           path: ${{ matrix.conan-cache-path || '~/.conan2/p' }}
           key: ${{ steps.conan-key.outputs.key }}
 
-      - if: contains(matrix.checks, 'main')
+      - id: build
+        if: contains(matrix.checks, 'main')
         run: just build
-      - if: contains(matrix.checks, 'main')
+      - if: ${{ !cancelled() && steps.build.outcome == 'success' && contains(matrix.checks, 'main') }}
         env:
           TAZ_DAEMON: daemon/build/linux-debug/tazd
         run: just test
-      - if: contains(matrix.checks, 'main')
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'main') }}
         run: just lint
 
-      - if: contains(matrix.checks, 'main')
+      - if: ${{ !cancelled() && steps.build.outcome == 'success' && contains(matrix.checks, 'main') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: taz-linux-x64-debug
@@ -534,16 +535,24 @@ jobs:
           path: ~/.conan2/p
           key: ${{ steps.conan-key.outputs.key }}
 
-      - if: contains(matrix.checks, 'main')
+      - id: build
+        if: contains(matrix.checks, 'main')
         run: just build
-      - if: contains(matrix.checks, 'main')
+      - if: ${{ !cancelled() && steps.build.outcome == 'success' && contains(matrix.checks, 'main') }}
         env:
           TAZ_DAEMON: daemon/build/windows-debug/tazd.exe
         run: just test
-      - if: contains(matrix.checks, 'main')
+      # RUN_AS needs SYSTEM: pytest runs as SYSTEM through a one-shot
+      # scheduled task, against a throwaway local account the recipe creates.
+      # The timeout leaves the lane time to print its log within the job's.
+      - if: ${{ !cancelled() && steps.build.outcome == 'success' && contains(matrix.checks, 'main') }}
+        env:
+          TAZ_DAEMON: daemon/build/windows-debug/tazd.exe
+        run: just test-py-system --timeout 420
+      - if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'main') }}
         run: just lint
 
-      - if: contains(matrix.checks, 'main')
+      - if: ${{ !cancelled() && steps.build.outcome == 'success' && contains(matrix.checks, 'main') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: taz-windows-x64-debug
@@ -566,13 +575,19 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
         run: just test-py --daemon daemon/build/windows-release/tazd.exe
 
+      # The RUN_AS rows as SYSTEM against the shipped binary; `preset=` keeps
+      # the recipe from building windows-debug first.
+      - id: release-test-py-system
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
+        run: just preset=windows-release test-py-system --daemon daemon/build/windows-release/tazd.exe --timeout 420
+
       - id: release-verify
         if: ${{ !cancelled() && steps.deps.outcome == 'success' && contains(matrix.checks, 'release') }}
         run: just verify-static windows-release
 
       # Only a binary that passed every check above is published.
       - id: release-bundle
-        if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-verify.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.release-test-c.outcome == 'success' && steps.release-test-py.outcome == 'success' && steps.release-test-py-system.outcome == 'success' && steps.release-verify.outcome == 'success' }}
         run: just release-bundle windows-release
 
       - id: release-verify-bundle

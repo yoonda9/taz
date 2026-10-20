@@ -62,6 +62,7 @@ markers = [
     "packaging: tests that build and inspect the wheel (slow; run with -m packaging)",
     "slow: integration tests that require a live daemon or real network",
     "valgrind: integration rows run under Valgrind memcheck by `just test-py-valgrind`",
+    "system: RUN_AS rows that need a daemon started as SYSTEM (Windows); run by `just test-py-system`",
 ]
 
 # ---------------------------------------------------------------------------

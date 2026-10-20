@@ -24,6 +24,8 @@ Subcommands:
     proto-breaking       buf breaking against main (skips if main has no schemas)
     valgrind --build-dir DIR   run the C unit tests under Valgrind memcheck
     valgrind-py --daemon PATH   run the marked Valgrind integration subset (pytest)
+    test-py-system [--daemon PATH] [--timeout S] [PYTEST ARGS...]   Windows: run the
+                         RUN_AS rows with pytest as SYSTEM (one-shot scheduled task)
     coverage --build-dir DIR   gcovr report for a coverage-instrumented build
     doctor               report tools mise cannot provide / missing pinned tools
     clean                remove daemon build directories
@@ -41,23 +43,30 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import codecs
+import ctypes
 import hashlib
+import io
 import json
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 import urllib.request
+import xml.etree.ElementTree as ElementTree
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from typing import NamedTuple
+from ctypes import wintypes
+from pathlib import Path, PurePath, PureWindowsPath
+from typing import NamedTuple, TextIO
 
 ROOT = Path(__file__).resolve().parent.parent
 RPC_DIR = ROOT / "rpc"
@@ -869,6 +878,510 @@ def cmd_valgrind_py(daemon: Path) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# SYSTEM test lane (Windows): pytest as SYSTEM through a one-shot scheduled task
+# ---------------------------------------------------------------------------
+SYSTEM_LANE_TASK = "taz-test-py-system"
+SYSTEM_LANE_USER = "taz-runas"
+SYSTEM_LANE_DIR = ROOT / "out" / "test-py-system"
+SYSTEM_LANE_TIMEOUT = 900
+_PASSWORD_CLASSES = (
+    "abcdefghijklmnopqrstuvwxyz",
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "0123456789",
+    "!#$%&()*+,-./:;<=>?@[]^_{|}~",
+)
+
+
+def random_password(length: int = 24) -> str:
+    """A password with every character class, so any complexity policy accepts it."""
+    pool = "".join(_PASSWORD_CLASSES)
+    chars = [secrets.choice(c) for c in _PASSWORD_CLASSES]
+    chars += [secrets.choice(pool) for _ in range(length - len(chars))]
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
+# lmaccess.h user flags, plus the NetUser* statuses and values used here.
+_USER_PRIV_USER = 1
+_UF_SCRIPT = 0x0001
+_UF_ACCOUNTDISABLE = 0x0002
+_UF_LOCKOUT = 0x0010
+_UF_PASSWD_CANT_CHANGE = 0x0040
+_UF_DONT_EXPIRE_PASSWD = 0x10000
+_UF_PASSWORD_EXPIRED = 0x800000
+_NERR_USER_NOT_FOUND = 2221
+_USER_FLAGS_LEVEL = 1008
+_USER_ACCT_EXPIRES_LEVEL = 1017
+_TIMEQ_FOREVER = 0xFFFFFFFF
+USERS_GROUP_SID = "S-1-5-32-545"  # BUILTIN\Users
+
+
+def system_lane_user_flags(flags: int) -> int:
+    """The test account's flags, repaired: enabled, unlocked, and a password
+    that never expires and that the account cannot change."""
+    flags &= ~(_UF_ACCOUNTDISABLE | _UF_LOCKOUT | _UF_PASSWORD_EXPIRED)
+    return flags | _UF_SCRIPT | _UF_PASSWD_CANT_CHANGE | _UF_DONT_EXPIRE_PASSWD
+
+
+def batch_quote(value: str) -> str:
+    """value as one quoted token on a batch-file line (`%` doubled)."""
+    if any(c in value for c in '"\r\n'):
+        raise ValueError(f"cannot carry {value!r} on a batch-file line")
+    return '"' + value.replace("%", "%%") + '"'
+
+
+# schtasks /TR takes the wrapper as a bare path (nested quotes do not survive
+# the VM's PowerShell shell), so the path must need no quoting at all.
+_TASK_PATH_UNSAFE = frozenset(' "&|<>^%!')
+
+
+def system_lane_path_problem(path: PurePath) -> str | None:
+    """Why path cannot be a scheduled task's /TR command, or None if it can."""
+    bad = sorted(set(str(path)) & _TASK_PATH_UNSAFE)
+    return f"contains {' '.join(repr(c) for c in bad)}" if bad else None
+
+
+def system_lane_pytest_command(
+    out_dir: PurePath, pytest_args: Sequence[str]
+) -> list[str]:
+    """What the launcher runs after `python`: the system rows, with junit."""
+    tmp = out_dir / "tmp"
+    return [
+        "-m",
+        "pytest",
+        "-m",
+        "system",
+        "-rA",
+        "-p",
+        "no:cacheprovider",
+        f"--basetemp={tmp / 'pytest'}",
+        f"--junit-xml={out_dir / 'junit.xml'}",
+        "tests\\test_integration.py",
+        *pytest_args,
+    ]
+
+
+def system_lane_env(*, daemon: PurePath, out_dir: PurePath, ci: bool) -> dict[str, str]:
+    """The environment the lane's pytest runs with, on top of SYSTEM's own."""
+    tmp = str(out_dir / "tmp")
+    env = {
+        "TAZ_DAEMON": str(daemon),
+        "TAZ_TEST_USER": SYSTEM_LANE_USER,
+        "TEMP": tmp,
+        "TMP": tmp,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    if ci:
+        env["CI"] = "1"
+    return env
+
+
+def system_lane_launcher(
+    *,
+    root: PurePath,
+    pid_file: PurePath,
+    env: dict[str, str],
+    command: Sequence[str],
+) -> str:
+    """The Python script the task runs: it records its pid, so a stuck or
+    abandoned run can be killed as a process tree, then runs `command` with
+    its own interpreter. Values are Python literals, so no shell quoting."""
+    lines = [
+        "# Generated by tools/dev.py test-py-system; run as SYSTEM by its task.",
+        "import os",
+        "import subprocess",
+        "import sys",
+        "",
+        f"os.chdir({str(root)!r})",
+        f"os.environ.update({env!r})",
+        f"with open({str(pid_file)!r}, 'w', encoding='ascii') as f:",
+        "    f.write(str(os.getpid()))",
+        f"sys.exit(subprocess.call([sys.executable, *{list(command)!r}]))",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def system_lane_wrapper(
+    *, python: PurePath, launcher: PurePath, out_dir: PurePath
+) -> str:
+    """The batch file the scheduled task runs; `exit.txt` is written last."""
+    log, exit_file = out_dir / "log.txt", out_dir / "exit.txt"
+    lines = [
+        "@echo off",
+        f"{batch_quote(str(python))} -u -B {batch_quote(str(launcher))}"
+        f" > {batch_quote(str(log))} 2>&1",
+        # The space keeps a one-digit code from reading as a `1>` redirect.
+        f"echo %ERRORLEVEL% > {batch_quote(str(exit_file))}",
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def skipped_rows(junit_xml: str) -> list[str]:
+    """Names of the test cases a junit report marks skipped (any suite nesting)."""
+    root = ElementTree.fromstring(junit_xml)  # noqa: S314 - our own pytest output
+    return [
+        f"{case.get('classname', '')}::{case.get('name', '')}"
+        for case in root.iter("testcase")
+        if case.find("skipped") is not None
+    ]
+
+
+def is_lane_process(image: str, created: float, pid_written: float) -> bool:
+    """Whether a live process is the launcher that wrote pid.txt: a python.exe
+    started before pid.txt was written (a reused pid would be younger)."""
+    return (
+        PureWindowsPath(image).name.lower() == "python.exe"
+        and created <= pid_written + 1.0
+    )
+
+
+def split_system_lane_args(argv: Sequence[str]) -> tuple[Path | None, int, list[str]]:
+    """test-py-system's own leading options (--daemon, --timeout); everything
+    from the first other argument (or after `--`) goes to pytest verbatim."""
+    daemon: Path | None = None
+    timeout = SYSTEM_LANE_TIMEOUT
+    rest = list(argv)
+    while rest:
+        name, eq, value = rest[0].partition("=")
+        if name not in ("--daemon", "--timeout"):
+            break
+        if eq:
+            rest = rest[1:]
+        elif len(rest) >= 2:
+            value, rest = rest[1], rest[2:]
+        else:
+            sys.exit(f"error: {name} needs a value")
+        if name == "--daemon":
+            daemon = Path(value)
+        elif value.isdigit():
+            timeout = int(value)
+        else:
+            sys.exit(f"error: --timeout needs a whole number of seconds: {value!r}")
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    return daemon, timeout, rest
+
+
+class LogFollower:
+    """Relays a file another process is still writing, chunk by chunk."""
+
+    def __init__(self, path: Path, out: TextIO) -> None:
+        self.path = path
+        self.out = out
+        self.offset = 0
+        self.decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder("utf-8")(errors="replace"), translate=True
+        )
+
+    def pump(self, *, final: bool = False) -> None:
+        try:
+            with self.path.open("rb") as f:
+                f.seek(self.offset)
+                data = f.read()
+        except OSError:
+            data = b""
+        self.offset += len(data)
+        text = self.decoder.decode(data, final=final)
+        if text:
+            self.out.write(text)
+            self.out.flush()
+
+
+# Seconds for a started task to write pid.txt, and from the launcher's exit
+# to cmd writing exit.txt.
+SYSTEM_LANE_START_GRACE = 20
+SYSTEM_LANE_EXIT_GRACE = 10
+
+
+def read_lane_exit(exit_file: Path, wait: float = 10.0) -> int:
+    """exit.txt can be seen empty or locked while cmd writes it; retry briefly."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            return int(exit_file.read_text().strip())
+        except (OSError, ValueError):
+            if time.monotonic() > deadline:
+                sys.exit(f"error: cannot read a SYSTEM lane exit code from {exit_file}")
+            time.sleep(0.2)
+
+
+def read_lane_pid(pid_file: Path) -> int | None:
+    """The launcher's pid, or None until pid.txt holds a whole one."""
+    try:
+        return int(pid_file.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _schtasks(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["schtasks", *args], capture_output=True, text=True, check=False
+    )
+
+
+def _user_info_1() -> type[ctypes.Structure]:
+    """USER_INFO_1 (lmaccess.h). Built when called: wintypes only has
+    Windows' sizes on Windows."""
+
+    class UserInfo1(ctypes.Structure):
+        _fields_ = (
+            ("name", wintypes.LPWSTR),
+            ("password", wintypes.LPWSTR),
+            ("password_age", wintypes.DWORD),
+            ("priv", wintypes.DWORD),
+            ("home_dir", wintypes.LPWSTR),
+            ("comment", wintypes.LPWSTR),
+            ("flags", wintypes.DWORD),
+            ("script_path", wintypes.LPWSTR),
+        )
+
+    return UserInfo1
+
+
+def _net_user_add(name: str, password: str) -> tuple[int, int]:
+    """NetUserAdd at level 1: (NET_API_STATUS, parm_err), (0, 0) on success."""
+    if sys.platform != "win32":
+        raise OSError("NetUserAdd is Windows-only")
+    flags = system_lane_user_flags(0)
+    info = _user_info_1()(name, password, 0, _USER_PRIV_USER, None, None, flags, None)
+    parm_err = wintypes.DWORD(0)
+    status = ctypes.WinDLL("netapi32").NetUserAdd(
+        None, 1, ctypes.byref(info), ctypes.byref(parm_err)
+    )
+    return int(status), int(parm_err.value)
+
+
+def _net_user_flags(name: str) -> tuple[int, int | None]:
+    """NetUserGetInfo at level 1: (NET_API_STATUS, the account's flags)."""
+    if sys.platform != "win32":
+        raise OSError("NetUserGetInfo is Windows-only")
+    netapi32 = ctypes.WinDLL("netapi32")
+    buf = ctypes.c_void_p()
+    status = int(netapi32.NetUserGetInfo(None, name, 1, ctypes.byref(buf)))
+    if status != 0:
+        return status, None
+    try:
+        info = ctypes.cast(buf, ctypes.POINTER(_user_info_1())).contents
+        return 0, int(info.flags)
+    finally:
+        netapi32.NetApiBufferFree(buf)
+
+
+def _net_user_set_dword(name: str, level: int, value: int) -> int:
+    """NetUserSetInfo at a one-DWORD level (flags, acct_expires): the status."""
+    if sys.platform != "win32":
+        raise OSError("NetUserSetInfo is Windows-only")
+    data = wintypes.DWORD(value)
+    parm_err = wintypes.DWORD(0)
+    return int(
+        ctypes.WinDLL("netapi32").NetUserSetInfo(
+            None, name, level, ctypes.byref(data), ctypes.byref(parm_err)
+        )
+    )
+
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_ACCESS_DENIED = 5
+_STILL_ACTIVE = 259
+
+
+def _process_query(pid: int) -> tuple[bool, tuple[str, float] | None]:
+    """(alive, (image path, creation time as Unix time) when readable)."""
+    if sys.platform != "win32":
+        raise OSError("process queries here are Windows-only")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    raw = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not raw:
+        # Access denied still means a process with that pid exists.
+        return ctypes.get_last_error() == _ERROR_ACCESS_DENIED, None
+    handle = wintypes.HANDLE(raw)
+    try:
+        code = wintypes.DWORD(0)
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True, None
+        if code.value != _STILL_ACTIVE:
+            return False, None
+        size = wintypes.DWORD(32768)
+        image = ctypes.create_unicode_buffer(size.value)
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.QueryFullProcessImageNameW(
+            handle, 0, image, ctypes.byref(size)
+        ) or not kernel32.GetProcessTimes(handle, *map(ctypes.byref, times)):
+            return True, None
+        ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        return True, (image.value, ticks / 10_000_000 - 11_644_473_600)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _kill_lane_tree(pid_file: Path) -> None:
+    """taskkill /T the launcher pid_file names, if it still runs (as SYSTEM,
+    with pytest, tazd and their children under it)."""
+    pid = read_lane_pid(pid_file)
+    try:
+        written = pid_file.stat().st_mtime
+    except OSError:
+        return
+    if pid is None:
+        return
+    _, identity = _process_query(pid)
+    if identity is None or not is_lane_process(*identity, written):
+        return
+    print(f"killing the SYSTEM lane's process tree (pid {pid})", flush=True)
+    subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False
+    )
+
+
+def _join_users_group() -> None:
+    # `net user /add` joins Users and NetUserAdd does not. By SID, since the
+    # group's name is localized; "already a member" counts as success.
+    script = (
+        f"Add-LocalGroupMember -SID {USERS_GROUP_SID} -Member {SYSTEM_LANE_USER}"
+        " -ErrorAction SilentlyContinue -ErrorVariable failed; "
+        "$failed = @($failed | Where-Object { "
+        "$_.CategoryInfo.Reason -ne 'MemberExistsException' -and "
+        "$_.FullyQualifiedErrorId -notlike 'MemberExists*' }); "
+        "if ($failed) { $failed; exit 1 }"
+    )
+    run(["powershell", "-NoProfile", "-Command", script])
+
+
+def _ensure_system_lane_user() -> None:
+    """Create the test account if missing, else repair it, so a disabled,
+    locked or expired leftover never fails the lane."""
+    user = SYSTEM_LANE_USER
+    status, flags = _net_user_flags(user)
+    if status == _NERR_USER_NOT_FOUND:
+        # Created in-process, so the password is never on a command line, a
+        # pipe or a console (a password piped to `net user *` fails on a CI
+        # runner), and never printed.
+        print(f"creating local account {user}", flush=True)
+        status, parm_err = _net_user_add(user, random_password())
+        if status != 0:
+            sys.exit(
+                f"error: cannot create {user}: NetUserAdd returned "
+                f"{status} (parm_err {parm_err})"
+            )
+    elif status != 0 or flags is None:
+        sys.exit(f"error: cannot read {user}: NetUserGetInfo returned {status}")
+    elif (repaired := system_lane_user_flags(flags)) != flags:
+        print(f"repairing local account {user} (flags {flags:#x} -> {repaired:#x})")
+        status = _net_user_set_dword(user, _USER_FLAGS_LEVEL, repaired)
+        if status != 0:
+            sys.exit(f"error: cannot repair {user}: NetUserSetInfo returned {status}")
+    status = _net_user_set_dword(user, _USER_ACCT_EXPIRES_LEVEL, _TIMEQ_FOREVER)
+    if status != 0:
+        sys.exit(
+            f"error: cannot clear {user}'s expiry: NetUserSetInfo returned {status}"
+        )
+    _join_users_group()
+
+
+def _wait_for_lane(
+    follower: LogFollower, pid_file: Path, exit_file: Path, timeout: int
+) -> None:
+    """Relay the log until exit.txt appears; exit with an error if the task
+    never starts, its launcher dies without one, or `timeout` runs out."""
+    started = time.monotonic()
+    pid: int | None = None
+    dead_since: float | None = None
+    while not exit_file.exists():
+        follower.pump()
+        now = time.monotonic()
+        if now - started > timeout:
+            sys.exit(f"error: SYSTEM lane timed out after {timeout}s")
+        if pid is None:
+            pid = read_lane_pid(pid_file)
+            if pid is None and now - started > SYSTEM_LANE_START_GRACE:
+                sys.exit("error: SYSTEM lane task did not start (no pid.txt)")
+        elif not _process_query(pid)[0]:
+            if dead_since is None:
+                dead_since = now
+            elif now - dead_since > SYSTEM_LANE_EXIT_GRACE:
+                sys.exit("error: SYSTEM lane launcher exited without an exit code")
+        time.sleep(1)
+
+
+def cmd_test_py_system(
+    daemon: Path | None, timeout: int, pytest_args: list[str]
+) -> None:
+    if not IS_WINDOWS:
+        print("error: test-py-system is Windows-only", file=sys.stderr)
+        sys.exit(2)
+    if daemon is None:
+        env_daemon = os.environ.get("TAZ_DAEMON")
+        daemon = Path(env_daemon) if env_daemon else daemon_binary("windows-debug")
+    daemon = daemon.resolve()
+    if not daemon.is_file():
+        sys.exit(f"error: daemon binary not found: {daemon}")
+    out_dir = SYSTEM_LANE_DIR
+    wrapper, launcher = out_dir / "run.cmd", out_dir / "launch.py"
+    pid_file, exit_file = out_dir / "pid.txt", out_dir / "exit.txt"
+    if problem := system_lane_path_problem(wrapper):
+        sys.exit(f"error: the checkout path cannot hold a task command: {problem}")
+
+    # A crashed or interrupted earlier run can leave its task, and pytest and
+    # tazd running as SYSTEM, holding files in out_dir open.
+    _schtasks("/End", "/TN", SYSTEM_LANE_TASK)
+    _schtasks("/Delete", "/TN", SYSTEM_LANE_TASK, "/F")
+    _kill_lane_tree(pid_file)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    (out_dir / "tmp").mkdir(parents=True)
+    _ensure_system_lane_user()
+    launcher.write_text(
+        system_lane_launcher(
+            root=ROOT,
+            pid_file=pid_file,
+            env=system_lane_env(daemon=daemon, out_dir=out_dir, ci=IN_CI),
+            command=system_lane_pytest_command(out_dir, pytest_args),
+        ),
+        encoding="utf-8",
+    )
+    try:
+        script = system_lane_wrapper(
+            python=Path(sys.executable), launcher=launcher, out_dir=out_dir
+        )
+    except ValueError as e:
+        sys.exit(f"error: {e}")
+    wrapper.write_text(script, newline="")
+    follower = LogFollower(out_dir / "log.txt", sys.stdout)
+    try:
+        created = _schtasks(
+            "/Create", "/TN", SYSTEM_LANE_TASK, "/TR", str(wrapper),
+            "/SC", "ONCE", "/ST", "00:00", "/RU", "SYSTEM", "/RL", "HIGHEST", "/F",
+        )  # fmt: skip
+        if created.returncode != 0:
+            sys.exit(f"error: schtasks /Create failed: {created.stderr.strip()}")
+        started = _schtasks("/Run", "/TN", SYSTEM_LANE_TASK)
+        if started.returncode != 0:
+            sys.exit(f"error: schtasks /Run failed: {started.stderr.strip()}")
+        print(f"SYSTEM lane running ({SYSTEM_LANE_TASK})", flush=True)
+        _wait_for_lane(follower, pid_file, exit_file, timeout)
+    finally:
+        if not exit_file.exists():
+            _kill_lane_tree(pid_file)
+            _schtasks("/End", "/TN", SYSTEM_LANE_TASK)
+        follower.pump(final=True)
+        _schtasks("/Delete", "/TN", SYSTEM_LANE_TASK, "/F")
+
+    exit_code = read_lane_exit(exit_file)
+    junit = out_dir / "junit.xml"
+    skipped = skipped_rows(junit.read_text(encoding="utf-8")) if junit.exists() else []
+    if skipped:
+        listing = "\n  ".join(skipped)
+        print(f"skipped privileged rows:\n  {listing}")
+        if IN_CI:
+            sys.exit("error: privileged rows skipped under CI")
+        print("warning: privileged rows skipped")
+    sys.exit(exit_code)
+
+
 def cmd_coverage(build_dir: Path) -> None:
     out = ROOT / "out" / "coverage" / "c"
     out.mkdir(parents=True, exist_ok=True)
@@ -1478,6 +1991,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--build-dir", type=Path, required=True)
     p = sub.add_parser("valgrind-py")
     p.add_argument("--daemon", type=Path, required=True)
+    sub.add_parser(
+        "test-py-system", help="run the SYSTEM lane (handled before argparse)"
+    )
     p = sub.add_parser("coverage")
     p.add_argument("--build-dir", type=Path, required=True)
     p = sub.add_parser("fuzz")
@@ -1504,6 +2020,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     # leading options such as `-S`, so dispatch it before parsing.
     if raw and raw[0] in {"cmake", "ctest"}:
         cmd_passthrough(raw[0], raw[1:])
+        return
+    # Likewise test-py-system, whose pytest arguments may start with a flag.
+    if raw and raw[0] == "test-py-system":
+        cmd_test_py_system(*split_system_lane_args(raw[1:]))
         return
 
     args = parser.parse_args(raw)
