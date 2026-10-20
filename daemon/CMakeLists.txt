@@ -184,6 +184,15 @@ if(NOT TAZ_SANITIZER STREQUAL "none")
     endif()
 endif()
 
+option(TAZ_BUILD_FUZZ
+       "Build the libFuzzer harnesses (requires Clang + -fsanitize=fuzzer)" OFF)
+if(TAZ_BUILD_FUZZ)
+    # Coverage instrumentation for everything the harnesses link (taz_core,
+    # taz_proto, nanopb), not just the harness files: without it libFuzzer
+    # sees only the harness's own few edges and cannot steer its inputs.
+    add_compile_options(-fsanitize=fuzzer-no-link)
+endif()
+
 # ---------------------------------------------------------------------------
 # Dependencies (Conan-generated config packages; `just configure` runs
 # `conan install` before cmake and the preset's toolchain file adds the
@@ -328,10 +337,8 @@ target_link_libraries(tazd PRIVATE taz_warnings taz_core)
 install(TARGETS tazd)
 
 # ---------------------------------------------------------------------------
-# Fuzz harnesses (linux-fuzz preset only)
+# Fuzz harnesses (linux-fuzz preset only; TAZ_BUILD_FUZZ is declared above)
 # ---------------------------------------------------------------------------
-option(TAZ_BUILD_FUZZ
-       "Build the libFuzzer harnesses (requires Clang + -fsanitize=fuzzer)" OFF)
 if(TAZ_BUILD_FUZZ)
     add_subdirectory(fuzz)
 endif()

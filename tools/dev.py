@@ -1079,12 +1079,25 @@ FUZZ_MAX_LEN = {
 }
 
 
+# Fewer coverage features than this at the end of a run means the code under
+# test was built without coverage instrumentation (each harness alone has a
+# handful), so libFuzzer was fuzzing blind.
+FUZZ_MIN_COVERAGE = 100
+
+
+def fuzz_final_coverage(output: str) -> int | None:
+    """The `cov:` count of libFuzzer's last status line, or None if absent."""
+    found = re.findall(r"\bcov: (\d+)", output)
+    return int(found[-1]) if found else None
+
+
 def cmd_fuzz(build_dir: Path, seconds: int) -> None:
     """Run each libFuzzer harness for `seconds` from its checked-in seeds.
 
     New inputs go to a scratch corpus in the build directory: libFuzzer writes
     to the first corpus directory it is given and only reads the others, so
-    the seeds in daemon/fuzz/corpus/ stay as committed.
+    the seeds in daemon/fuzz/corpus/ stay as committed. A run that ends with
+    less than FUZZ_MIN_COVERAGE coverage fails as well as a crashing one.
     """
     seeds_dir = ROOT / "daemon" / "fuzz" / "corpus"
     for harness, max_len in FUZZ_MAX_LEN.items():
@@ -1093,19 +1106,34 @@ def cmd_fuzz(build_dir: Path, seconds: int) -> None:
             sys.exit(f"error: fuzz binary not found: {binary}")
         scratch = build_dir / "fuzz-corpus" / harness
         scratch.mkdir(parents=True, exist_ok=True)
-        rc = run(
-            [
-                binary,
-                scratch,
-                seeds_dir / harness,
-                f"-max_total_time={seconds}",
-                f"-max_len={max_len}",
-                "-error_exitcode=1",
-            ],
-            check=False,
-        )
-        if rc != 0:
-            sys.exit(f"error: {harness} reported a failure (exit {rc})")
+        cmd = [
+            str(binary),
+            str(scratch),
+            str(seeds_dir / harness),
+            f"-max_total_time={seconds}",
+            f"-max_len={max_len}",
+            "-error_exitcode=1",
+        ]
+        print(f"$ {' '.join(cmd)}", flush=True)
+        # libFuzzer reports on stderr; relay it as it comes and keep a copy.
+        lines: list[str] = []
+        with subprocess.Popen(
+            cmd, cwd=ROOT, stderr=subprocess.PIPE, text=True, errors="replace"
+        ) as proc:
+            if proc.stderr is None:  # always set: stderr=PIPE above
+                sys.exit(f"error: no stderr pipe from {harness}")
+            for line in proc.stderr:
+                sys.stderr.write(line)
+                lines.append(line)
+        if proc.returncode != 0:
+            sys.exit(f"error: {harness} reported a failure (exit {proc.returncode})")
+        coverage = fuzz_final_coverage("".join(lines))
+        if coverage is None or coverage < FUZZ_MIN_COVERAGE:
+            sys.exit(
+                f"error: {harness} ended with coverage {coverage} (want at "
+                f"least {FUZZ_MIN_COVERAGE}): is the code under test built "
+                "with -fsanitize=fuzzer-no-link?"
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -824,3 +824,22 @@ def test_third_party_notices_mentions_every_musl_toolchain() -> None:
         assert toolchain.name in notices, (
             f"{toolchain.name} missing from THIRD_PARTY_NOTICES"
         )
+
+
+# --- fuzz ---------------------------------------------------------------------
+
+
+def test_fuzz_final_coverage_reads_the_last_status_line() -> None:
+    output = (
+        "#26\tINITED cov: 141 ft: 387 corp: 15/130b exec/s: 0 rss: 34Mb\n"
+        "#1003031\tDONE   cov: 250 ft: 1442 corp: 301/31Kb exec/s: 47763\n"
+    )
+    assert dev.fuzz_final_coverage(output) == 250
+    assert dev.fuzz_final_coverage("INFO: Seed: 1\n") is None
+
+
+def test_an_uninstrumented_fuzz_run_is_below_the_minimum() -> None:
+    blind = "#43000000\tDONE   cov: 2 ft: 2 corp: 1/1b exec/s: 700000\n"
+    coverage = dev.fuzz_final_coverage(blind)
+    assert coverage is not None
+    assert coverage < dev.FUZZ_MIN_COVERAGE
