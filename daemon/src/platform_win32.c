@@ -151,14 +151,13 @@ static int append_quoted(char *out, size_t out_size, size_t *pos,
             {
                 return -1;
             }
-            while (backslashes-- > 0U)
+            for (; backslashes > 0U; backslashes--)
             {
                 out[(*pos)++] = '\\';
                 out[(*pos)++] = '\\';
             }
             out[(*pos)++] = '\\';
             out[(*pos)++] = '"';
-            backslashes = 0U;
             continue;
         }
         if (backslashes > 0U)
@@ -167,7 +166,7 @@ static int append_quoted(char *out, size_t out_size, size_t *pos,
             {
                 return -1;
             }
-            while (backslashes-- > 0U)
+            for (; backslashes > 0U; backslashes--)
             {
                 out[(*pos)++] = '\\';
             }
@@ -184,7 +183,7 @@ static int append_quoted(char *out, size_t out_size, size_t *pos,
         {
             return -1;
         }
-        while (backslashes-- > 0U)
+        for (; backslashes > 0U; backslashes--)
         {
             out[(*pos)++] = '\\';
             out[(*pos)++] = '\\';
