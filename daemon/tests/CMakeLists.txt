@@ -15,6 +15,11 @@ target_link_libraries(taz_test_sleeper PRIVATE taz_warnings libuv::uv_a)
 add_executable(taz_test_grandchild grandchild.c)
 target_link_libraries(taz_test_grandchild PRIVATE taz_warnings libuv::uv_a)
 
+# Cross-platform helper for the exec tree-kill tests: spawns the sleeper as a
+# grandchild, records its pid, then sleeps. Test-only, not installed.
+add_executable(taz_test_treeparent treeparent.c)
+target_link_libraries(taz_test_treeparent PRIVATE taz_warnings libuv::uv_a)
+
 # Cross-platform helper for the DETACH FAILED tests: exits immediately with
 # a caller-chosen status. Test-only, not installed.
 add_executable(taz_test_exiter exiter.c)
@@ -70,6 +75,7 @@ target_compile_definitions(
     taz_tests
     PRIVATE TAZ_TEST_SLEEPER_PATH="$<TARGET_FILE:taz_test_sleeper>"
             TAZ_TEST_GRANDCHILD_PATH="$<TARGET_FILE:taz_test_grandchild>"
+            TAZ_TEST_TREEPARENT_PATH="$<TARGET_FILE:taz_test_treeparent>"
             TAZ_TEST_EXITER_PATH="$<TARGET_FILE:taz_test_exiter>")
 
 gtest_discover_tests(taz_tests)

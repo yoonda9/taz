@@ -353,8 +353,8 @@ jobs:
 
       # Hand the native-arm test job the (fully static) test executables; they
       # aren't in the release bundle, so they ship as their own artifact. The
-      # suite spawns helpers (taz_test_sleeper/_grandchild/_exiter) via paths
-      # baked absolute at build time ($<TARGET_FILE:...>), i.e. under
+      # suite spawns helpers (taz_test_sleeper/_grandchild/_treeparent/_exiter)
+      # via paths baked absolute at build time ($<TARGET_FILE:...>), i.e. under
       # /home/runner/work/taz/taz/daemon/build/<preset>/tests. Both runners use
       # that same workspace root, so linux-arm-test restores these to the exact
       # same relative path and the baked paths resolve. The artifact flattens to
@@ -368,6 +368,7 @@ jobs:
             daemon/build/linux-musl-aarch64-release/tests/taz_tests
             daemon/build/linux-musl-aarch64-release/tests/taz_test_sleeper
             daemon/build/linux-musl-aarch64-release/tests/taz_test_grandchild
+            daemon/build/linux-musl-aarch64-release/tests/taz_test_treeparent
             daemon/build/linux-musl-aarch64-release/tests/taz_test_exiter
           if-no-files-found: error
 
@@ -434,7 +435,8 @@ jobs:
       - name: C unit tests (native aarch64)
         run: |
           d=daemon/build/linux-musl-aarch64-release/tests
-          for exe in taz_tests taz_test_sleeper taz_test_grandchild taz_test_exiter; do
+          for exe in taz_tests taz_test_sleeper taz_test_grandchild taz_test_treeparent \
+            taz_test_exiter; do
             test -f "$d/$exe" || { echo "missing $exe in artifact"; exit 1; }
             chmod +x "$d/$exe"
           done

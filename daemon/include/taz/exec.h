@@ -209,6 +209,24 @@ extern "C"
      * real call. Process-global; callers must restore NULL when done. */
     typedef int (*taz_exec_assign_job_fn_t)(void *job, void *process);
     void taz_exec_set_assign_job_for_tests(taz_exec_assign_job_fn_t fn);
+
+    /* True on a pre-Windows-8 kernel (major.minor < 6.2), where nested Job
+     * Objects are unsupported. Returns the taz_exec_set_pre_win8_for_tests
+     * override when one is set; otherwise asks ntdll's RtlGetVersion, which
+     * reports the kernel's real version (GetVersionEx/VerifyVersionInfo are
+     * manifest-shimmed and lie on Windows 8.1+ without a compat manifest).
+     * Returns false if the version cannot be read. */
+    bool taz_exec_win32_is_pre_win8(void);
+
+    /* The uv_process_options_t.flags taz_exec_start spawns with:
+     * UV_PROCESS_WINDOWS_HIDE, plus UV_PROCESS_DETACHED iff
+     * taz_exec_win32_is_pre_win8(). */
+    unsigned int taz_exec_win32_spawn_flags(void);
+
+    /* Test-only: 1 forces "pre-Windows-8", 0 forces "Windows 8+", -1 clears
+     * the override so the real version check runs again. Not synchronised;
+     * call it from the loop thread before taz_exec_start. */
+    void taz_exec_set_pre_win8_for_tests(int state);
 #endif
 
 #ifdef __cplusplus

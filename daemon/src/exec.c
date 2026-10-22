@@ -1017,6 +1017,66 @@ static int create_job_object(HANDLE *out_job)
     *out_job = job;
     return 0;
 }
+
+/* -1 = run the real version check, 0/1 = forced Windows 8+/pre-Windows-8. */
+static int g_pre_win8_override = -1;
+
+/* Windows 8 is NT 6.2: anything older cannot nest Job Objects. */
+static const DWORD PRE_WIN8_MAJOR = 6U;
+static const DWORD PRE_WIN8_MINOR = 2U;
+
+typedef LONG(WINAPI *rtl_get_version_fn_t)(PRTL_OSVERSIONINFOW);
+
+bool taz_exec_win32_is_pre_win8(void)
+{
+    if (g_pre_win8_override >= 0)
+    {
+        return g_pre_win8_override != 0;
+    }
+
+    /* RtlGetVersion rather than GetVersionEx/VerifyVersionInfo: those are
+     * manifest-shimmed and report 6.2 on Windows 8.1+ unless the exe carries
+     * a compat manifest, while RtlGetVersion states the kernel's truth. */
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == NULL)
+    {
+        return false;
+    }
+    rtl_get_version_fn_t rtl_get_version =
+        (rtl_get_version_fn_t)GetProcAddress(ntdll, "RtlGetVersion");
+    if (rtl_get_version == NULL)
+    {
+        return false;
+    }
+
+    RTL_OSVERSIONINFOW info;
+    (void)memset(&info, 0, sizeof(info));
+    info.dwOSVersionInfoSize = sizeof(info);
+    if (rtl_get_version(&info) != 0)
+    {
+        return false;
+    }
+    if (info.dwMajorVersion != PRE_WIN8_MAJOR)
+    {
+        return info.dwMajorVersion < PRE_WIN8_MAJOR;
+    }
+    return info.dwMinorVersion < PRE_WIN8_MINOR;
+}
+
+unsigned int taz_exec_win32_spawn_flags(void)
+{
+    unsigned int flags = UV_PROCESS_WINDOWS_HIDE;
+    if (taz_exec_win32_is_pre_win8())
+    {
+        flags |= UV_PROCESS_DETACHED;
+    }
+    return flags;
+}
+
+void taz_exec_set_pre_win8_for_tests(int state)
+{
+    g_pre_win8_override = state;
+}
 #endif
 
 void taz_exec_apply_identity(uv_process_options_t *options,
@@ -2019,7 +2079,15 @@ int taz_exec_start(uv_loop_t *loop, const taz_exec_spec_t *spec,
     options.stdio_count = TAZ_EXEC_STDIO_COUNT;
     options.stdio = stdio;
 #ifdef _WIN32
-    options.flags = UV_PROCESS_WINDOWS_HIDE;
+    /* On pre-Windows-8 this adds UV_PROCESS_DETACHED, so libuv does not put
+     * the child in its own global job (nested jobs are unsupported there)
+     * and the per-exec job below is the only one. Detached means no console
+     * (DETACHED_PROCESS overrides HIDE's CREATE_NO_WINDOW). The child's own
+     * output is unaffected, as stdout/stderr are captured over the pipes
+     * above, but any console program it launches allocates a fresh console
+     * window, visible when tazd runs in an interactive session (not in
+     * session 0 as a service). libuv offers no way around this. */
+    options.flags = taz_exec_win32_spawn_flags();
 #else
     options.flags = UV_PROCESS_DETACHED;
 #endif

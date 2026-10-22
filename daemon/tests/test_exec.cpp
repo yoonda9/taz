@@ -22,6 +22,9 @@
 #include <io.h>
 #include <windows.h>
 
+// Needs <windows.h> first.
+#include <versionhelpers.h>
+
 #include "win32_token_test_support.h"
 #endif
 
@@ -681,6 +684,9 @@ class ExecSpawnTest : public ::testing::Test
 
     void TearDown() override
     {
+#ifdef _WIN32
+        taz_exec_set_pre_win8_for_tests(-1);
+#endif
         EXPECT_EQ(uv_run(&loop_, UV_RUN_DEFAULT), 0);
         EXPECT_EQ(uv_loop_close(&loop_), 0);
     }
@@ -1897,6 +1903,172 @@ TEST_F(ExecSpawnTest, ZeroTimeoutMeansChildRunsToNormalCompletion)
     EXPECT_FALSE(outcome.timed_out);
 }
 
+// --- tree kill, end to end -------------------------------------------------
+//
+// taz_test_treeparent spawns the sleeper as a grandchild that shares its
+// stdout pipe and records the grandchild's pid in a file. Cancelling the exec
+// must take the grandchild down too, not just the direct child: on_done only
+// fires once the pipe drains, so it also cannot fire early.
+
+std::string tree_pid_file()
+{
+    const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
+    return ::testing::TempDir() + "taz_tree_" + info->name() + "_" +
+           std::to_string(uv_os_getpid()) + ".pid";
+}
+
+// Waits (without running the loop) for the helper's complete pid line.
+int wait_for_grandchild_pid(const std::string &path)
+{
+    for (int i = 0; i < 500; i++)
+    {
+        FILE *f = std::fopen(path.c_str(), "r");
+        if (f != nullptr)
+        {
+            char buf[32] = {0};
+            const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+            (void)std::fclose(f);
+            if (n > 0 && buf[n - 1] == '\n')
+            {
+                return static_cast<int>(std::strtol(buf, nullptr, 10));
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return 0;
+}
+
+// A killed grandchild is reparented and may linger as an unreaped zombie,
+// which kill(pid, 0) still reports as present. Only Linux exposes the state.
+bool process_is_zombie(int pid)
+{
+#ifdef __linux__
+    const std::string path = "/proc/" + std::to_string(pid) + "/stat";
+    FILE *f = std::fopen(path.c_str(), "r");
+    if (f == nullptr)
+    {
+        return true;
+    }
+    char buf[256] = {0};
+    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    (void)std::fclose(f);
+    const char *paren = n > 0 ? std::strrchr(buf, ')') : nullptr;
+    return paren != nullptr && paren[1] == ' ' && paren[2] == 'Z';
+#else
+    (void)pid;
+    return false;
+#endif
+}
+
+bool process_alive(int pid)
+{
+    return uv_kill(pid, 0) == 0 && !process_is_zombie(pid);
+}
+
+// Polls briefly: the kill is already delivered when on_done fires, but the
+// kernel may take a moment to finish tearing the process down.
+bool process_gone_soon(int pid)
+{
+    for (int i = 0; i < 250; i++)
+    {
+        if (!process_alive(pid))
+        {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+void expect_tree_dies_on_cancel(uv_loop_t *loop)
+{
+    const std::string pid_file = tree_pid_file();
+    (void)std::remove(pid_file.c_str());
+    const char *const args[] = {TAZ_TEST_SLEEPER_PATH, pid_file.c_str()};
+    taz_exec_spec_t spec{};
+    spec.file = TAZ_TEST_TREEPARENT_PATH;
+    spec.args = args;
+    spec.args_count = 2;
+    spec.max_output_bytes = 1024;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(loop, &spec, record_outcome, &outcome, &x), 0);
+
+    const int grandchild = wait_for_grandchild_pid(pid_file);
+    ASSERT_GT(grandchild, 0);
+    ASSERT_TRUE(process_alive(grandchild)) << "grandchild should be running";
+
+    taz_exec_cancel(x);
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_EQ(uv_run(loop, UV_RUN_DEFAULT), 0);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_TRUE(outcome.cancelled);
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+    EXPECT_TRUE(process_gone_soon(grandchild))
+        << "grandchild survived the cancel";
+    (void)std::remove(pid_file.c_str());
+}
+
+TEST_F(ExecSpawnTest, CancelKillsGrandchildToo)
+{
+    expect_tree_dies_on_cancel(Loop());
+}
+
+#ifdef _WIN32
+TEST_F(ExecSpawnTest, ForcedPreWin8ChildRunsToCompletionAndReturnsOutput)
+{
+    taz_exec_set_pre_win8_for_tests(1);
+
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1U << 20;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.exit_status, 0);
+    EXPECT_FALSE(outcome.out.empty());
+    EXPECT_FALSE(outcome.cancelled);
+    EXPECT_FALSE(outcome.timed_out);
+}
+
+TEST_F(ExecSpawnTest, ForcedPreWin8CancelKillsGrandchildToo)
+{
+    taz_exec_set_pre_win8_for_tests(1);
+    expect_tree_dies_on_cancel(Loop());
+}
+
+TEST_F(ExecSpawnTest, ForcedWin8PlusChildRunsToCompletionAndReturnsOutput)
+{
+    taz_exec_set_pre_win8_for_tests(0);
+
+    const char *const args[] = {"--gtest_filter=NoSuchSuite.*"};
+    taz_exec_spec_t spec{};
+    spec.file = Exe().c_str();
+    spec.args = args;
+    spec.args_count = 1;
+    spec.max_output_bytes = 1U << 20;
+
+    ExecOutcome outcome;
+    taz_exec_t *x = nullptr;
+    ASSERT_EQ(taz_exec_start(Loop(), &spec, record_outcome, &outcome, &x), 0);
+    ASSERT_EQ(uv_run(Loop(), UV_RUN_DEFAULT), 0);
+
+    EXPECT_TRUE(outcome.called);
+    EXPECT_EQ(outcome.exit_status, 0);
+    EXPECT_FALSE(outcome.out.empty());
+}
+#endif
+
 // --- taz_exec_pid / taz_exec_signal ----------------------------------------
 //
 // taz_test_sleeper (see above) gives these a live child to probe without
@@ -2225,5 +2397,57 @@ TEST_F(ExecSpawnTest, OutOfRangeSignumDoesNotCrashAndLeavesChildSignalable)
     EXPECT_TRUE(outcome.called);
     EXPECT_TRUE(outcome.cancelled);
 }
+
+#ifdef _WIN32
+class ExecWin32SeamTest : public ::testing::Test
+{
+  protected:
+    void TearDown() override
+    {
+        taz_exec_set_pre_win8_for_tests(-1);
+    }
+};
+
+TEST_F(ExecWin32SeamTest, ForcedPreWin8AddsDetachedToTheSpawnFlags)
+{
+    taz_exec_set_pre_win8_for_tests(1);
+    EXPECT_TRUE(taz_exec_win32_is_pre_win8());
+    const unsigned int flags = taz_exec_win32_spawn_flags();
+    EXPECT_NE(flags & UV_PROCESS_DETACHED, 0U);
+    EXPECT_NE(flags & UV_PROCESS_WINDOWS_HIDE, 0U);
+}
+
+TEST_F(ExecWin32SeamTest, ForcedWin8PlusLeavesDetachedOut)
+{
+    taz_exec_set_pre_win8_for_tests(0);
+    EXPECT_FALSE(taz_exec_win32_is_pre_win8());
+    const unsigned int flags = taz_exec_win32_spawn_flags();
+    EXPECT_EQ(flags & UV_PROCESS_DETACHED, 0U);
+    EXPECT_NE(flags & UV_PROCESS_WINDOWS_HIDE, 0U);
+}
+
+TEST_F(ExecWin32SeamTest, ClearedOverrideFollowsTheRealVersionCheck)
+{
+    taz_exec_set_pre_win8_for_tests(-1);
+    const bool pre = taz_exec_win32_is_pre_win8();
+    const unsigned int flags = taz_exec_win32_spawn_flags();
+    EXPECT_EQ((flags & UV_PROCESS_DETACHED) != 0U, pre);
+    EXPECT_NE(flags & UV_PROCESS_WINDOWS_HIDE, 0U);
+    // Independent oracle that holds on any host, including a real pre-Win8
+    // boot: without a compat manifest the shim caps the reported version at
+    // 6.2, which still answers "8 or newer" correctly.
+    EXPECT_EQ(pre, !IsWindows8OrGreater());
+}
+
+TEST_F(ExecWin32SeamTest, OverrideIsNotSticky)
+{
+    taz_exec_set_pre_win8_for_tests(-1);
+    const bool real = taz_exec_win32_is_pre_win8();
+    taz_exec_set_pre_win8_for_tests(1);
+    EXPECT_TRUE(taz_exec_win32_is_pre_win8());
+    taz_exec_set_pre_win8_for_tests(-1);
+    EXPECT_EQ(taz_exec_win32_is_pre_win8(), real);
+}
+#endif
 
 } // namespace
