@@ -51,6 +51,11 @@ proto-check:
 musl-toolchain arch="x86_64":
     {{ dev }} musl-toolchain {{ arch }}
 
+# Develop the libuv patch series: `import` (default) rebuilds the scratch git tree in
+# out/libuv-patches/ from the recipe; `export` writes its commits back to the recipe
+libuv-patches mode="import" *flags:
+    {{ dev }} libuv-patches {{ mode }} {{ flags }}
+
 # Install the preset's Conan dependencies (the first half of `configure`)
 deps preset=preset:
     {{ dev }} deps {{ preset }}

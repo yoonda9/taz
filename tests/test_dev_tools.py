@@ -22,6 +22,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+import yaml
 
 _SPEC = importlib.util.spec_from_file_location(
     "dev", Path(__file__).resolve().parent.parent / "tools" / "dev.py"
@@ -334,6 +335,115 @@ def test_conan_env_gives_i686_and_aarch64_their_own_conan_home(
     assert aarch64_env["TAZ_MUSL_TOOLCHAIN"] == str(tmp_path / "aarch64")
 
 
+# --- export-in-deps: the libuv recipe is exported before install/lock --------
+
+
+LIBUV_LOCKED = "libuv/1.51.0-taz.1#" + "a" * 32
+
+
+def _record_conan_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, exported: str = LIBUV_LOCKED
+) -> list[tuple[list[str], dict[str, str] | None]]:
+    """Record conan invocations; `conan export` reports `exported`, and the
+    lockfile pins LIBUV_LOCKED."""
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def fake_run(
+        cmd: list[Any], *, env: dict[str, str] | None = None, **_kwargs: Any
+    ) -> int:
+        calls.append(([str(c) for c in cmd], env))
+        return 0
+
+    def fake_subprocess_run(
+        cmd: list[Any], *, env: dict[str, str] | None = None, **_kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(([str(c) for c in cmd], env))
+        stdout = json.dumps({"reference": exported})
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout)
+
+    lock = tmp_path / "conan.lock"
+    lock.write_text(
+        json.dumps({"requires": [f"{LIBUV_LOCKED}%1792722675.0", "gtest/1.17.0#b"]})
+    )
+    monkeypatch.setattr(dev, "CONAN_LOCKFILE", lock)
+    monkeypatch.setattr(dev, "tool", lambda name: name)
+    monkeypatch.setattr(dev, "ensure_msvc_env", lambda: None)
+    monkeypatch.setattr(dev, "run", fake_run)
+    monkeypatch.setattr(dev.subprocess, "run", fake_subprocess_run)
+    monkeypatch.delenv(dev.CI_CONAN_PRESET_VAR, raising=False)
+    return calls
+
+
+def test_deps_exports_libuv_recipe_before_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_conan_calls(tmp_path, monkeypatch)
+
+    dev.cmd_deps("linux-debug")
+
+    verbs = [c[0][1] for c in calls]
+    assert verbs == ["export", "install"]
+    assert calls[0][0][2] == str(dev.LIBUV_RECIPE_DIR)
+    assert calls[0][1] == calls[1][1]  # same CONAN_HOME as the install
+
+
+def test_deps_refuses_a_lock_pinning_another_libuv_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    edited = "libuv/1.51.0-taz.1#" + "b" * 32
+    calls = _record_conan_calls(tmp_path, monkeypatch, exported=edited)
+
+    with pytest.raises(SystemExit, match="just lock-deps") as excinfo:
+        dev.cmd_deps("linux-debug")
+
+    assert edited in str(excinfo.value)
+    assert LIBUV_LOCKED in str(excinfo.value)
+    assert [c[0][1] for c in calls] == ["export"]  # never reaches install
+
+
+def test_deps_accepts_a_lock_without_the_recipe_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_conan_calls(
+        tmp_path, monkeypatch, exported="libuv/1.52.0-taz.1#" + "c" * 32
+    )
+
+    dev.cmd_deps("linux-debug")
+
+    assert [c[0][1] for c in calls] == ["export", "install"]
+
+
+def test_lock_deps_exports_libuv_recipe_before_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A stale lock is what lock-deps is for: no revision check.
+    calls = _record_conan_calls(
+        tmp_path, monkeypatch, exported="libuv/1.51.0-taz.1#" + "b" * 32
+    )
+
+    dev.cmd_lock_deps("linux-debug")
+
+    assert [c[0][1] for c in calls] == ["export", "lock"]
+    assert calls[0][0][2] == str(dev.LIBUV_RECIPE_DIR)
+
+
+def test_deps_exports_into_the_musl_conan_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_conan_calls(tmp_path, monkeypatch)
+    monkeypatch.setattr(dev, "cache_root", lambda: tmp_path)
+    monkeypatch.setattr(dev, "musl_toolchain_dir", lambda arch=None: tmp_path / "tc")
+    monkeypatch.setattr(dev, "ensure_musl_toolchain", lambda arch=None: None)
+    monkeypatch.setattr(dev, "ensure_musl_conan_home", lambda env: None)
+
+    dev.cmd_deps("linux-musl-release")
+
+    export_env = calls[0][1]
+    assert calls[0][0][1] == "export"
+    assert export_env is not None
+    assert export_env["CONAN_HOME"] == str(tmp_path / "conan-musl")
+
+
 # --- conan-cache-key ---------------------------------------------------------
 
 
@@ -386,6 +496,57 @@ def test_conan_cache_key_digest_includes_musl_sha_only_for_musl_preset(
         assert key.startswith("conan-Linux-gcc-15-Release-")
     assert musl_key_a != musl_key_b
     assert glibc_key != musl_key_a
+
+
+def test_conan_cache_key_changes_with_libuv_recipe_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile = json.dumps(
+        {
+            "host": {
+                "settings": {
+                    "os": "Linux",
+                    "compiler": "gcc",
+                    "compiler.version": "15",
+                    "build_type": "Release",
+                }
+            }
+        }
+    )
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        stdout = "2.x.y\n" if "--version" in cmd else profile
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    recipe = tmp_path / "libuv"
+    (recipe / "patches").mkdir(parents=True)
+    (recipe / "conanfile.py").write_text("a")
+    monkeypatch.setattr(dev, "tool", lambda name: name)
+    monkeypatch.setattr(dev.subprocess, "run", fake_run)
+    monkeypatch.setattr(dev, "LIBUV_RECIPE_DIR", recipe)
+
+    def key() -> str:
+        dev.cmd_conan_cache_key("linux-release")
+        return capsys.readouterr().out.strip()
+
+    base = key()
+    assert key() == base
+    (recipe / "patches" / "0001-x.patch").write_text("p")
+    with_patch = key()
+    assert with_patch != base
+    (recipe / "patches" / "0001-x.patch").write_text("q")
+    assert key() != with_patch
+    stable = key()
+    (recipe / "__pycache__").mkdir()
+    (recipe / "__pycache__" / "conanfile.cpython-313.pyc").write_bytes(b"\0")
+    (recipe / "stray.pyc").write_bytes(b"\0")
+    assert key() == stable
+    # Path and contents are hashed apart: moving bytes between them counts.
+    (recipe / "ab").write_text("c")
+    moved_from = key()
+    (recipe / "ab").unlink()
+    (recipe / "a").write_text("bc")
+    assert key() != moved_from
 
 
 # --- verify-static -----------------------------------------------------------
@@ -1273,3 +1434,358 @@ def test_an_uninstrumented_fuzz_run_is_below_the_minimum() -> None:
     coverage = dev.fuzz_final_coverage(blind)
     assert coverage is not None
     assert coverage < dev.FUZZ_MIN_COVERAGE
+
+
+# --- libuv-patches -----------------------------------------------------------
+
+REAL_LIBUV_RECIPE = (
+    Path(__file__).resolve().parent.parent / "daemon" / "recipes" / "libuv"
+)
+
+
+class LibuvLab:
+    """A fake libuv tarball, a copy of the real recipe dir and a scratch tree."""
+
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.cache = tmp_path / "cache"
+        self.recipe = tmp_path / "recipe"
+        self.tree_root = tmp_path / "out" / "libuv-patches"
+        self.tree = self.tree_root / "libuv-1.51.0"
+        shutil.copytree(
+            REAL_LIBUV_RECIPE, self.recipe, ignore=shutil.ignore_patterns("__pycache__")
+        )
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w:gz") as tar:
+            for name, data in (
+                ("libuv-1.51.0/README.md", b"libuv\n"),
+                ("libuv-1.51.0/src/unix/core.c", b"int main(void) { return 0; }\n"),
+            ):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        self.tarball = payload.getvalue()
+        self.sha256 = hashlib.sha256(self.tarball).hexdigest()
+        conandata = self.recipe / "conandata.yml"
+        conandata.write_text(
+            conandata.read_text().replace(
+                "27e55cf7083913bfb6826ca78cde9de7647cded648d35f24163f2d31bb9f51cd",
+                self.sha256,
+            ),
+            newline="\n",
+        )
+        monkeypatch.setattr(dev, "cache_root", lambda: self.cache)
+        monkeypatch.setattr(dev, "LIBUV_RECIPE_DIR", self.recipe)
+        monkeypatch.setattr(dev, "LIBUV_PATCH_TREE", self.tree_root)
+        monkeypatch.setattr(dev.urllib.request, "urlopen", _no_network)
+
+    def seed_cache(self) -> None:
+        directory = self.cache / "libuv"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{self.sha256}.tar.gz").write_bytes(self.tarball)
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            [dev.tool("git"), *args],
+            cwd=self.tree,
+            env=dev.libuv_git_env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    def commit_change(self, subject: str = "unix: tweak core") -> None:
+        (self.tree / "src" / "unix" / "core.c").write_text(
+            "int main(void) { return 1; }\n", newline="\n"
+        )
+        self.git("commit", "-q", "-a", "-m", subject)
+
+    def patches(self) -> list[str]:
+        return sorted(p.name for p in (self.recipe / "patches").glob("*.patch"))
+
+    def recipe_bytes(self) -> dict[str, bytes]:
+        return {
+            p.relative_to(self.recipe).as_posix(): p.read_bytes()
+            for p in sorted(self.recipe.rglob("*"))
+            if p.is_file()
+        }
+
+    def restore_recipe(self, snapshot: dict[str, bytes]) -> None:
+        """Put the recipe dir back to `snapshot`, as a checkout of it would."""
+        for path in [p for p in self.recipe.rglob("*") if p.is_file()]:
+            if path.relative_to(self.recipe).as_posix() not in snapshot:
+                path.unlink()
+        for name, data in snapshot.items():
+            (self.recipe / name).write_bytes(data)
+
+    def break_first_patch(self) -> None:
+        """Change the first patch's context so `git am` can no longer apply it."""
+        (patch,) = (self.recipe / "patches").glob("0001-*.patch")
+        patch.write_bytes(
+            patch.read_bytes().replace(b"-int main(void) { return 0; }", b"-int x;")
+        )
+
+
+@pytest.fixture
+def libuv_lab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LibuvLab:
+    lab = LibuvLab(tmp_path, monkeypatch)
+    lab.seed_cache()
+    return lab
+
+
+def test_libuv_patches_import_builds_pristine_tree(libuv_lab: LibuvLab) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    assert libuv_lab.git("rev-parse", "pristine") == libuv_lab.git("rev-parse", "HEAD")
+    assert libuv_lab.git("status", "--porcelain") == ""
+    assert len(libuv_lab.git("log", "--oneline").splitlines()) == 1
+    assert (libuv_lab.tree / "src" / "unix" / "core.c").is_file()
+    assert not (libuv_lab.tree / "libuv-1.51.0").exists()
+
+
+def test_libuv_patches_import_rejects_checksum_mismatch(
+    libuv_lab: LibuvLab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (libuv_lab.cache / "libuv" / f"{libuv_lab.sha256}.tar.gz").unlink()
+    served = b"not the tarball"
+
+    class Response(io.BytesIO):
+        def __enter__(self) -> Response:
+            return self
+
+    monkeypatch.setattr(
+        dev.urllib.request, "urlopen", lambda *_a, **_k: Response(served)
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        dev.cmd_libuv_patches("import", force=False)
+    message = str(excinfo.value)
+    assert libuv_lab.sha256 in message
+    assert hashlib.sha256(served).hexdigest() in message
+    assert not libuv_lab.tree.exists()
+    assert not list((libuv_lab.cache / "libuv").glob("*.tar.gz"))
+
+
+def test_libuv_patches_import_refuses_dirty_tree_unless_forced(
+    libuv_lab: LibuvLab,
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    (libuv_lab.tree / "scratch.txt").write_text("wip")
+    with pytest.raises(SystemExit, match="--force"):
+        dev.cmd_libuv_patches("import", force=False)
+    assert (libuv_lab.tree / "scratch.txt").exists()
+    dev.cmd_libuv_patches("import", force=True)
+    assert not (libuv_lab.tree / "scratch.txt").exists()
+    assert libuv_lab.git("status", "--porcelain") == ""
+
+
+def test_libuv_patches_import_refuses_unexported_commits(libuv_lab: LibuvLab) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    libuv_lab.commit_change()
+    with pytest.raises(SystemExit, match="export"):
+        dev.cmd_libuv_patches("import", force=False)
+    dev.cmd_libuv_patches("export", force=False)
+    dev.cmd_libuv_patches("import", force=False)
+
+
+def test_libuv_patches_round_trips_a_one_commit_series(libuv_lab: LibuvLab) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    libuv_lab.commit_change()
+    dev.cmd_libuv_patches("export", force=False)
+
+    assert libuv_lab.patches() == ["0001-unix-tweak-core.patch"]
+    conandata = (libuv_lab.recipe / "conandata.yml").read_text()
+    assert conandata.endswith(
+        "patches:\n"
+        "  1.51.0-taz.1:\n"
+        "    - patch_file: patches/0001-unix-tweak-core.patch\n"
+        '      patch_description: "unix: tweak core"\n'
+        "      patch_type: portability\n"
+    )
+    assert conandata.startswith("sources:\n")
+    assert libuv_lab.sha256 in conandata
+    first = libuv_lab.recipe_bytes()
+
+    dev.cmd_libuv_patches("import", force=True)
+    assert len(libuv_lab.git("log", "--oneline").splitlines()) == 2
+    assert libuv_lab.git("rev-parse", "pristine") != libuv_lab.git("rev-parse", "HEAD")
+    dev.cmd_libuv_patches("export", force=False)
+    assert libuv_lab.recipe_bytes() == first
+
+
+def test_libuv_patches_export_drops_stale_patches_and_keeps_gitkeep(
+    libuv_lab: LibuvLab,
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    (libuv_lab.recipe / "patches" / "0009-stale.patch").write_text("stale")
+    dev.cmd_libuv_patches("export", force=False)
+    assert libuv_lab.patches() == []
+    assert (libuv_lab.recipe / "patches" / ".gitkeep").exists()
+
+
+def test_libuv_patches_empty_series_round_trips_byte_for_byte(
+    libuv_lab: LibuvLab,
+) -> None:
+    before = libuv_lab.recipe_bytes()
+    dev.cmd_libuv_patches("import", force=False)
+    dev.cmd_libuv_patches("export", force=False)
+    assert libuv_lab.recipe_bytes() == before
+
+
+def test_libuv_conandata_emitter_reproduces_the_checked_in_file() -> None:
+    text = (REAL_LIBUV_RECIPE / "conandata.yml").read_text()
+    assert dev.render_libuv_conandata(text, "1.51.0-taz.1", []) == text
+
+
+def test_libuv_patches_export_needs_an_imported_tree(libuv_lab: LibuvLab) -> None:
+    with pytest.raises(SystemExit, match="import"):
+        dev.cmd_libuv_patches("export", force=False)
+
+
+def test_libuv_patches_failed_import_cannot_export_an_empty_series(
+    libuv_lab: LibuvLab,
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    libuv_lab.commit_change()
+    dev.cmd_libuv_patches("export", force=False)
+    libuv_lab.break_first_patch()
+    broken = libuv_lab.recipe_bytes()
+
+    with pytest.raises(SystemExit, match=r"then `just libuv-patches export`"):
+        dev.cmd_libuv_patches("import", force=True)
+    assert (libuv_lab.tree / ".git" / "rebase-apply").exists()  # left to resolve
+    with pytest.raises(SystemExit, match="in progress"):
+        dev.cmd_libuv_patches("export", force=False)
+    with pytest.raises(SystemExit, match="in progress"):
+        dev.cmd_libuv_patches("import", force=False)
+    assert libuv_lab.recipe_bytes() == broken
+
+    # Resolve it by re-making the change by hand, as after a libuv bump.
+    (libuv_lab.tree / "src" / "unix" / "core.c").write_text(
+        "int main(void) { return 1; }\n", newline="\n"
+    )
+    libuv_lab.git("add", "src/unix/core.c")
+    libuv_lab.git("am", "--continue")
+    dev.cmd_libuv_patches("export", force=False)
+    assert libuv_lab.patches() == ["0001-unix-tweak-core.patch"]
+    assert (
+        b"-int x;"
+        not in (
+            libuv_lab.recipe / "patches" / "0001-unix-tweak-core.patch"
+        ).read_bytes()
+    )
+
+
+def test_libuv_patches_export_refuses_a_series_changed_since_import(
+    libuv_lab: LibuvLab,
+) -> None:
+    empty = libuv_lab.recipe_bytes()
+    dev.cmd_libuv_patches("import", force=False)
+    libuv_lab.commit_change()
+    dev.cmd_libuv_patches("export", force=False)
+    one_patch = libuv_lab.recipe_bytes()
+    dev.cmd_libuv_patches("import", force=False)
+    libuv_lab.restore_recipe(empty)  # e.g. a checkout of an older branch
+
+    # Each message points at a way out, not at the other command.
+    with pytest.raises(SystemExit, match=r"`just libuv-patches --force`"):
+        dev.cmd_libuv_patches("export", force=False)
+    assert libuv_lab.recipe_bytes() == empty
+    dev.cmd_libuv_patches("export", force=True)
+    assert libuv_lab.recipe_bytes() == one_patch
+
+
+def test_libuv_patches_aborted_import_cannot_export_an_empty_series(
+    libuv_lab: LibuvLab,
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    libuv_lab.commit_change()
+    dev.cmd_libuv_patches("export", force=False)
+    libuv_lab.break_first_patch()
+    broken = libuv_lab.recipe_bytes()
+    with pytest.raises(SystemExit):
+        dev.cmd_libuv_patches("import", force=True)
+    libuv_lab.git("am", "--abort")  # the way out git's own hint offers
+
+    with pytest.raises(SystemExit, match="delete every patch"):
+        dev.cmd_libuv_patches("export", force=False)
+    assert libuv_lab.recipe_bytes() == broken
+    dev.cmd_libuv_patches("export", force=True)  # dropping it on purpose
+    assert libuv_lab.patches() == []
+
+
+def test_libuv_patches_export_refuses_a_tree_without_a_stamp(
+    libuv_lab: LibuvLab,
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    (libuv_lab.tree / ".git" / dev.LIBUV_SERIES_STAMP).unlink()  # an older import
+    before = libuv_lab.recipe_bytes()
+    with pytest.raises(SystemExit, match="--force"):
+        dev.cmd_libuv_patches("export", force=False)
+    assert libuv_lab.recipe_bytes() == before
+
+
+def test_libuv_patches_import_names_a_listed_patch_that_is_missing(
+    libuv_lab: LibuvLab,
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    libuv_lab.commit_change()
+    dev.cmd_libuv_patches("export", force=False)
+    (libuv_lab.recipe / "patches" / "0001-unix-tweak-core.patch").unlink()
+    with pytest.raises(SystemExit, match=r"0001-unix-tweak-core\.patch"):
+        dev.cmd_libuv_patches("import", force=True)
+    assert (libuv_lab.tree / ".git").exists()  # the old tree is kept
+
+
+def _commit_merge(lab: LibuvLab) -> None:
+    lab.git("checkout", "-q", "-b", "side")
+    lab.commit_change()
+    lab.git("checkout", "-q", "-")
+    lab.git("merge", "-q", "--no-ff", "-m", "merge side", "side")
+
+
+def _commit_new_file(lab: LibuvLab, name: str, data: bytes) -> None:
+    (lab.tree / name).write_bytes(data)
+    lab.git("add", name)
+    lab.git("commit", "-q", "-m", f"add {name}")
+
+
+def _commit_mode_change(lab: LibuvLab) -> None:
+    core = lab.tree / "src" / "unix" / "core.c"
+    core.chmod(0o755)  # a no-op on Windows, where git ignores file modes
+    lab.git("update-index", "--chmod=+x", "src/unix/core.c")
+    lab.git("commit", "-q", "-m", "make core.c executable")
+
+
+@pytest.mark.parametrize(
+    ("make_commit", "error"),
+    [
+        (
+            lambda lab: lab.git("commit", "-q", "--allow-empty", "-m", "No"),
+            "changes nothing",
+        ),
+        (_commit_merge, "merge"),
+        (lambda lab: _commit_new_file(lab, "blob.bin", b"\0\1\2"), "binary"),
+        (lambda lab: _commit_new_file(lab, "empty.c", b""), "without changing"),
+        (_commit_mode_change, "without changing"),
+    ],
+    ids=["empty", "merge", "binary", "empty-file", "mode-only"],
+)
+def test_libuv_patches_export_refuses_unappliable_commits_untouched(
+    libuv_lab: LibuvLab, make_commit: Callable[[LibuvLab], object], error: str
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    before = libuv_lab.recipe_bytes()
+    make_commit(libuv_lab)
+    with pytest.raises(SystemExit, match=error):
+        dev.cmd_libuv_patches("export", force=False)
+    assert libuv_lab.recipe_bytes() == before
+
+
+def test_libuv_conandata_quotes_descriptions_yaml_would_retype() -> None:
+    subjects = ["No", "null", "1.2", "yes", "unix: tweak core", "win: add fallback"]
+    text = dev.render_libuv_conandata(
+        "sources: {}\npatches:\n",
+        "1.51.0-taz.1",
+        [(f"patches/{i:04}-x.patch", s) for i, s in enumerate(subjects)],
+    )
+    loaded = yaml.safe_load(text)["patches"]["1.51.0-taz.1"]
+    assert [entry["patch_description"] for entry in loaded] == subjects
+    assert "patch_description: No\n" not in text
