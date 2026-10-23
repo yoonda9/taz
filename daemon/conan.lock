@@ -1,7 +1,7 @@
 {
     "version": "0.5",
     "requires": [
-        "libuv/1.51.0#ea781dcacf58c65462ab0d3d75e9b002%1764745176.352",
+        "libuv/1.51.0-taz.1#4f2f134ed5dbb3ae7b58370a5e675af9%1792768124.8650553",
         "gtest/1.17.0#43201cc96e5d35332662ce8890cceb27%1786446850.202"
     ],
     "build_requires": [

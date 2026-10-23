@@ -4,7 +4,8 @@ Driven by `just configure <preset>` (tools/dev.py), which runs
 `conan install` with the preset's host profile chain and output folder, then
 `cmake --preset <preset>`; the preset's toolchainFile points at the
 conan_toolchain.cmake generated here. nanopb is a git submodule, not a Conan
-package.
+package. libuv comes from the in-repo recipe in daemon/recipes/libuv, which
+`just deps` exports into the active Conan home first.
 """
 
 from conan import ConanFile
@@ -15,7 +16,7 @@ class TazDaemon(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
 
     def requirements(self) -> None:
-        self.requires("libuv/1.51.0")
+        self.requires("libuv/1.51.0-taz.1")
 
     def build_requirements(self) -> None:
         self.test_requires("gtest/1.17.0")
