@@ -8,6 +8,10 @@ trim_trailing_whitespace = true
 indent_style = space
 indent_size = 4
 
+# git format-patch output: trailing whitespace is part of a patch.
+[*.patch]
+trim_trailing_whitespace = false
+
 [*.{md,yml,yaml,json,toml,proto,options}]
 indent_size = 2
 
