@@ -61,6 +61,33 @@ TAZ layer.
   same release as the generator used by `just proto`.
 - **Conan manages C dependencies** (libuv, gtest). Profiles live in
   `daemon/profiles/`; CMake presets in `daemon/CMakePresets.json`.
+- **libuv comes from the in-repo recipe `daemon/recipes/libuv`**
+  (`libuv/1.51.0-taz.1`): a copy of the conan-center recipe plus a patch
+  series (empty today). Its `legacy_fallbacks` option is pinned off
+  (`libuv/*:legacy_fallbacks=False`) in every host profile, so current targets
+  build upstream libuv. `just deps` and `just lock-deps` export the recipe into
+  the active Conan home first (every home, the Windows VM and CI included), and
+  `tools/dev.py conan-cache-key` hashes the recipe directory, so a patch edit starts
+  fresh CI caches.
+- **Bumping libuv:** edit the `sources` url/sha256 in
+  `daemon/recipes/libuv/conandata.yml` and the version in that file,
+  `daemon/recipes/libuv/conanfile.py` and `daemon/conanfile.py`. Run
+  `just libuv-patches` to re-apply the series onto the new tarball, fix any
+  conflicts and `just libuv-patches export`, then `just lock-deps`. Restore any
+  unrelated lock lines (`--update` can also bump gtest/cmake), and update the
+  libuv version in `THIRD_PARTY_NOTICES`.
+- **Working on the libuv patch series:** `just libuv-patches` unpacks the
+  sha256-verified tarball into a scratch git tree (`out/libuv-patches/`),
+  commits it pristine and `git am`s the series; commit your changes there, then
+  `just libuv-patches export` runs `git format-patch` back into
+  `daemon/recipes/libuv/patches/` and rewrites the patch list in
+  `conandata.yml`. A patch that no longer applies leaves its `git am` in
+  progress in the scratch tree to resolve there, and `export` waits until it
+  is finished; `export` also refuses to overwrite a series that changed since
+  the import (`export --force` overrides). `--force` on import discards
+  unexported commits in the scratch tree. Then run `just lock-deps`: every
+  series change is a new recipe revision, and `just deps` refuses a lock that
+  pins another one.
 - **`linux-musl-release` is isolated from every other Linux preset**: a
   complete host profile (`daemon/profiles/linux-musl`, not composed after
   `default`) pointed at the Bootlin musl toolchain, and its own Conan home
@@ -142,7 +169,8 @@ Every version is exact and bumped by hand (no update bot). Where each lives:
 | Python                        | `.python-version`                                             | edit the version                         |
 | Python packages (incl. conan) | `uv.lock`                                                     | `uv lock --upgrade-package NAME`         |
 | Build backend for `c3`        | `[tool.uv] build-constraint-dependencies` in `pyproject.toml` | edit, then `uv lock`                     |
-| C dependencies                | `daemon/conanfile.py` + `daemon/conan.lock`                   | edit versions, then `just lock-deps`     |
+| C dependencies (not libuv)    | `daemon/conanfile.py` + `daemon/conan.lock`                   | edit versions, then `just lock-deps`     |
+| libuv                         | `daemon/recipes/libuv`                                        | see Conan section, then `just lock-deps` |
 | GitHub Actions                | `ci.yml` `uses:` commit SHA + `# vX.Y.Z`                      | replace both                             |
 | cppcheck on Windows           | `ci.yml` `CPPCHECK_VERSION` + `CPPCHECK_SHA256`               | same version as `mise.toml`              |
 | nanopb                        | submodule commit                                              | check out a tag in it, then `just proto` |
