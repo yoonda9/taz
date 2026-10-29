@@ -63,9 +63,10 @@ TAZ layer.
   `daemon/profiles/`; CMake presets in `daemon/CMakePresets.json`.
 - **libuv comes from the in-repo recipe `daemon/recipes/libuv`**
   (`libuv/1.51.0-taz.1`): a copy of the conan-center recipe plus a patch
-  series (empty today). Its `legacy_fallbacks` option is pinned off
-  (`libuv/*:legacy_fallbacks=False`) in every host profile, so current targets
-  build upstream libuv. `just deps` and `just lock-deps` export the recipe into
+  series (guard-only, see the legacy bullets below). Its `legacy_fallbacks`
+  option is pinned off (`libuv/*:legacy_fallbacks=False`) in every shipping
+  host profile, so current targets build upstream libuv; only the two legacy
+  presets below turn it on. `just deps` and `just lock-deps` export the recipe into
   the active Conan home first (every home, the Windows VM and CI included), and
   `tools/dev.py conan-cache-key` hashes the recipe directory, so a patch edit starts
   fresh CI caches.
@@ -88,6 +89,31 @@ TAZ layer.
   unexported commits in the scratch tree. Then run `just lock-deps`: every
   series change is a new recipe revision, and `just deps` refuses a lock that
   pins another one.
+- **Legacy XP patches are guard-only:** each change sits in
+  `#if TAZ_LEGACY_FALLBACKS` (`TAZ_FORCE_LEGACY` nested inside), with the
+  upstream lines verbatim in the `#else` branch. `just libuv-patches check`
+  applies the recipe's series to a fresh tree (`out/libuv-check/`), undefines
+  both macros and fails unless the result is byte-identical to the `pristine`
+  tag, so the off-build stays upstream libuv.
+- **`just libuv-test [stock|legacy|forced]`:** builds the recipe's series with
+  the recipe's own definitions (`TAZ_DEFINES` in its `conanfile.py`) and runs
+  libuv's `uv_run_tests_a` one test at a time, each from a clean tree, so a
+  test that dies cannot fail the ones after it. Logs and `results.json` go to
+  `out/libuv-test/<variant>/`. A test fails the run if it fails twice, fails
+  once and then passes (flaky), or crashes; tests in `LIBUV_TEST_ACCEPTED`
+  (`tools/dev.py`, with reasons) are exempt. With `--baseline
+out/libuv-test/stock/results.json`, a flake the baseline shares is
+  tolerated, and a test the baseline passed must not be skipped or missing.
+  On Windows run `just win libuv-test` with the same variant (commit first:
+  `just win` pushes HEAD).
+- **`just libuv-imports <variant>`** (Windows, after `just win libuv-test` with
+  `--build-only`): reads libuv's static lib with `dumpbin`. The legacy and
+  forced libs must import none of the post-XP functions the patches look up
+  at runtime (`LIBUV_LEGACY_IMPORTS`); stock must still import the native
+  ones.
+- **Legacy presets:** `windows-legacy-debug` (`legacy_fallbacks=True`) and
+  `windows-forced-legacy-debug` (also `force_legacy=True`) compose a partial
+  profile after `windows-static`, so the pin flips for libuv only.
 - **`linux-musl-release` is isolated from every other Linux preset**: a
   complete host profile (`daemon/profiles/linux-musl`, not composed after
   `default`) pointed at the Bootlin musl toolchain, and its own Conan home
