@@ -9,9 +9,16 @@ Subcommands:
     conan-profiles       create the detected Conan base profiles (default, clang)
     musl-toolchain [--print] [--print-key] [ARCH]   fetch/verify the pinned
                          Bootlin musl toolchain for ARCH (default x86_64)
-    libuv-patches [import|export] [--force]   rebuild a scratch git tree of libuv
-                         from daemon/recipes/libuv (import) or write its commits
-                         back as the recipe's patch series (export)
+    libuv-patches [import|export|check] [--force]   rebuild a scratch git tree of
+                         libuv from daemon/recipes/libuv (import), write its commits
+                         back as the recipe's patch series (export), or prove the
+                         recipe's series, freshly applied, equals upstream with the
+                         TAZ macros off (check)
+    libuv-test VARIANT [--build-only] [--baseline results.json] [--jobs N]
+                         build the recipe's libuv series (stock|legacy|forced) and
+                         run uv_run_tests_a test by test; logs go to out/libuv-test/
+    libuv-imports VARIANT   dumpbin the built libuv.lib (Windows) and fail on post-XP
+                         imports (legacy/forced) or a missing modern import (stock)
     deps PRESET          conan install (preset's profiles, daemon/conan.lock)
     lock-deps PRESET     re-resolve daemon/conan.lock to the newest Conan revisions
     configure PRESET     deps + cmake --preset
@@ -46,7 +53,9 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import ast
 import codecs
+import contextlib
 import ctypes
 import hashlib
 import io
@@ -71,6 +80,7 @@ from ctypes import wintypes
 from pathlib import Path, PurePath, PureWindowsPath
 from typing import NamedTuple, TextIO
 
+import psutil
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -706,6 +716,7 @@ def cmd_conan_cache_trim(preset: str) -> None:
 # as ordinary commits. `import` rebuilds it from the recipe, `export` writes it
 # back; the recipe directory stays the only source of truth.
 LIBUV_PATCH_TREE = ROOT / "out" / "libuv-patches"
+LIBUV_CHECK_TREE = ROOT / "out" / "libuv-check"
 LIBUV_PRISTINE_TAG = "pristine"
 LIBUV_PATCH_TYPE = "portability"
 # Inside the scratch tree's .git: the digest of the series it was imported
@@ -1095,14 +1106,697 @@ def _libuv_export(recipe: LibuvRecipe, tree: Path, *, force: bool) -> None:
         print(f"removed {', '.join(removed)}")
 
 
+# The only macros a patch may test, and only in the forms below, so that the
+# series can be proven byte-identical to upstream with both undefined.
+_TAZ_MACRO = r"TAZ_(?:LEGACY_FALLBACKS|FORCE_LEGACY)"
+_TAZ_MACRO_RE = re.compile(rf"\b{_TAZ_MACRO}\b")
+# One trailing comment; a /* */ one may not contain "*/", so nothing can hide
+# between two comments (`/* a */ || 1 /* b */`).
+_TAZ_COMMENT = r"\s*(?:/\*(?:(?!\*/).)*\*/|//.*)?\s*"
+_TAZ_GUARD_RE = re.compile(
+    rf"\s*#\s*(?:if\s+({_TAZ_MACRO})|ifdef\s+({_TAZ_MACRO})"
+    rf"|if\s+defined\s*\(\s*({_TAZ_MACRO})\s*\)){_TAZ_COMMENT}"
+)
+_CPP_DIRECTIVE_RE = re.compile(r"\s*#\s*(ifdef|ifndef|if|elif|else|endif)\b")
+_TAZ_LEGACY = "TAZ_LEGACY_FALLBACKS"
+
+
+class _GuardFrame(NamedTuple):
+    macro: str | None  # the TAZ macro this frame tests, None for any other #if
+    line: int
+    in_true: list[bool]  # one cell: still in the (dropped) true branch?
+    has_else: list[bool]
+
+
+def _scan_c_line(line: str, state: str) -> str:
+    """The lexical state after `line`, given the state before it: "code",
+    "block" (inside a /* */ comment) or "line" (a // comment that a trailing
+    backslash continues). String and character literals are skipped."""
+    if state == "line":
+        return "line" if line.endswith("\\") else "code"
+    i, n = 0, len(line)
+    while i < n:
+        if state == "block":
+            end = line.find("*/", i)
+            if end < 0:
+                return "block"
+            state, i = "code", end + 2
+        elif line[i] in "\"'":
+            quote, i = line[i], i + 1
+            while i < n and line[i] != quote:
+                i += 2 if line[i] == "\\" else 1
+            i += 1
+        elif line.startswith("//", i):
+            return "line" if line.endswith("\\") else "code"
+        elif line.startswith("/*", i):
+            state, i = "block", i + 2
+        else:
+            i += 1
+    return state
+
+
+def _resolve_taz_guards(text: str) -> tuple[str, int]:
+    out: list[str] = []
+    stack: list[_GuardFrame] = []
+    regions = 0
+    lexical = "code"  # where the previous line left off (see _scan_c_line)
+    continued = False  # the previous line ended in a backslash
+    for number, line in enumerate(re.findall(r"[^\n]*\n|[^\n]+", text), start=1):
+        body = line.rstrip("\r\n")
+        # The compiler sees a directive only on a line that starts in code:
+        # not inside a comment, and not a backslash continuation it joins.
+        starts = lexical == "code" and not continued
+        guard = _TAZ_GUARD_RE.fullmatch(body) if starts else None
+        directive = _CPP_DIRECTIVE_RE.match(body) if starts else None
+        kind = directive.group(1) if directive else ""
+        lexical = _scan_c_line(body, lexical)
+        continued = body.endswith("\\")
+        if guard:
+            macro = next(g for g in guard.groups() if g)
+            dropped = any(f.macro and f.in_true[0] for f in stack)
+            if macro == _TAZ_LEGACY and any(f.macro for f in stack):
+                raise ValueError(f"line {number}: {macro} guard nested in a TAZ guard")
+            if macro != _TAZ_LEGACY and not any(
+                f.macro == _TAZ_LEGACY and f.in_true[0] for f in stack
+            ):
+                raise ValueError(
+                    f"line {number}: {macro} must be nested inside the true branch "
+                    f"of a {_TAZ_LEGACY} guard"
+                )
+            if not dropped:
+                regions += 1
+            stack.append(_GuardFrame(macro, number, [True], [False]))
+            continue
+        if kind in ("if", "ifdef", "ifndef"):
+            if _TAZ_MACRO_RE.search(body):
+                raise ValueError(
+                    f"line {number}: unsupported TAZ guard: {body.strip()}"
+                )
+            stack.append(_GuardFrame(None, number, [False], [False]))
+        elif kind in ("elif", "else", "endif"):
+            if not stack:
+                raise ValueError(f"line {number}: #{kind} without #if")
+            top = stack[-1]
+            if kind == "elif" and (top.macro or _TAZ_MACRO_RE.search(body)):
+                raise ValueError(f"line {number}: #elif of or testing a TAZ macro")
+            if kind == "else":
+                if top.has_else[0]:
+                    raise ValueError(f"line {number}: second #else")
+                top.has_else[0] = True
+                if top.macro:
+                    top.in_true[0] = False
+                    continue
+            elif kind == "endif":
+                stack.pop()
+                if top.macro:
+                    continue
+        elif _TAZ_MACRO_RE.search(body):
+            raise ValueError(
+                f"line {number}: TAZ macro outside a guard: {body.strip()}"
+            )
+        if not any(f.macro and f.in_true[0] for f in stack):
+            out.append(line)
+    if stack:
+        raise ValueError(f"line {stack[-1].line}: unterminated #if")
+    return "".join(out), regions
+
+
+def resolve_taz_guards(text: str) -> str:
+    """`text` with TAZ_LEGACY_FALLBACKS and TAZ_FORCE_LEGACY undefined.
+
+    Only whole `#if X`, `#ifdef X` and `#if defined(X)` guards (optional
+    `#else`) are understood; any other use of the macros raises ValueError
+    naming the line.
+    """
+    return _resolve_taz_guards(text)[0]
+
+
+def _libuv_show(tree: Path, rev: str, path: str) -> str:
+    """A file at `rev` as latin-1 text (lossless for any bytes, no newline mangling)."""
+    result = subprocess.run(
+        ["git", "-c", "core.autocrlf=false", "show", f"{rev}:{path}"],
+        cwd=tree,
+        env=libuv_git_env(),
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.exit(f"error: git show {rev}:{path} failed: {result.stderr.decode()}")
+    return result.stdout.decode("latin-1")
+
+
+def _libuv_check(tree: Path, patches: int) -> None:
+    """Fail unless the series in `tree` equals upstream with the TAZ macros
+    undefined."""
+    if not (tree / ".git").exists():
+        sys.exit(
+            f"error: {tree} does not exist. Run `just libuv-patches` (import) first."
+        )
+    if _libuv_am_in_progress(tree):
+        sys.exit(
+            f"error: a `git am` is in progress in {tree}. Finish it "
+            "(`git am --continue` or `--skip`) before checking."
+        )
+    if _libuv_git(tree, "status", "--porcelain"):
+        sys.exit(f"error: {tree} has uncommitted changes. Commit them before checking.")
+    entries = _libuv_git(
+        tree, "diff", "--name-status", "-z", "--no-renames", LIBUV_PRISTINE_TAG, "HEAD"
+    ).split("\0")[:-1]
+    changed = list(zip(entries[::2], entries[1::2], strict=True))
+    bad = [path for status, path in changed if status != "M"]
+    if bad:
+        sys.exit(
+            "error: the series adds, deletes or renames files "
+            f"({', '.join(bad)}); a new file cannot be guarded, so only "
+            "modifications are allowed."
+        )
+    regions = 0
+    for _, path in changed:
+        try:
+            resolved, found = _resolve_taz_guards(_libuv_show(tree, "HEAD", path))
+        except ValueError as error:
+            sys.exit(f"error: {path}: {error}")
+        regions += found
+        want = _libuv_show(tree, LIBUV_PRISTINE_TAG, path)
+        if resolved != want:
+            got_lines, want_lines = resolved.split("\n"), want.split("\n")
+            first = next(
+                (
+                    i
+                    for i, (a, b) in enumerate(zip(got_lines, want_lines, strict=False))
+                    if a != b
+                ),
+                min(len(got_lines), len(want_lines)),
+            )
+            sys.exit(
+                f"error: {path}: with TAZ_LEGACY_FALLBACKS and TAZ_FORCE_LEGACY "
+                f"undefined it differs from upstream at line {first + 1}; upstream "
+                "lines must move into an #else branch, not be edited in place."
+            )
+    print(
+        f"neutral: {patches} patches, {len(changed)} files resolve to upstream "
+        f"byte for byte ({regions} guard regions)"
+    )
+
+
 def cmd_libuv_patches(mode: str, *, force: bool) -> None:
     """Develop the libuv patch series in a scratch git tree (see AGENTS.md)."""
     recipe = read_libuv_recipe()
     tree = LIBUV_PATCH_TREE / f"libuv-{recipe.upstream}"
     if mode == "export":
         _libuv_export(recipe, tree, force=force)
+    elif mode == "check":
+        # The recipe's series applied afresh, never whatever the scratch tree
+        # holds (a reset, stale or not yet exported tree would prove nothing).
+        check_tree = LIBUV_CHECK_TREE / f"libuv-{recipe.upstream}"
+        _libuv_import(recipe, check_tree, force=True)
+        _libuv_check(check_tree, len(recipe.patches))
     else:
         _libuv_import(recipe, tree, force=force)
+
+
+# ---------------------------------------------------------------------------
+# libuv's own test suite (just libuv-test)
+# ---------------------------------------------------------------------------
+# Build the recipe's series the way the recipe does (fresh unpack + apply, the
+# recipe's own preprocessor definitions) and run libuv's uv_run_tests_a. Not a
+# Conan test(): the Windows variants need the VM and a log-file-only output
+# policy.
+LIBUV_TEST_TREE = ROOT / "out" / "libuv-test"
+LIBUV_TEST_VARIANT_NAMES = ("stock", "legacy", "forced")
+# Tests allowed to fail per (platform.system(), variant), each with a one-line
+# reason, and only after a rerun confirmed the failure. A "*" variant applies
+# to every variant of that platform.
+LIBUV_TEST_ACCEPTED: dict[tuple[str, str], frozenset[str]] = {
+    # The patches touch only src/win, so on Linux every variant is upstream.
+    ("Linux", "*"): frozenset(
+        {
+            # hosts without multicast loopback never deliver (timeout, alone)
+            "udp_multicast_join",
+            "udp_multicast_join6",
+        }
+    ),
+    # The forced build NULLs every pointer that has a fallback, so these run the
+    # degraded path on purpose; the legacy variant never gets such a list.
+    ("Windows", "forced"): frozenset(
+        {
+            # ReOpenFile is absent: uv_fs_fchmod returns ENOSYS
+            "fs_chmod",
+            "fs_fchmod_archive_readonly",
+            # CreateSymbolicLinkW is absent: uv_fs_symlink returns ENOTSUP
+            # (on which fs_symlink_dir skips)
+            "fs_file_loop",
+            "fs_fstat_st_dev",
+            "fs_lutime",
+            "fs_readdir_symlink",
+            "fs_symlink_dir",
+            # GetFinalPathNameByHandleW is absent: uv_fs_realpath returns ENOSYS
+            "fs_realpath",
+            "fs_symlink_junction",
+            # ConvertInterfaceIndexToLuid is absent: uv_if_indextoname is ENOSYS
+            "ip6_addr_link_local",
+            # CancelSynchronousIo is absent: the blocking read of an anonymous
+            # pipe cannot be interrupted, so closing the pipe waits for its
+            # writer, which the test closes only afterwards (it times out)
+            "pipe_getsockname_blocking",
+            # GetCurrentProcessorNumber is absent: uv_thread_getcpu is ENOTSUP
+            "thread_affinity",
+        }
+    ),
+}
+_TAP_RE = re.compile(r"^(ok|not ok) \d+ - (\S+)(.*)$", re.MULTILINE)
+# A single test's own budget comes from libuv; this only stops a hung runner.
+LIBUV_TEST_RUN_TIMEOUT = 600
+# uv_run_tests_a's exit status for a skipped test (TEST_SKIP in test/task.h).
+LIBUV_TEST_SKIP_STATUS = 7
+
+
+def libuv_recipe_defines() -> dict[str, dict[str, str]]:
+    """The recipe's TAZ_DEFINES literal: the preprocessor definitions each
+    option adds to libuv's own build."""
+    recipe = LIBUV_RECIPE_DIR / "conanfile.py"
+    for node in ast.parse(recipe.read_text()).body:
+        if isinstance(node, ast.AnnAssign):
+            targets: list[ast.expr] = [node.target]
+        elif isinstance(node, ast.Assign):
+            targets = node.targets
+        else:
+            continue
+        named = any(isinstance(t, ast.Name) and t.id == "TAZ_DEFINES" for t in targets)
+        if not named or node.value is None:
+            continue
+        defines = ast.literal_eval(node.value)
+        if isinstance(defines, dict) and all(
+            isinstance(option, str)
+            and isinstance(values, dict)
+            and all(isinstance(v, str) for v in [*values, *values.values()])
+            for option, values in defines.items()
+        ):
+            return defines
+        break
+    sys.exit(f"error: {recipe} has no TAZ_DEFINES dict of str -> dict[str, str]")
+
+
+def libuv_test_variants() -> dict[str, dict[str, str]]:
+    """Each libuv-test variant's preprocessor definitions, from the recipe:
+    stock has none, legacy is legacy_fallbacks, forced adds force_legacy."""
+    defines = libuv_recipe_defines()
+    legacy = dict(defines["legacy_fallbacks"])
+    return {
+        "stock": {},
+        "legacy": legacy,
+        "forced": {**legacy, **defines["force_legacy"]},
+    }
+
+
+def parse_libuv_tap(text: str) -> dict[str, str]:
+    """TAP lines of uv_run_tests_a as {test name: "pass" | "fail" | "skip"}."""
+    results: dict[str, str] = {}
+    for status, name, rest in _TAP_RE.findall(text):
+        if status == "not ok":
+            results[name] = "fail"
+        else:
+            results[name] = "skip" if re.search(r"#\s*SKIP", rest, re.I) else "pass"
+    return results
+
+
+def libuv_test_result(name: str, status: int, output: str) -> str:
+    """One `uv_run_tests_a NAME` run as "pass", "skip" or "fail". Its TAP line
+    and its exit status must agree; anything else (a crash, a timeout, no
+    TAP line) is a failure."""
+    tap = parse_libuv_tap(output).get(name)
+    if tap == "pass" and status == 0:
+        return "pass"
+    if tap == "skip" and status == LIBUV_TEST_SKIP_STATUS:
+        return "skip"
+    return "fail"
+
+
+def libuv_test_verdict(
+    results: dict[str, str],
+    accepted: frozenset[str],
+    baseline: dict[str, str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """(failures, regressions) for one run; tests in `accepted` are exempt.
+
+    A failure is a test that failed twice; one that failed once and passed
+    on its rerun ("flaky") unless the baseline was flaky on it too; and one
+    that the baseline passed but this run skipped or lacks. Regressions are
+    the failures that passed in the baseline.
+    """
+    base = baseline or {}
+    failures: list[str] = []
+    for name in sorted(set(results) | set(base)):
+        result = results.get(name, "missing")
+        if name in accepted:
+            continue
+        if (
+            result == "fail"
+            or (result == "flaky" and base.get(name) != "flaky")
+            or (result in ("skip", "missing") and base.get(name) == "pass")
+        ):
+            failures.append(name)
+    regressions = [n for n in failures if base.get(n) == "pass"]
+    return failures, regressions
+
+
+def _libuv_test_log(log: Path, cmd: Sequence[str | Path], cwd: Path) -> int:
+    """Run `cmd` appending its stdout+stderr to `log`; return the exit status."""
+    with log.open("ab") as handle:
+        handle.write(f"$ {' '.join(str(c) for c in cmd)}\n".encode())
+        handle.flush()
+        return subprocess.run(
+            [str(c) for c in cmd],
+            cwd=cwd,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            check=False,
+        ).returncode
+
+
+def _libuv_test_capture(
+    log: Path, cmd: Sequence[str | Path], cwd: Path
+) -> tuple[int, str]:
+    """Run `cmd`, append its stdout+stderr to `log`, return (status, output).
+    A run past LIBUV_TEST_RUN_TIMEOUT has status -1.
+
+    The output goes to a file, not a pipe: the runner's test processes inherit
+    their handles, so one that outlives the runner would hold a pipe open and
+    the read would never end.
+    """
+    words = [str(c) for c in cmd]
+    fd, name = tempfile.mkstemp(dir=log.parent, prefix="capture.", suffix=".out")
+    capture = Path(name)
+    with os.fdopen(fd, "wb") as handle:
+        try:
+            status = subprocess.run(
+                words,
+                cwd=cwd,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=LIBUV_TEST_RUN_TIMEOUT,
+            ).returncode
+        except subprocess.TimeoutExpired:
+            status = -1
+    output = capture.read_bytes().decode(errors="replace")
+    if status == -1:
+        output += "\n# timed out\n"
+    with contextlib.suppress(OSError):  # a leaked test process may still hold it
+        capture.unlink()
+    with log.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(f"$ {' '.join(words)}\n{output}")
+    return status, output
+
+
+def _libuv_test_reap(runner: Path) -> list[int]:
+    """Kill whatever still runs `runner` and return the pids. A test's helpers
+    are the runner binary itself, and one left behind would keep its port and
+    its files in the tree for the next test."""
+    target = os.path.normcase(str(runner.resolve()))
+    leftovers = [
+        proc
+        for proc in psutil.process_iter(["exe"])
+        if proc.pid != os.getpid()
+        and proc.info["exe"]
+        and os.path.normcase(proc.info["exe"]) == target
+    ]
+    for proc in leftovers:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            proc.kill()
+    psutil.wait_procs(leftovers, timeout=10)
+    return [proc.pid for proc in leftovers]
+
+
+def _libuv_test_dirty(src: Path) -> str:
+    return _libuv_git(
+        src, "status", "--porcelain", "--ignored", "--untracked-files=all"
+    )
+
+
+def _libuv_test_make_writable(src: Path) -> None:
+    """Let the owner delete everything under `src` (write on files, rwx on
+    directories), skipping links, whose targets may lie outside it."""
+    pending = [p for p in src.iterdir() if p.name != ".git"]
+    while pending:
+        path = pending.pop()
+        if path.is_symlink() or path.is_junction():
+            continue
+        is_dir = path.is_dir()
+        try:
+            path.chmod(path.stat().st_mode | (0o700 if is_dir else 0o200))
+        except OSError:
+            continue
+        if is_dir:
+            pending.extend(path.iterdir())
+
+
+def _libuv_test_clean(src: Path) -> None:
+    """Return `src` to the applied series before each test. A test that dies
+    half way leaves read-only files, links and directories behind, and the
+    next test that opens the same fixture name then fails with EPERM. `git
+    clean` removes links without following them."""
+    if not (src / ".git").is_dir():
+        # Without its own .git, git would act on the enclosing TAZ checkout.
+        sys.exit(f"error: {src} is not the unpacked libuv tree")
+    _libuv_git(src, "clean", "-ffdxq", check=False)  # also empty directories
+    if not _libuv_test_dirty(src):
+        return
+    _libuv_git(src, "reset", "-q", "--hard", check=False)
+    _libuv_git(src, "clean", "-ffdxq", check=False)
+    if _libuv_test_dirty(src):
+        _libuv_test_make_writable(src)
+        _libuv_git(src, "clean", "-ffdxq", check=False)
+        _libuv_git(src, "reset", "-q", "--hard", check=False)
+    if left := _libuv_test_dirty(src):
+        sys.exit(f"error: cannot clean {src} between tests:\n{left}")
+
+
+def _libuv_test_phase(
+    variant_dir: Path, name: str, cmd: Sequence[str | Path], cwd: Path
+) -> None:
+    log = variant_dir / f"{name}.log"
+    print(f"libuv-test: {name} ...", flush=True)
+    if _libuv_test_log(log, cmd, cwd) != 0:
+        sys.exit(f"error: libuv-test {name} failed; see {log}")
+
+
+def _libuv_test_names(runner: Path, src: Path, log: Path) -> list[str]:
+    """The suite's test names, from `uv_run_tests_a --list` (one per line,
+    optionally followed by its helpers in parentheses)."""
+    status, output = _libuv_test_capture(log, [runner, "--list"], src)
+    names = [line.split()[0] for line in output.splitlines() if line.strip()]
+    if status != 0 or not names:
+        sys.exit(f"error: `uv_run_tests_a --list` failed or listed nothing; see {log}")
+    return names
+
+
+def _libuv_test_one(runner: Path, name: str, src: Path, log: Path) -> str:
+    _libuv_test_clean(src)
+    status, output = _libuv_test_capture(log, [runner, name], src)
+    if leaked := _libuv_test_reap(runner):
+        with log.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(f"# killed what {name} left running: {leaked}\n")
+    return libuv_test_result(name, status, output)
+
+
+def cmd_libuv_test(
+    variant: str, *, build_only: bool, baseline: Path | None, jobs: int | None
+) -> None:
+    """Build libuv with the variant's definitions and run its own test suite,
+    one test at a time from a clean tree."""
+    recipe = read_libuv_recipe()
+    base: dict[str, str] | None = None
+    if baseline is not None:
+        if not baseline.is_file():
+            sys.exit(
+                f"error: baseline {baseline} not found; run the stock variant first"
+            )
+        base = json.loads(baseline.read_text())
+    variant_dir = LIBUV_TEST_TREE / variant
+    src, build = variant_dir / "src", variant_dir / "build"
+    runner = build / ("uv_run_tests_a.exe" if IS_WINDOWS else "uv_run_tests_a")
+    _libuv_test_reap(runner)  # left by an interrupted run, holding build and src
+    shutil.rmtree(build, ignore_errors=True)
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    for log in variant_dir.glob("*.log"):
+        log.unlink()
+    (variant_dir / "results.json").unlink(missing_ok=True)
+    print(f"libuv-test: unpack and apply the series ({len(recipe.patches)} patches)")
+    _libuv_import(recipe, src, force=True)
+    ensure_msvc_env()
+    defines = libuv_test_variants()[variant]
+    flags = " ".join(f"-D{k}={v}" for k, v in defines.items())
+    # BUILD_TESTING is what libuv's CMake needs for LIBUV_BUILD_TESTS (which
+    # also wants the default shared lib); uv_run_tests_a links the static uv_a.
+    configure = [
+        tool("cmake"), "-S", "src", "-B", "build", "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=Debug", "-DBUILD_TESTING=ON", "-DLIBUV_BUILD_TESTS=ON",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+    ]  # fmt: skip
+    if flags:
+        # _INIT keeps the platform defaults (/W3 /DWIN32 ...) that a plain
+        # CMAKE_C_FLAGS would replace.
+        configure.append(f"-DCMAKE_C_FLAGS_INIT={flags}")
+    _libuv_test_phase(variant_dir, "configure", configure, variant_dir)
+    build_cmd = [tool("cmake"), "--build", "build"]
+    if jobs:
+        build_cmd += ["--parallel", str(jobs)]
+    _libuv_test_phase(variant_dir, "build", build_cmd, variant_dir)
+    if build_only:
+        print(f"libuv-test {variant}: built; logs: {variant_dir}")
+        return
+    run_log = variant_dir / "run.log"
+    # One process per test, each from a clean tree, so a test that dies
+    # cannot leave fixtures that fail the ones after it. libuv's add_test runs
+    # the suite from the source directory (fixtures, relative paths).
+    names = _libuv_test_names(runner, src, run_log)
+    print(f"libuv-test: run {len(names)} tests one by one ...", flush=True)
+    results: dict[str, str] = {}
+    for name in names:
+        result = _libuv_test_one(runner, name, src, run_log)
+        if result == "fail" and _libuv_test_one(runner, name, src, run_log) != "fail":
+            result = "flaky"
+        results[name] = result
+    _libuv_test_clean(src)
+    (variant_dir / "results.json").write_text(
+        json.dumps(results, indent=2, sort_keys=True) + "\n", newline="\n"
+    )
+    system = platform.system()
+    accepted = LIBUV_TEST_ACCEPTED.get(
+        (system, variant), frozenset()
+    ) | LIBUV_TEST_ACCEPTED.get((system, "*"), frozenset())
+    failures, regressions = libuv_test_verdict(results, accepted, base)
+    count = {r: sum(v == r for v in results.values()) for r in ("pass", "skip", "fail")}
+    flaky = sorted(n for n, r in results.items() if r == "flaky")
+    hit = sum(r in ("fail", "flaky") and n in accepted for n, r in results.items())
+    note = ", ".join(regressions) if regressions else "none"
+    print(
+        f"libuv-test {variant}: {count['pass']} passed, {count['fail']} failed, "
+        f"{len(flaky)} flaky, {count['skip']} skipped ({hit} accepted); "
+        f"regressions vs baseline: {note}; logs: {variant_dir}"
+    )
+    if flaky:
+        print(f"flaky (failed once, passed on rerun): {', '.join(flaky)}")
+    if passing := sorted(n for n in accepted if results.get(n) == "pass"):
+        print(f"accepted but passed: {', '.join(passing)}")
+    if failures:
+        sys.exit(f"error: failing tests: {', '.join(failures)}")
+
+
+# ---------------------------------------------------------------------------
+# libuv static lib: post-XP imports (just libuv-imports, Windows only)
+# ---------------------------------------------------------------------------
+# Every post-XP function the patches look up at runtime instead of importing,
+# plus the K32 names that PSAPI_VERSION=1 maps to psapi.dll's XP-era exports.
+LIBUV_LEGACY_IMPORTS: frozenset[str] = frozenset(
+    {
+        "GetTickCount64",
+        "GetSystemTimePreciseAsFileTime",
+        "GetCurrentProcessorNumber",
+        "SystemFunction036",
+        "RegGetValueW",
+        "CompareStringOrdinal",
+        "ConvertInterfaceIndexToLuid",
+        "ConvertInterfaceLuidToNameW",
+        "GetFinalPathNameByHandleW",
+        "ReOpenFile",
+        "CreateSymbolicLinkW",
+        "GetFileInformationByHandleEx",
+        "SetFileInformationByHandle",
+        "SHGetKnownFolderPath",
+        "GetNamedPipeClientProcessId",
+        "GetNamedPipeServerProcessId",
+        "CancelSynchronousIo",
+        "NeedCurrentDirectoryForExePathW",
+        "GetQueuedCompletionStatusEx",
+        "CancelIoEx",
+        "SetFileCompletionNotificationModes",
+        "InitializeSRWLock",
+        "AcquireSRWLockShared",
+        "TryAcquireSRWLockShared",
+        "ReleaseSRWLockShared",
+        "AcquireSRWLockExclusive",
+        "TryAcquireSRWLockExclusive",
+        "ReleaseSRWLockExclusive",
+        "InitializeConditionVariable",
+        "WakeConditionVariable",
+        "WakeAllConditionVariable",
+        "SleepConditionVariableCS",
+        "InitOnceExecuteOnce",
+        "K32GetProcessMemoryInfo",
+        "K32GetModuleBaseNameW",
+    }
+)
+# What the stock lib must still import: proof that legacy_fallbacks=False is
+# upstream libuv, which imports the native primitives directly.
+LIBUV_STOCK_MUST_IMPORT: frozenset[str] = frozenset(
+    {"AcquireSRWLockExclusive", "GetQueuedCompletionStatusEx", "GetTickCount64"}
+)
+# Imports every libuv build has; their absence means the dump is not of a
+# libuv static lib (or its format changed), so nothing else can be judged.
+LIBUV_ALWAYS_IMPORTED: frozenset[str] = frozenset({"CloseHandle", "CreateFileW"})
+# `dumpbin /symbols` rows for undefined externals: "... UNDEF ... | name".
+_UNDEF_RE = re.compile(r"^\s*\S+\s+[0-9A-Fa-f]{8}\s+UNDEF\s.*\|\s*(.+?)\s*$", re.M)
+
+
+def libuv_lib_undefined(text: str) -> set[str]:
+    """Bare names of the undefined externals in `dumpbin /symbols` output.
+
+    `__imp_` (the import-table slot), a leading `_` and an x86 `@N` suffix are
+    stripped, so `__imp__Foo@8`, `__imp_Foo` and `Foo` all come out as `Foo`.
+    """
+    names: set[str] = set()
+    for raw in _UNDEF_RE.findall(text):
+        name = raw.removeprefix("__imp_").removeprefix("_")
+        names.add(re.sub(r"@\d+$", "", name))
+    return names
+
+
+def judge_libuv_imports(variant: str, undefined: set[str]) -> list[str]:
+    """Errors for one variant's undefined names; empty when the lib passes.
+
+    stock must still import the modern-lane functions; legacy and forced must
+    reference none of the post-XP inventory directly.
+    """
+    if missing := sorted(LIBUV_ALWAYS_IMPORTED - undefined):
+        return [f"no import of {', '.join(missing)}: not a libuv static lib's dump"]
+    if variant == "stock":
+        return [
+            f"stock lib does not import {name}"
+            for name in sorted(LIBUV_STOCK_MUST_IMPORT - undefined)
+        ]
+    return [
+        f"{variant} lib still imports {name}"
+        for name in sorted(undefined & LIBUV_LEGACY_IMPORTS)
+    ]
+
+
+def cmd_libuv_imports(variant: str) -> None:
+    """Check the variant's libuv static lib with `dumpbin /symbols`."""
+    if not IS_WINDOWS:
+        sys.exit("error: libuv-imports runs on Windows (just win libuv-imports ...)")
+    lib = LIBUV_TEST_TREE / variant / "build" / "libuv.lib"
+    if not lib.is_file():
+        sys.exit(
+            f"error: {lib} not found; run "
+            f"`just libuv-test {variant} --build-only` first"
+        )
+    ensure_msvc_env()  # dumpbin ships with MSVC
+    dump = subprocess.run(
+        [tool("dumpbin"), "/symbols", str(lib)],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=True,
+    ).stdout
+    undefined = libuv_lib_undefined(dump)
+    seen = sorted(undefined & LIBUV_LEGACY_IMPORTS)
+    print(f"libuv-imports {variant}: inventory imports present: {seen or 'none'}")
+    errors = judge_libuv_imports(variant, undefined)
+    if errors:
+        sys.exit("error: " + "; ".join(errors))
+    print(f"libuv-imports {variant}: pass ({lib})")
 
 
 def cmd_passthrough(program: str, args: Sequence[str]) -> None:
@@ -2435,8 +3129,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         "arch", nargs="?", default=DEFAULT_MUSL_ARCH, choices=sorted(MUSL_TOOLCHAINS)
     )
     p = sub.add_parser("libuv-patches")
-    p.add_argument("mode", nargs="?", default="import", choices=["import", "export"])
+    p.add_argument(
+        "mode", nargs="?", default="import", choices=["import", "export", "check"]
+    )
     p.add_argument("--force", action="store_true")
+    p = sub.add_parser("libuv-test")
+    p.add_argument("variant", choices=LIBUV_TEST_VARIANT_NAMES)
+    p.add_argument("--build-only", action="store_true")
+    p.add_argument("--baseline", type=Path)
+    p.add_argument("--jobs", type=int)
+    p = sub.add_parser("libuv-imports")
+    p.add_argument("variant", choices=LIBUV_TEST_VARIANT_NAMES)
     p = sub.add_parser("deps")
     p.add_argument("preset")
     p = sub.add_parser("lock-deps")
@@ -2506,6 +3209,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         case "libuv-patches":
             cmd_libuv_patches(args.mode, force=args.force)
+        case "libuv-test":
+            cmd_libuv_test(
+                args.variant,
+                build_only=args.build_only,
+                baseline=args.baseline,
+                jobs=args.jobs,
+            )
+        case "libuv-imports":
+            cmd_libuv_imports(args.variant)
         case "deps":
             cmd_deps(args.preset)
         case "lock-deps":

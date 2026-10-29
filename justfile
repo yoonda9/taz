@@ -52,9 +52,23 @@ musl-toolchain arch="x86_64":
     {{ dev }} musl-toolchain {{ arch }}
 
 # Develop the libuv patch series: `import` (default) rebuilds the scratch git tree in
-# out/libuv-patches/ from the recipe; `export` writes its commits back to the recipe
+# out/libuv-patches/ from the recipe; `export` writes its commits back to the recipe;
+# `check` proves the series is neutral with the TAZ macros undefined
 libuv-patches mode="import" *flags:
     {{ dev }} libuv-patches {{ mode }} {{ flags }}
+
+# Build the recipe's libuv series (variant: stock|legacy|forced) and run its own
+# suite one test at a time; compiler and runner output goes to
+# out/libuv-test/<variant>/*.log, stdout gets a summary.
+# Flags: --build-only, --baseline PATH, --jobs N
+libuv-test variant="stock" *flags:
+    {{ dev }} libuv-test {{ variant }} {{ flags }}
+
+# Check a built libuv static lib (variant: stock|legacy|forced) for post-XP imports.
+# Windows only, after `just win libuv-test <variant> --build-only`:
+# `just win libuv-imports legacy`
+libuv-imports variant="stock":
+    {{ dev }} libuv-imports {{ variant }}
 
 # Install the preset's Conan dependencies (the first half of `configure`)
 deps preset=preset:

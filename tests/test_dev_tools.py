@@ -1485,6 +1485,7 @@ class LibuvLab:
         monkeypatch.setattr(dev, "cache_root", lambda: self.cache)
         monkeypatch.setattr(dev, "LIBUV_RECIPE_DIR", self.recipe)
         monkeypatch.setattr(dev, "LIBUV_PATCH_TREE", self.tree_root)
+        monkeypatch.setattr(dev, "LIBUV_CHECK_TREE", tmp_path / "out" / "libuv-check")
         monkeypatch.setattr(dev.urllib.request, "urlopen", _no_network)
 
     def seed_cache(self) -> None:
@@ -1800,3 +1801,817 @@ def test_libuv_conandata_quotes_descriptions_yaml_would_retype() -> None:
     loaded = yaml.safe_load(text)["patches"]["1.51.0-taz.1"]
     assert [entry["patch_description"] for entry in loaded] == subjects
     assert "patch_description: No\n" not in text
+
+
+# --- libuv neutrality check: resolve_taz_guards + `libuv-patches check` ----------
+
+
+def test_resolve_taz_guards_drops_the_true_branch_and_keeps_the_else() -> None:
+    text = "a\n#if TAZ_LEGACY_FALLBACKS\nnew\n#else\nold\n#endif\nb\n"
+    assert dev.resolve_taz_guards(text) == "a\nold\nb\n"
+
+
+@pytest.mark.parametrize(
+    "opener",
+    [
+        "#if TAZ_LEGACY_FALLBACKS",
+        "#ifdef TAZ_LEGACY_FALLBACKS",
+        "#if defined(TAZ_LEGACY_FALLBACKS)",
+        "  #  if defined( TAZ_LEGACY_FALLBACKS )  /* why */",
+        "#ifdef TAZ_LEGACY_FALLBACKS // why",
+    ],
+)
+def test_resolve_taz_guards_accepts_every_guard_form(opener: str) -> None:
+    text = f"{opener}\nnew\n#endif /* TAZ_LEGACY_FALLBACKS */\nx\n"
+    assert dev.resolve_taz_guards(text) == "x\n"
+
+
+def test_resolve_taz_guards_counts_other_conditionals_for_nesting() -> None:
+    text = (
+        "#ifdef TAZ_LEGACY_FALLBACKS\n"
+        "#if FOO\n"
+        "#else\n"
+        "#endif\n"
+        "new\n"
+        "#else\n"
+        "#if BAR\n"
+        "old\n"
+        "#else\n"
+        "older\n"
+        "#endif\n"
+        "#endif\n"
+    )
+    assert dev.resolve_taz_guards(text) == "#if BAR\nold\n#else\nolder\n#endif\n"
+
+
+def test_resolve_taz_guards_nests_force_legacy_in_legacy_fallbacks() -> None:
+    text = (
+        "#if TAZ_LEGACY_FALLBACKS\n"
+        "fallback\n"
+        "#if TAZ_FORCE_LEGACY\n"
+        "forced\n"
+        "#endif\n"
+        "#else\n"
+        "upstream\n"
+        "#endif\n"
+    )
+    assert dev.resolve_taz_guards(text) == "upstream\n"
+
+
+def test_resolve_taz_guards_is_the_identity_without_the_macros() -> None:
+    text = "#if A\r\nx\r\n#elif B\r\ny\r\n#else\r\nz\r\n#endif\r\n\x0c\nno newline"
+    assert dev.resolve_taz_guards(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "#ifndef TAZ_LEGACY_FALLBACKS\nx\n#endif\n",
+        "#if !defined(TAZ_LEGACY_FALLBACKS)\nx\n#endif\n",
+        "#if TAZ_LEGACY_FALLBACKS\nx\n#elif FOO\ny\n#endif\n",
+        "#if TAZ_LEGACY_FALLBACKS && FOO\nx\n#endif\n",
+        "#define TAZ_LEGACY_FALLBACKS 1\n",
+        "int x; /* TAZ_FORCE_LEGACY */\n",
+        'const char *s = "TAZ_LEGACY_FALLBACKS";\n',
+        "#if TAZ_LEGACY_FALLBACKS\nx\n",
+        "#if TAZ_FORCE_LEGACY\nx\n#endif\n",
+        "#if TAZ_LEGACY_FALLBACKS\n#else\n#if TAZ_FORCE_LEGACY\n#endif\n#endif\n",
+        "#endif\n",
+        "#if TAZ_LEGACY_FALLBACKS\n#if TAZ_LEGACY_FALLBACKS\n#endif\n#endif\n",
+        # a second comment cannot hide a condition between the two
+        "#if TAZ_LEGACY_FALLBACKS /* a */ || 1 /* b */\nx\n#endif\n",
+        # a guard inside a block comment is no guard to the compiler
+        "/* c\n#if TAZ_LEGACY_FALLBACKS\n*/\nevil();\n/*\n#endif\n*/\n",
+        # nor is one on a line a backslash joins to a // comment
+        "// a \\\n#if TAZ_LEGACY_FALLBACKS\nevil();\n// b \\\n#endif\n",
+    ],
+)
+def test_resolve_taz_guards_rejects_everything_else(text: str) -> None:
+    with pytest.raises(ValueError, match=r"line \d+"):
+        dev.resolve_taz_guards(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/*\n#endif\n#if X\n*/\nx\n",
+        "// one \\\n#endif\nx\n",
+        "#define M(a) \\\n  a\n#if X\n#endif\n",
+    ],
+)
+def test_resolve_taz_guards_ignores_directives_the_compiler_does_not_see(
+    text: str,
+) -> None:
+    assert dev.resolve_taz_guards(text) == text
+
+
+def test_resolve_taz_guards_skips_comment_markers_in_literals() -> None:
+    text = (
+        'const char* s = "/*";\n'
+        "char c = '\"';\n"
+        "#if TAZ_LEGACY_FALLBACKS\n"
+        "new\n"
+        "#endif\n"
+        "end */\n"
+    )
+    assert (
+        dev.resolve_taz_guards(text)
+        == 'const char* s = "/*";\nchar c = \'"\';\nend */\n'
+    )
+
+
+def _commit_files(lab: LibuvLab, files: dict[str, str], subject: str = "s") -> None:
+    for name, content in files.items():
+        path = lab.tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, newline="\n")
+    lab.git("add", "--all")
+    lab.git("commit", "-q", "-m", subject)
+
+
+def _export_files(lab: LibuvLab, files: dict[str, str]) -> None:
+    """Commit `files` in the scratch tree and export them as the series."""
+    _commit_files(lab, files)
+    dev.cmd_libuv_patches("export", force=False)
+
+
+GUARDED_CORE = (
+    "#if TAZ_LEGACY_FALLBACKS\n"
+    "int main(void) { return 2; }\n"
+    "#else\n"
+    "int main(void) { return 0; }\n"
+    "#endif\n"
+)
+
+
+def test_libuv_patches_check_passes_on_an_empty_series(
+    libuv_lab: LibuvLab, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dev.cmd_libuv_patches("check", force=False)
+    out = capsys.readouterr().out
+    assert "0 patches, 0 files" in out
+    assert "0 guard regions" in out
+
+
+def test_libuv_patches_check_passes_a_guarded_region(
+    libuv_lab: LibuvLab, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    _export_files(libuv_lab, {"src/unix/core.c": GUARDED_CORE})
+    capsys.readouterr()
+    dev.cmd_libuv_patches("check", force=False)
+    out = capsys.readouterr().out
+    assert "1 patches, 1 files" in out
+    assert "1 guard regions" in out
+
+
+def test_libuv_patches_check_applies_the_recipe_series_not_the_scratch_tree(
+    libuv_lab: LibuvLab, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    _export_files(libuv_lab, {"src/unix/core.c": GUARDED_CORE})
+    # A reset scratch tree, then an unexported unguarded edit: neither counts.
+    libuv_lab.git("reset", "-q", "--hard", dev.LIBUV_PRISTINE_TAG)
+    libuv_lab.commit_change()
+    capsys.readouterr()
+    dev.cmd_libuv_patches("check", force=False)
+    assert "1 patches, 1 files" in capsys.readouterr().out
+
+
+def test_libuv_patches_check_names_the_edited_upstream_line(
+    libuv_lab: LibuvLab,
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    libuv_lab.commit_change()
+    dev.cmd_libuv_patches("export", force=False)
+    with pytest.raises(SystemExit, match=r"src/unix/core\.c.*line 1"):
+        dev.cmd_libuv_patches("check", force=False)
+
+
+def test_libuv_patches_check_rejects_a_new_file(libuv_lab: LibuvLab) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    _export_files(libuv_lab, {"src/win/new.c": "int x;\n"})
+    with pytest.raises(SystemExit, match=r"src/win/new\.c"):
+        dev.cmd_libuv_patches("check", force=False)
+
+
+def test_libuv_patches_check_reports_a_bad_guard_with_the_file(
+    libuv_lab: LibuvLab,
+) -> None:
+    dev.cmd_libuv_patches("import", force=False)
+    _export_files(libuv_lab, {"src/unix/core.c": "#ifndef TAZ_FORCE_LEGACY\n#endif\n"})
+    with pytest.raises(SystemExit, match=r"src/unix/core\.c: line 1"):
+        dev.cmd_libuv_patches("check", force=False)
+
+
+# ---------------------------------------------------------------------------
+# just libuv-test
+# ---------------------------------------------------------------------------
+TAP_SAMPLE = """\
+ok 1 - platform_output
+not ok 2 - tcp_open
+    # stderr noise
+ok 3 - udp_send # SKIP no network
+ok 4 - loop_alive
+"""
+
+
+def test_libuv_test_variants_come_from_the_recipe() -> None:
+    assert dev.libuv_test_variants() == {
+        "stock": {},
+        "legacy": {"TAZ_LEGACY_FALLBACKS": "1", "PSAPI_VERSION": "1"},
+        "forced": {
+            "TAZ_LEGACY_FALLBACKS": "1",
+            "PSAPI_VERSION": "1",
+            "TAZ_FORCE_LEGACY": "1",
+        },
+    }
+
+
+def test_libuv_test_variants_follow_an_edited_recipe(libuv_lab: LibuvLab) -> None:
+    conanfile = libuv_lab.recipe / "conanfile.py"
+    text = conanfile.read_text()
+    assert text.count('"PSAPI_VERSION": "1",') == 1
+    conanfile.write_text(text.replace('"PSAPI_VERSION": "1",', ""))
+    assert dev.libuv_test_variants()["legacy"] == {"TAZ_LEGACY_FALLBACKS": "1"}
+
+
+def test_libuv_test_variants_need_the_recipe_literal(libuv_lab: LibuvLab) -> None:
+    conanfile = libuv_lab.recipe / "conanfile.py"
+    conanfile.write_text(conanfile.read_text().replace("TAZ_DEFINES", "OTHER"))
+    with pytest.raises(SystemExit, match="TAZ_DEFINES"):
+        dev.libuv_test_variants()
+
+
+def test_parse_libuv_tap_reads_pass_fail_and_skip() -> None:
+    assert dev.parse_libuv_tap(TAP_SAMPLE) == {
+        "platform_output": "pass",
+        "tcp_open": "fail",
+        "udp_send": "skip",
+        "loop_alive": "pass",
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "output", "result"),
+    [
+        (0, "ok 1 - t\n", "pass"),
+        (7, "ok 1 - t # SKIP why\n", "skip"),
+        (1, "not ok 1 - t\n", "fail"),
+        # the exit status and the TAP line must agree
+        (0xC0000005, "ok 1 - t\n", "fail"),
+        (0, "ok 1 - t # SKIP why\n", "fail"),
+        (7, "ok 1 - t\n", "fail"),
+        # no TAP line for this test: a crash or a timeout
+        (0, "", "fail"),
+        (-1, "ok 1 - other\n# timed out\n", "fail"),
+    ],
+)
+def test_libuv_test_result_needs_tap_and_status_to_agree(
+    status: int, output: str, result: str
+) -> None:
+    assert dev.libuv_test_result("t", status, output) == result
+
+
+def test_libuv_test_verdict_accepts_listed_failures_only() -> None:
+    results = {"a": "fail", "b": "fail", "c": "pass"}
+    assert dev.libuv_test_verdict(results, frozenset({"a"})) == (["b"], [])
+    assert dev.libuv_test_verdict(results, frozenset({"a", "b"})) == ([], [])
+
+
+def test_libuv_test_verdict_fails_a_flake_the_baseline_did_not_have() -> None:
+    results = {"a": "flaky", "b": "flaky"}
+    assert dev.libuv_test_verdict(results, frozenset()) == (["a", "b"], [])
+    baseline = {"a": "flaky", "b": "pass"}
+    assert dev.libuv_test_verdict(results, frozenset(), baseline) == (["b"], ["b"])
+    assert dev.libuv_test_verdict(results, frozenset({"b"}), baseline) == ([], [])
+
+
+def test_libuv_test_verdict_lists_regressions_against_the_baseline() -> None:
+    results = {"a": "fail", "b": "fail", "c": "pass", "d": "skip"}
+    baseline = {"a": "pass", "b": "fail", "c": "pass", "d": "pass", "e": "pass"}
+    assert dev.libuv_test_verdict(results, frozenset(), baseline) == (
+        ["a", "b", "d", "e"],
+        ["a", "d", "e"],
+    )
+    assert dev.libuv_test_verdict(results, frozenset({"a", "d"}), baseline) == (
+        ["b", "e"],
+        ["e"],
+    )
+
+
+class LibuvTestRun:
+    """Stands in for the logged subprocess runners and records each command.
+
+    `outcomes` maps a test name to the results of its successive runs
+    ("pass", "fail", "skip", or "crash": exit 0xC0000005 after an ok line);
+    a test with no entry passes. `reaps` records, for each sweep for leftover
+    processes, the test it followed ([] for none), and `leaks` maps a test name
+    to the pids its sweep reports.
+    """
+
+    def __init__(self, names: Sequence[str] = ("loop_alive", "tcp_open")) -> None:
+        self.names = list(names)
+        self.outcomes: dict[str, list[str]] = {}
+        self.commands: list[list[str]] = []
+        self.cwds: list[Path] = []
+        self.fail_phase: str | None = None
+        self.list_status = 0
+        self.reaps: list[list[str]] = []
+        self.leaks: dict[str, list[int]] = {}
+
+    def phase(self, log: Path, cmd: Sequence[str | Path], cwd: Path) -> int:
+        self.commands.append([str(c) for c in cmd])
+        log.touch()
+        return 1 if log.stem == self.fail_phase else 0
+
+    def capture(
+        self, log: Path, cmd: Sequence[str | Path], cwd: Path
+    ) -> tuple[int, str]:
+        words = [str(c) for c in cmd]
+        self.commands.append(words)
+        self.cwds.append(cwd)
+        log.touch()
+        if words[1:] == ["--list"]:
+            listing = "".join(f"{n}\n" for n in self.names)
+            return self.list_status, listing.replace(
+                "tcp_open\n", "tcp_open (helpers: x)\n"
+            )
+        (name,) = words[1:]
+        queue = self.outcomes.get(name, [])
+        outcome = queue.pop(0) if queue else "pass"
+        return {
+            "pass": (0, f"ok 1 - {name}\n"),
+            "skip": (7, f"ok 1 - {name} # SKIP\n"),
+            "fail": (1, f"not ok 1 - {name}\n"),
+            "crash": (0xC0000005, f"ok 1 - {name}\n"),
+        }[outcome]
+
+    def reap(self, runner: Path) -> list[int]:
+        after = self.commands[-1][1:] if self.commands else []
+        self.reaps.append(after)
+        return self.leaks.pop(after[0], []) if after else []
+
+    def runs_of(self, name: str) -> int:
+        return sum(c[1:] == [name] for c in self.commands)
+
+
+@pytest.fixture
+def libuv_test_run(
+    libuv_lab: LibuvLab, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> LibuvTestRun:
+    monkeypatch.setattr(dev, "LIBUV_TEST_TREE", tmp_path / "out" / "libuv-test")
+    monkeypatch.setattr(dev, "LIBUV_TEST_ACCEPTED", {})
+    run = LibuvTestRun()
+    monkeypatch.setattr(dev, "_libuv_test_log", run.phase)
+    monkeypatch.setattr(dev, "_libuv_test_capture", run.capture)
+    monkeypatch.setattr(dev, "_libuv_test_reap", run.reap)
+    return run
+
+
+def _libuv_test(variant: str = "stock", **kwargs: Any) -> None:
+    options: dict[str, Any] = {"build_only": False, "baseline": None, "jobs": None}
+    dev.cmd_libuv_test(variant, **{**options, **kwargs})
+
+
+def _configure_command(run: LibuvTestRun) -> list[str]:
+    return next(c for c in run.commands if "-S" in c)
+
+
+def _results(tmp_path: Path, variant: str = "stock") -> dict[str, str]:
+    path = tmp_path / "out" / "libuv-test" / variant / "results.json"
+    results: dict[str, str] = json.loads(path.read_text())
+    return results
+
+
+@pytest.mark.parametrize(
+    ("variant", "defines"),
+    [
+        ("stock", None),
+        ("legacy", "-DTAZ_LEGACY_FALLBACKS=1 -DPSAPI_VERSION=1"),
+        (
+            "forced",
+            "-DTAZ_LEGACY_FALLBACKS=1 -DPSAPI_VERSION=1 -DTAZ_FORCE_LEGACY=1",
+        ),
+    ],
+)
+def test_libuv_test_configure_carries_the_variant_defines(
+    libuv_test_run: LibuvTestRun, variant: str, defines: str | None
+) -> None:
+    _libuv_test(variant, build_only=True)
+    configure = _configure_command(libuv_test_run)
+    flags = [w for w in configure if w.startswith("-DCMAKE_C_FLAGS_INIT=")]
+    assert flags == ([] if defines is None else [f"-DCMAKE_C_FLAGS_INIT={defines}"])
+    assert "-DLIBUV_BUILD_TESTS=ON" in configure
+    assert "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON" in configure
+
+
+def test_libuv_test_unpacks_the_series_into_the_variant_directory(
+    libuv_test_run: LibuvTestRun, tmp_path: Path
+) -> None:
+    _libuv_test("legacy", build_only=True, jobs=3)
+    variant_dir = tmp_path / "out" / "libuv-test" / "legacy"
+    assert (variant_dir / "src" / "README.md").is_file()
+    assert (variant_dir / "configure.log").is_file()
+    assert (variant_dir / "build.log").is_file()
+    build = next(c for c in libuv_test_run.commands if "--build" in c)
+    assert build[-2:] == ["--parallel", "3"]
+    assert not any(Path(c[0]).stem == "uv_run_tests_a" for c in libuv_test_run.commands)
+
+
+def _git_tree(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    env = dev.libuv_git_env()
+    git = dev.tool("git")
+    subprocess.run([git, "init", "-q", str(path)], check=True, env=env)
+    (path / "tracked.c").write_text("x")
+    subprocess.run([git, "-C", str(path), "add", "tracked.c"], check=True, env=env)
+    subprocess.run(
+        [git, "-C", str(path), "commit", "-q", "-m", "c"], check=True, env=env
+    )
+
+
+def test_libuv_test_clean_restores_the_applied_tree(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    _git_tree(src)
+    (src / "tracked.c").write_text("edited")
+    leftover = src / "test_file"
+    leftover.write_text("x")
+    leftover.chmod(0o444)
+    (src / "sub" / "empty").mkdir(parents=True)
+    (src / "sub" / "nested").write_text("x")
+    dev._libuv_test_clean(src)
+    assert sorted(p.name for p in src.iterdir() if p.name != ".git") == ["tracked.c"]
+    assert (src / "tracked.c").read_text() == "x"
+
+
+def test_libuv_test_clean_removes_an_empty_directory(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    _git_tree(src)
+    (src / "fixture_dir").mkdir()
+    dev._libuv_test_clean(src)
+    assert not (src / "fixture_dir").exists()
+
+
+def test_libuv_test_clean_refuses_a_tree_without_its_own_git(tmp_path: Path) -> None:
+    outer = tmp_path / "outer"
+    _git_tree(outer)
+    (outer / "tracked.c").write_text("uncommitted")
+    src = outer / "src"
+    src.mkdir()
+    with pytest.raises(SystemExit, match="not the unpacked libuv tree"):
+        dev._libuv_test_clean(src)
+    assert (outer / "tracked.c").read_text() == "uncommitted"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory modes")
+def test_libuv_test_clean_leaves_what_a_link_points_to_alone(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    _git_tree(src)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("x")
+    outside.chmod(0o555)
+    (src / "link").symlink_to(outside)
+    stuck = src / "stuck"
+    stuck.mkdir()
+    (stuck / "file").write_text("x")
+    stuck.chmod(0o555)  # git clean alone cannot empty it
+    try:
+        dev._libuv_test_clean(src)
+        assert not (src / "link").exists() and not stuck.exists()
+        assert (outside / "keep").is_file()
+        assert outside.stat().st_mode & 0o777 == 0o555
+    finally:
+        outside.chmod(0o755)
+
+
+@pytest.mark.parametrize("phase", ["configure", "build"])
+def test_libuv_test_names_the_log_of_a_failed_phase(
+    libuv_test_run: LibuvTestRun, phase: str
+) -> None:
+    libuv_test_run.fail_phase = phase
+    with pytest.raises(SystemExit, match=rf"{phase}\.log"):
+        _libuv_test()
+
+
+def test_libuv_test_runs_each_listed_test_alone_from_the_source_tree(
+    libuv_test_run: LibuvTestRun,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleaned: list[Path] = []
+    monkeypatch.setattr(dev, "_libuv_test_clean", cleaned.append)
+    libuv_test_run.names = ["loop_alive", "tcp_open", "udp_send"]
+    libuv_test_run.outcomes = {"udp_send": ["skip"]}
+    _libuv_test()
+    src = tmp_path / "out" / "libuv-test" / "stock" / "src"
+    runs = [
+        c[1:] for c in libuv_test_run.commands if Path(c[0]).stem == "uv_run_tests_a"
+    ]
+    assert runs == [["--list"], ["loop_alive"], ["tcp_open"], ["udp_send"]]
+    assert set(libuv_test_run.cwds) == {src}
+    assert cleaned == [src] * 4  # before each test and once at the end
+    assert _results(tmp_path) == {
+        "loop_alive": "pass",
+        "tcp_open": "pass",
+        "udp_send": "skip",
+    }
+    out = capsys.readouterr().out
+    assert (
+        "libuv-test stock: 2 passed, 0 failed, 0 flaky, 1 skipped (0 accepted)" in out
+    )
+    assert "regressions vs baseline: none" in out
+
+
+def test_libuv_test_fails_a_flake_without_a_baseline(
+    libuv_test_run: LibuvTestRun, tmp_path: Path
+) -> None:
+    libuv_test_run.outcomes = {"tcp_open": ["fail", "pass"]}
+    with pytest.raises(SystemExit, match="failing tests: tcp_open"):
+        _libuv_test()
+    assert libuv_test_run.runs_of("tcp_open") == 2
+    assert _results(tmp_path)["tcp_open"] == "flaky"
+
+
+def test_libuv_test_tolerates_a_flake_the_baseline_shares(
+    libuv_test_run: LibuvTestRun, tmp_path: Path
+) -> None:
+    baseline = tmp_path / "stock.json"
+    baseline.write_text(json.dumps({"loop_alive": "pass", "tcp_open": "flaky"}))
+    libuv_test_run.outcomes = {"tcp_open": ["fail", "pass"]}
+    _libuv_test("legacy", baseline=baseline)
+
+
+def test_libuv_test_exits_nonzero_on_a_confirmed_failure(
+    libuv_test_run: LibuvTestRun,
+) -> None:
+    libuv_test_run.outcomes = {"tcp_open": ["fail", "fail"]}
+    with pytest.raises(SystemExit, match="failing tests: tcp_open"):
+        _libuv_test()
+
+
+def test_libuv_test_fails_a_crash_after_an_ok_line(
+    libuv_test_run: LibuvTestRun,
+) -> None:
+    libuv_test_run.outcomes = {"tcp_open": ["crash", "crash"]}
+    with pytest.raises(SystemExit, match="failing tests: tcp_open"):
+        _libuv_test()
+
+
+@pytest.mark.parametrize("variant", ["stock", "*"])
+def test_libuv_test_tolerates_an_accepted_failure(
+    libuv_test_run: LibuvTestRun,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variant: str,
+) -> None:
+    accepted = {(dev.platform.system(), variant): frozenset({"tcp_open", "gone"})}
+    monkeypatch.setattr(dev, "LIBUV_TEST_ACCEPTED", accepted)
+    libuv_test_run.outcomes = {"tcp_open": ["fail", "fail"]}
+    _libuv_test()
+    assert "1 failed, 0 flaky, 0 skipped (1 accepted)" in capsys.readouterr().out
+
+
+def test_libuv_test_reports_an_accepted_test_that_passed(
+    libuv_test_run: LibuvTestRun,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    accepted = {(dev.platform.system(), "stock"): frozenset({"tcp_open"})}
+    monkeypatch.setattr(dev, "LIBUV_TEST_ACCEPTED", accepted)
+    _libuv_test()
+    assert "accepted but passed: tcp_open" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("outcome", "names"),
+    [
+        (["fail", "fail"], ["loop_alive", "tcp_open"]),
+        (["skip"], ["loop_alive", "tcp_open"]),
+        (["pass"], ["loop_alive"]),  # tcp_open missing from this build
+    ],
+)
+def test_libuv_test_flags_a_regression_against_the_baseline(
+    libuv_test_run: LibuvTestRun,
+    tmp_path: Path,
+    outcome: list[str],
+    names: list[str],
+) -> None:
+    baseline = tmp_path / "stock.json"
+    baseline.write_text(json.dumps({"loop_alive": "pass", "tcp_open": "pass"}))
+    libuv_test_run.names = names
+    libuv_test_run.outcomes = {"tcp_open": outcome}
+    with pytest.raises(SystemExit, match="failing tests: tcp_open"):
+        _libuv_test("legacy", baseline=baseline)
+
+
+def test_libuv_test_needs_an_existing_baseline(
+    libuv_test_run: LibuvTestRun, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit, match=r"baseline.*missing\.json"):
+        _libuv_test("legacy", baseline=tmp_path / "missing.json")
+    assert libuv_test_run.commands == []
+
+
+@pytest.mark.parametrize(("status", "names"), [(1, ["loop_alive"]), (0, [])])
+def test_libuv_test_fails_when_the_runner_lists_nothing(
+    libuv_test_run: LibuvTestRun, status: int, names: list[str]
+) -> None:
+    libuv_test_run.list_status = status
+    libuv_test_run.names = names
+    with pytest.raises(SystemExit, match="--list"):
+        _libuv_test()
+
+
+def test_libuv_test_capture_logs_and_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = tmp_path / "run.log"
+    status, output = dev._libuv_test_capture(
+        log, [sys.executable, "-c", "print('ok 1 - t')"], tmp_path
+    )
+    assert (status, output.strip()) == (0, "ok 1 - t")
+    monkeypatch.setattr(dev, "LIBUV_TEST_RUN_TIMEOUT", 0.5)
+    status, output = dev._libuv_test_capture(
+        log, [sys.executable, "-c", "import time; time.sleep(5)"], tmp_path
+    )
+    assert status == -1 and "timed out" in output
+    assert log.read_text().count("$ ") == 2
+    assert not list(tmp_path.glob("capture.*"))
+
+
+def test_libuv_test_reaps_before_the_run_and_after_every_test(
+    libuv_test_run: LibuvTestRun,
+) -> None:
+    libuv_test_run.leaks = {"tcp_open": [4242]}
+    _libuv_test()
+    assert libuv_test_run.reaps == [[], ["loop_alive"], ["tcp_open"]]
+    log = dev.LIBUV_TEST_TREE / "stock" / "run.log"
+    assert "# killed what tcp_open left running: [4242]" in log.read_text()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="runs a copy of a POSIX binary")
+def test_libuv_test_reap_kills_only_the_runner_binary(tmp_path: Path) -> None:
+    sleep = shutil.which("sleep")
+    assert sleep is not None
+    runner = tmp_path / "uv_run_tests_a"
+    shutil.copy2(sleep, runner)
+    leaked = subprocess.Popen([runner, "60"])
+    other = subprocess.Popen([sleep, "60"])
+    try:
+        assert dev._libuv_test_reap(runner) == [leaked.pid]
+        leaked.wait(timeout=10)
+        assert other.poll() is None
+        assert dev._libuv_test_reap(runner) == []
+    finally:
+        for proc in (leaked, other):
+            proc.kill()
+            proc.wait()
+
+
+# --- libuv-imports -----------------------------------------------------------
+
+LIBUV_DUMP = """\
+Dump of file out\\libuv-test\\stock\\build\\libuv.lib
+
+Archive member name at 8E: uv-util.obj/
+
+COFF SYMBOL TABLE
+000 00000000 SECT1  notype ()    External     | uv_uptime
+001 00000000 UNDEF  notype       External     | __imp_GetTickCount64
+002 00000000 UNDEF  notype       External     | SystemFunction036
+003 00000000 UNDEF  notype ()    External     | _Foo@8
+004 00000000 UNDEF  notype       External     | __imp__AcquireSRWLockExclusive@4
+005 00000000 ABS    notype       Static       | @comp.id
+"""
+
+
+def test_libuv_lib_undefined_returns_bare_import_names() -> None:
+    assert dev.libuv_lib_undefined(LIBUV_DUMP) == {
+        "GetTickCount64",
+        "SystemFunction036",
+        "Foo",
+        "AcquireSRWLockExclusive",
+    }
+
+
+def test_libuv_lib_undefined_excludes_defined_symbols() -> None:
+    assert "uv_uptime" not in dev.libuv_lib_undefined(LIBUV_DUMP)
+
+
+ALWAYS = set(dev.LIBUV_ALWAYS_IMPORTED)
+
+
+def test_judge_libuv_imports_stock_needs_the_modern_imports() -> None:
+    assert dev.judge_libuv_imports("stock", ALWAYS | dev.LIBUV_STOCK_MUST_IMPORT) == []
+    assert dev.judge_libuv_imports("stock", ALWAYS | {"GetTickCount64"}) == [
+        "stock lib does not import AcquireSRWLockExclusive",
+        "stock lib does not import GetQueuedCompletionStatusEx",
+    ]
+
+
+@pytest.mark.parametrize("variant", ["legacy", "forced"])
+def test_judge_libuv_imports_legacy_rejects_inventory_imports(variant: str) -> None:
+    assert dev.judge_libuv_imports(variant, ALWAYS | {"Foo", "memcpy"}) == []
+    assert dev.judge_libuv_imports(variant, ALWAYS | {"GetTickCount64"}) == [
+        f"{variant} lib still imports GetTickCount64"
+    ]
+
+
+@pytest.mark.parametrize("variant", ["stock", "legacy", "forced"])
+def test_judge_libuv_imports_refuses_a_dump_with_nothing_to_judge(
+    variant: str,
+) -> None:
+    for undefined in (set(), {"CloseHandle"}, dev.libuv_lib_undefined("")):
+        (error,) = dev.judge_libuv_imports(variant, undefined)
+        assert "CreateFileW" in error and "not a libuv static lib" in error
+
+
+def test_legacy_import_names_cover_the_inventory() -> None:
+    assert {
+        "K32GetProcessMemoryInfo",
+        "K32GetModuleBaseNameW",
+        "InitOnceExecuteOnce",
+    } <= dev.LIBUV_LEGACY_IMPORTS
+    assert dev.LIBUV_STOCK_MUST_IMPORT <= dev.LIBUV_LEGACY_IMPORTS
+
+
+def test_libuv_imports_refuses_to_run_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dev, "IS_WINDOWS", False)
+    with pytest.raises(SystemExit, match="runs on Windows"):
+        dev.cmd_libuv_imports("stock")
+
+
+def test_libuv_imports_needs_the_built_lib(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(dev, "IS_WINDOWS", True)
+    monkeypatch.setattr(dev, "LIBUV_TEST_TREE", tmp_path)
+    with pytest.raises(SystemExit, match=r"libuv-test legacy --build-only"):
+        dev.cmd_libuv_imports("legacy")
+
+
+@pytest.fixture
+def libuv_lib_on_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Callable[[str], Path]:
+    """Pretend to be Windows with one built libuv.lib per variant under tmp_path."""
+
+    def make(variant: str) -> Path:
+        lib = tmp_path / variant / "build" / "libuv.lib"
+        lib.parent.mkdir(parents=True, exist_ok=True)
+        lib.write_bytes(b"!<arch>\n")
+        return lib
+
+    monkeypatch.setattr(dev, "IS_WINDOWS", True)
+    monkeypatch.setattr(dev, "LIBUV_TEST_TREE", tmp_path)
+    monkeypatch.setattr(dev, "ensure_msvc_env", lambda: None)
+    monkeypatch.setattr(dev, "tool", lambda name: name)
+    return make
+
+
+def _fake_dumpbin(monkeypatch: pytest.MonkeyPatch, dump: str) -> list[list[str]]:
+    commands: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=dump, stderr="")
+
+    monkeypatch.setattr(dev.subprocess, "run", fake_run)
+    return commands
+
+
+def test_libuv_imports_passes_a_stock_lib_with_the_modern_imports(
+    monkeypatch: pytest.MonkeyPatch,
+    libuv_lib_on_windows: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lib = libuv_lib_on_windows("stock")
+    dump = "".join(
+        f"00{i} 00000000 UNDEF  notype       External     | __imp_{name}\n"
+        for i, name in enumerate(sorted(dev.LIBUV_STOCK_MUST_IMPORT | ALWAYS))
+    )
+    commands = _fake_dumpbin(monkeypatch, dump)
+    dev.cmd_libuv_imports("stock")
+    assert commands == [["dumpbin", "/symbols", str(lib)]]
+    assert "libuv-imports stock: pass" in capsys.readouterr().out
+
+
+def test_libuv_imports_fails_a_legacy_lib_that_still_imports_post_xp(
+    monkeypatch: pytest.MonkeyPatch,
+    libuv_lib_on_windows: Callable[[str], Path],
+) -> None:
+    libuv_lib_on_windows("legacy")
+    _fake_dumpbin(
+        monkeypatch,
+        "".join(
+            f"00{i} 00000000 UNDEF  notype       External     | __imp_{name}\n"
+            for i, name in enumerate(sorted(ALWAYS | {"GetTickCount64"}))
+        ),
+    )
+    with pytest.raises(SystemExit, match="legacy lib still imports GetTickCount64"):
+        dev.cmd_libuv_imports("legacy")
