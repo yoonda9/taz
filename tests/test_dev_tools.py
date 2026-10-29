@@ -1454,6 +1454,15 @@ class LibuvLab:
         shutil.copytree(
             REAL_LIBUV_RECIPE, self.recipe, ignore=shutil.ignore_patterns("__pycache__")
         )
+        # The lab imports a fake tarball, so the real series cannot apply: start empty.
+        for patch in (self.recipe / "patches").glob("*.patch"):
+            patch.unlink()
+        (self.recipe / "conandata.yml").write_text(
+            dev.render_libuv_conandata(
+                (self.recipe / "conandata.yml").read_text(), "1.51.0-taz.1", []
+            ),
+            newline="\n",
+        )
         payload = io.BytesIO()
         with tarfile.open(fileobj=payload, mode="w:gz") as tar:
             for name, data in (
@@ -1631,7 +1640,9 @@ def test_libuv_patches_empty_series_round_trips_byte_for_byte(
 
 def test_libuv_conandata_emitter_reproduces_the_checked_in_file() -> None:
     text = (REAL_LIBUV_RECIPE / "conandata.yml").read_text()
-    assert dev.render_libuv_conandata(text, "1.51.0-taz.1", []) == text
+    entries = yaml.safe_load(text)["patches"]["1.51.0-taz.1"]
+    patches = [(e["patch_file"], e["patch_description"]) for e in entries]
+    assert dev.render_libuv_conandata(text, "1.51.0-taz.1", patches) == text
 
 
 def test_libuv_patches_export_needs_an_imported_tree(libuv_lab: LibuvLab) -> None:

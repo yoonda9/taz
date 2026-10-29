@@ -3,4 +3,19 @@ sources:
     sha256: 27e55cf7083913bfb6826ca78cde9de7647cded648d35f24163f2d31bb9f51cd
     url: https://github.com/libuv/libuv/archive/v1.51.0.tar.gz
 patches:
-  1.51.0-taz.1: []
+  1.51.0-taz.1:
+    - patch_file: patches/0001-win-resolve-post-XP-imports-at-runtime.patch
+      patch_description: "win: resolve post-XP imports at runtime"
+      patch_type: portability
+    - patch_file: patches/0002-win-time-cpu-random-and-uname-fallbacks-for-pre-Vist.patch
+      patch_description: "win: time, cpu, random and uname fallbacks for pre-Vista"
+      patch_type: portability
+    - patch_file: patches/0003-win-fs-and-process-fallbacks-for-pre-Vista.patch
+      patch_description: "win: fs and process fallbacks for pre-Vista"
+      patch_type: portability
+    - patch_file: patches/0004-win-pipe-and-net-fallbacks-for-pre-Vista.patch
+      patch_description: "win: pipe and net fallbacks for pre-Vista"
+      patch_type: portability
+    - patch_file: patches/0005-win-lookup-only-wiring-for-I-O-SRW-and-condvar-calls.patch
+      patch_description: "win: lookup-only wiring for I/O, SRW and condvar calls"
+      patch_type: portability

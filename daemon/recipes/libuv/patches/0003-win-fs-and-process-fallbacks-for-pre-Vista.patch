@@ -1,0 +1,382 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:27:47 +0000
+Subject: [PATCH] win: fs and process fallbacks for pre-Vista
+
+Uses the run-time pointers from the first patch, compiled only when the
+legacy-fallbacks macro is set; upstream lines are unchanged and move into
+#else branches.
+
+- env_strncmp: CompareStringOrdinal absent -> ordinal compare of UTF-16
+  code units upper-cased with RtlUpcaseUnicodeChar (ntdll), the
+  invariant table CompareStringOrdinal itself uses.
+- fs__realpath: GetFinalPathNameByHandleW absent -> UV_ENOSYS before the
+  file is opened (the call sites follow a7493d8a^).
+- fs__fchmod: ReOpenFile absent -> UV_ENOSYS.
+- fs__symlink: CreateSymbolicLinkW absent -> UV_ENOTSUP (junctions still
+  work).
+- fs__open (UV_FS_O_FILEMAP) and the fs-event pending-delete check:
+  uv__file_standard_info, which calls GetFileInformationByHandleEx when
+  it exists and NtQueryInformationFile(FileStandardInformation) when not.
+- uv__kill SIGQUIT minidump: skipped when RegGetValueW,
+  SHGetKnownFolderPath or SetFileInformationByHandle is missing;
+  uv__once_init() first, since uv_kill may run before any loop.
+- NeedCurrentDirectoryForExePathW absent -> TRUE unless
+  NoDefaultCurrentDirectoryInExePath is set.
+---
+ src/win/fs-event.c |  4 +++
+ src/win/fs.c       | 43 +++++++++++++++++++++++++++
+ src/win/process.c  | 73 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/win/winapi.c   | 34 +++++++++++++++++++++
+ src/win/winapi.h   |  7 +++++
+ 5 files changed, 161 insertions(+)
+
+diff --git a/src/win/fs-event.c b/src/win/fs-event.c
+index 1bbb8c52be2d82c9d32b63fb08d30b14903956e1..43b7f7420afa2e794d3e216e9bb8ff8b184ea306 100644
+--- a/src/win/fs-event.c
++++ b/src/win/fs-event.c
+@@ -571,10 +571,14 @@ void uv__process_fs_event_req(uv_loop_t* loop, uv_req_t* req,
+     FILE_STANDARD_INFO info;
+     if (err == ERROR_ACCESS_DENIED &&
+         handle->dirw != NULL &&
++#if TAZ_LEGACY_FALLBACKS
++        uv__file_standard_info(handle->dir_handle, &info) &&
++#else
+         GetFileInformationByHandleEx(handle->dir_handle,
+                                      FileStandardInfo,
+                                      &info,
+                                      sizeof(info)) &&
++#endif
+         info.Directory &&
+         info.DeletePending) {
+       uv__convert_utf16_to_utf8(handle->dirw, -1, &filename);
+diff --git a/src/win/fs.c b/src/win/fs.c
+index 27248f644f381bbdeeef7c65401c74ab9474d0ad..fb7df558d0289bb4a5b4444df34b1f0ef6f8a19f 100644
+--- a/src/win/fs.c
++++ b/src/win/fs.c
+@@ -616,10 +616,14 @@ void fs__open(uv_fs_t* req) {
+ 
+   if (flags & UV_FS_O_FILEMAP) {
+     FILE_STANDARD_INFO file_info;
++#if TAZ_LEGACY_FALLBACKS
++    if (!uv__file_standard_info(file, &file_info)) {
++#else
+     if (!GetFileInformationByHandleEx(file,
+                                       FileStandardInfo,
+                                       &file_info,
+                                       sizeof file_info)) {
++#endif
+       SET_REQ_WIN32_ERROR(req, GetLastError());
+       CloseHandle(file);
+       return;
+@@ -2503,7 +2507,15 @@ static void fs__fchmod(uv_fs_t* req) {
+ 
+   VERIFY_FD(fd, req);
+ 
++#if TAZ_LEGACY_FALLBACKS
++  if (pReOpenFile == NULL) {
++    SET_REQ_UV_ERROR(req, UV_ENOSYS, ERROR_CALL_NOT_IMPLEMENTED);
++    return;
++  }
++  handle = pReOpenFile(uv__get_osfhandle(fd), FILE_WRITE_ATTRIBUTES, 0, 0);
++#else
+   handle = ReOpenFile(uv__get_osfhandle(fd), FILE_WRITE_ATTRIBUTES, 0, 0);
++#endif
+   if (handle == INVALID_HANDLE_VALUE) {
+     SET_REQ_WIN32_ERROR(req, GetLastError());
+     return;
+@@ -2894,7 +2906,15 @@ static void fs__symlink(uv_fs_t* req) {
+   else
+     flags = uv__file_symlink_usermode_flag;
+ 
++#if TAZ_LEGACY_FALLBACKS
++  if (pCreateSymbolicLinkW == NULL) {
++    SET_REQ_UV_ERROR(req, UV_ENOTSUP, ERROR_NOT_SUPPORTED);
++    return;
++  }
++  if (pCreateSymbolicLinkW(new_pathw, pathw, flags)) {
++#else
+   if (CreateSymbolicLinkW(new_pathw, pathw, flags)) {
++#endif
+     SET_REQ_RESULT(req, 0);
+     return;
+   }
+@@ -2955,7 +2975,18 @@ static ssize_t fs__realpath_handle(HANDLE handle, char** realpath_ptr) {
+   WCHAR* w_realpath_ptr = NULL;
+   WCHAR* w_realpath_buf;
+ 
++#if TAZ_LEGACY_FALLBACKS
++  if (pGetFinalPathNameByHandleW == NULL) {
++    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++    return -1;
++  }
++  w_realpath_len = pGetFinalPathNameByHandleW(handle,
++                                              NULL,
++                                              0,
++                                              VOLUME_NAME_DOS);
++#else
+   w_realpath_len = GetFinalPathNameByHandleW(handle, NULL, 0, VOLUME_NAME_DOS);
++#endif
+   if (w_realpath_len == 0) {
+     return -1;
+   }
+@@ -2967,8 +2998,13 @@ static ssize_t fs__realpath_handle(HANDLE handle, char** realpath_ptr) {
+   }
+   w_realpath_ptr = w_realpath_buf;
+ 
++#if TAZ_LEGACY_FALLBACKS
++  if (pGetFinalPathNameByHandleW(
++          handle, w_realpath_ptr, w_realpath_len, VOLUME_NAME_DOS) == 0) {
++#else
+   if (GetFinalPathNameByHandleW(
+           handle, w_realpath_ptr, w_realpath_len, VOLUME_NAME_DOS) == 0) {
++#endif
+     uv__free(w_realpath_buf);
+     SetLastError(ERROR_INVALID_HANDLE);
+     return -1;
+@@ -3001,6 +3037,13 @@ static ssize_t fs__realpath_handle(HANDLE handle, char** realpath_ptr) {
+ static void fs__realpath(uv_fs_t* req) {
+   HANDLE handle;
+ 
++#if TAZ_LEGACY_FALLBACKS
++  if (pGetFinalPathNameByHandleW == NULL) {
++    SET_REQ_UV_ERROR(req, UV_ENOSYS, ERROR_CALL_NOT_IMPLEMENTED);
++    return;
++  }
++
++#endif
+   handle = CreateFileW(req->file.pathw,
+                        0,
+                        0,
+diff --git a/src/win/process.c b/src/win/process.c
+index 27605ca36f44348a6c2f24adce93d9d9b3e8b6da..282b2c2a08ef70e0104ad71694763b2ce231ff6b 100644
+--- a/src/win/process.c
++++ b/src/win/process.c
+@@ -378,7 +378,16 @@ static WCHAR* search_path(const WCHAR *file,
+   } else {
+     dir_end = path;
+ 
++#if TAZ_LEGACY_FALLBACKS
++    /* Absent on 2000: current directory first unless the variable is set. */
++    if (pNeedCurrentDirectoryForExePathW != NULL
++            ? pNeedCurrentDirectoryForExePathW(L"")
++            : GetEnvironmentVariableW(L"NoDefaultCurrentDirectoryInExePath",
++                                      NULL,
++                                      0) == 0) {
++#else
+     if (NeedCurrentDirectoryForExePathW(L"")) {
++#endif
+       /* The file is really only a name; look in cwd first, then scan path */
+       result = path_search_walk_ext(L"", 0,
+                                     file, file_len,
+@@ -614,8 +623,31 @@ static int env_strncmp(const wchar_t* a, int na, const wchar_t* b) {
+   assert(b_eq);
+   nb = b_eq - b;
+ 
++#if TAZ_LEGACY_FALLBACKS
++  /* Runs before any loop exists too: libuv's tests call make_program_env. */
++  uv__once_init();
++  if (pCompareStringOrdinal != NULL) {
++    r = pCompareStringOrdinal(a, na, b, nb, /*case insensitive*/TRUE);
++    return r - CSTR_EQUAL;
++  } else {
++    /* Ordinal, case-insensitive: compare UTF-16 code units upper-cased with
++     * the system's invariant table, the one CompareStringOrdinal uses (not
++     * the locale-dependent CharUpperW). */
++    int i;
++    int n = na < nb ? na : nb;
++
++    for (i = 0; i < n; i++) {
++      WCHAR ca = pRtlUpcaseUnicodeChar(a[i]);
++      WCHAR cb = pRtlUpcaseUnicodeChar(b[i]);
++      if (ca != cb)
++        return ca < cb ? -1 : 1;
++    }
++    return na < nb ? -1 : (na > nb ? 1 : 0);
++  }
++#else
+   r = CompareStringOrdinal(a, na, b, nb, /*case insensitive*/TRUE);
+   return r - CSTR_EQUAL;
++#endif
+ }
+ 
+ 
+@@ -1177,7 +1209,17 @@ static int uv__kill(HANDLE process_handle, int signum) {
+    * for more detail.  Note that if the dump folder does not exist, we attempt
+    * to create it, to match behavior with WER itself.
+    * [0]: https://learn.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps */
++#if TAZ_LEGACY_FALLBACKS
++  /* Skip the dump when the registry, shell or file-info API is missing.
++   * uv_kill can run before any loop exists, so resolve the pointers first. */
++  uv__once_init();
++  if (signum == SIGQUIT &&
++      pRegGetValueW != NULL &&
++      pSHGetKnownFolderPath != NULL &&
++      pSetFileInformationByHandle != NULL) {
++#else
+   if (signum == SIGQUIT) {
++#endif
+     HKEY registry_key;
+     DWORD pid, ret;
+     WCHAR basename[MAX_PATH];
+@@ -1199,6 +1241,15 @@ static int uv__kill(HANDLE process_handle, int signum) {
+       HANDLE hDumpFile = NULL;
+       WCHAR dump_folder[MAX_PATH], dump_name[MAX_PATH];
+       DWORD dump_folder_len = sizeof(dump_folder), key_type = 0;
++#if TAZ_LEGACY_FALLBACKS
++      ret = pRegGetValueW(registry_key,
++                          NULL,
++                          L"DumpFolder",
++                          RRF_RT_ANY,
++                          &key_type,
++                          (PVOID) dump_folder,
++                          &dump_folder_len);
++#else
+       ret = RegGetValueW(registry_key,
+                          NULL,
+                          L"DumpFolder",
+@@ -1206,6 +1257,7 @@ static int uv__kill(HANDLE process_handle, int signum) {
+                          &key_type,
+                          (PVOID) dump_folder,
+                          &dump_folder_len);
++#endif
+       if (ret != ERROR_SUCCESS) {
+         /* Workaround for missing uuid.dll on MinGW. */
+         static const GUID FOLDERID_LocalAppData_libuv = {
+@@ -1215,10 +1267,17 @@ static int uv__kill(HANDLE process_handle, int signum) {
+ 
+         /* Default value for `dump_folder` is `%LOCALAPPDATA%\CrashDumps`. */
+         WCHAR* localappdata;
++#if TAZ_LEGACY_FALLBACKS
++        pSHGetKnownFolderPath(&FOLDERID_LocalAppData_libuv,
++                              0,
++                              NULL,
++                              &localappdata);
++#else
+         SHGetKnownFolderPath(&FOLDERID_LocalAppData_libuv,
+                              0,
+                              NULL,
+                              &localappdata);
++#endif
+         _snwprintf_s(dump_folder,
+                      sizeof(dump_folder),
+                      _TRUNCATE,
+@@ -1252,10 +1311,17 @@ static int uv__kill(HANDLE process_handle, int signum) {
+         FILE_DISPOSITION_INFO DeleteOnClose = { TRUE };
+ 
+         /* If something goes wrong while writing it out, delete the file. */
++#if TAZ_LEGACY_FALLBACKS
++        pSetFileInformationByHandle(hDumpFile,
++                                    FileDispositionInfo,
++                                    &DeleteOnClose,
++                                    sizeof(DeleteOnClose));
++#else
+         SetFileInformationByHandle(hDumpFile,
+                                    FileDispositionInfo,
+                                    &DeleteOnClose,
+                                    sizeof(DeleteOnClose));
++#endif
+ 
+         /* Tell wine to dump ELF modules as well. */
+         sym_options = SymGetOptions();
+@@ -1280,10 +1346,17 @@ static int uv__kill(HANDLE process_handle, int signum) {
+                               NULL)) {
+           /* Don't delete the file on close if we successfully wrote it out. */
+           FILE_DISPOSITION_INFO DontDeleteOnClose = { FALSE };
++#if TAZ_LEGACY_FALLBACKS
++          pSetFileInformationByHandle(hDumpFile,
++                                      FileDispositionInfo,
++                                      &DontDeleteOnClose,
++                                      sizeof(DontDeleteOnClose));
++#else
+           SetFileInformationByHandle(hDumpFile,
+                                      FileDispositionInfo,
+                                      &DontDeleteOnClose,
+                                      sizeof(DontDeleteOnClose));
++#endif
+         }
+         SymSetOptions(sym_options);
+         CloseHandle(hDumpFile);
+diff --git a/src/win/winapi.c b/src/win/winapi.c
+index 62cd1b2c025bd206660640a93fda69f9c206053e..8671b93e9fe81c99fbcf247c057b22bdcc382d0b 100644
+--- a/src/win/winapi.c
++++ b/src/win/winapi.c
+@@ -81,6 +81,7 @@ sInitializeConditionVariable pInitializeConditionVariable;
+ sWakeConditionVariable pWakeConditionVariable;
+ sWakeAllConditionVariable pWakeAllConditionVariable;
+ sSleepConditionVariableCS pSleepConditionVariableCS;
++sRtlUpcaseUnicodeChar pRtlUpcaseUnicodeChar;
+ 
+ /* LoadLibrary from the system directory only: XP has no
+  * LOAD_LIBRARY_SEARCH_SYSTEM32, and a bare DLL name would search the
+@@ -103,6 +104,35 @@ static HMODULE uv__load_system_library(const WCHAR* name) {
+   return LoadLibraryW(path);
+ }
+ 
++
++BOOL uv__file_standard_info(HANDLE file, FILE_STANDARD_INFO* info) {
++  FILE_STANDARD_INFORMATION nt_info;
++  IO_STATUS_BLOCK io_status;
++  NTSTATUS status;
++
++  if (pGetFileInformationByHandleEx != NULL)
++    return pGetFileInformationByHandleEx(file,
++                                         FileStandardInfo,
++                                         info,
++                                         sizeof(*info));
++
++  status = pNtQueryInformationFile(file,
++                                   &io_status,
++                                   &nt_info,
++                                   sizeof(nt_info),
++                                   FileStandardInformation);
++  if (!NT_SUCCESS(status)) {
++    SetLastError(pRtlNtStatusToDosError(status));
++    return FALSE;
++  }
++  info->AllocationSize = nt_info.AllocationSize;
++  info->EndOfFile = nt_info.EndOfFile;
++  info->NumberOfLinks = nt_info.NumberOfLinks;
++  info->DeletePending = nt_info.DeletePending;
++  info->Directory = nt_info.Directory;
++  return TRUE;
++}
++
+ #endif
+ void uv__winapi_init(void) {
+   HMODULE ntdll_module;
+@@ -212,6 +242,10 @@ void uv__winapi_init(void) {
+     pGetSystemTimePreciseAsFileTime = (sGetSystemTimePreciseAsFileTime) GetProcAddress(kernel32_module, "GetSystemTimePreciseAsFileTime");
+     pGetCurrentProcessorNumber = (sGetCurrentProcessorNumber) GetProcAddress(kernel32_module, "GetCurrentProcessorNumber");
+     pCompareStringOrdinal = (sCompareStringOrdinal) GetProcAddress(kernel32_module, "CompareStringOrdinal");
++    pRtlUpcaseUnicodeChar = (sRtlUpcaseUnicodeChar) GetProcAddress(ntdll_module, "RtlUpcaseUnicodeChar");
++    if (pRtlUpcaseUnicodeChar == NULL) {
++      uv_fatal_error(GetLastError(), "GetProcAddress");
++    }
+     pGetFinalPathNameByHandleW = (sGetFinalPathNameByHandleW) GetProcAddress(kernel32_module, "GetFinalPathNameByHandleW");
+     pReOpenFile = (sReOpenFile) GetProcAddress(kernel32_module, "ReOpenFile");
+     pCreateSymbolicLinkW = (sCreateSymbolicLinkW) GetProcAddress(kernel32_module, "CreateSymbolicLinkW");
+diff --git a/src/win/winapi.h b/src/win/winapi.h
+index e480dea3911851afd6bdaa5d755beb4667e9d66c..71873c25ba90f1e3e0b31130eb60e718d828c1a1 100644
+--- a/src/win/winapi.h
++++ b/src/win/winapi.h
+@@ -4897,6 +4897,8 @@ typedef BOOL (WINAPI *sSleepConditionVariableCS)
+     (PCONDITION_VARIABLE, PCRITICAL_SECTION, DWORD);
+ typedef BOOL (WINAPI *sInitOnceExecuteOnce)
+     (PINIT_ONCE, PINIT_ONCE_FN, PVOID, LPVOID*);
++typedef WCHAR (NTAPI *sRtlUpcaseUnicodeChar)
++    (WCHAR);
+ 
+ extern sGetTickCount64 pGetTickCount64;
+ extern sGetSystemTimePreciseAsFileTime pGetSystemTimePreciseAsFileTime;
+@@ -4930,5 +4932,10 @@ extern sInitializeConditionVariable pInitializeConditionVariable;
+ extern sWakeConditionVariable pWakeConditionVariable;
+ extern sWakeAllConditionVariable pWakeAllConditionVariable;
+ extern sSleepConditionVariableCS pSleepConditionVariableCS;
++extern sRtlUpcaseUnicodeChar pRtlUpcaseUnicodeChar;
++
++/* FileStandardInfo through GetFileInformationByHandleEx, or through
++ * NtQueryInformationFile where that is missing. Sets the last error. */
++BOOL uv__file_standard_info(HANDLE file, FILE_STANDARD_INFO* info);
+ #endif
+ #endif /* UV_WIN_WINAPI_H_ */

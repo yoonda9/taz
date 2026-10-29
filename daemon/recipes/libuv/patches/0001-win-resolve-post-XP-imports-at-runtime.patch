@@ -1,0 +1,402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:09:28 +0000
+Subject: [PATCH] win: resolve post-XP imports at runtime
+
+Adds the run-time lookup layer for the Windows functions newer than XP,
+compiled only when the legacy-fallbacks macro is set. Nothing calls the
+new pointers yet; later patches in the series do.
+
+Restores the pre-removal mechanism from upstream: the kernel32 lookup
+block of e62e85ea (src/win/winapi.c), the sGetQueuedCompletionStatusEx
+typedef of 6a276e37 (src/win/winapi.h) and the pointer style of
+a7493d8a.
+
+Pointers with a fallback (may stay NULL): GetTickCount64,
+GetSystemTimePreciseAsFileTime, GetCurrentProcessorNumber,
+SystemFunction036, RegGetValueW, CompareStringOrdinal,
+ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToNameW,
+GetFinalPathNameByHandleW, ReOpenFile, CreateSymbolicLinkW,
+GetFileInformationByHandleEx, SetFileInformationByHandle,
+SHGetKnownFolderPath, GetNamedPipeClientProcessId,
+GetNamedPipeServerProcessId, CancelSynchronousIo,
+NeedCurrentDirectoryForExePathW. The force-legacy macro sets exactly
+these to NULL after the lookups.
+
+Lookup-only pointers (fatal at init, named, when missing):
+GetQueuedCompletionStatusEx, CancelIoEx,
+SetFileCompletionNotificationModes, the seven SRW lock functions and
+the four condition-variable functions.
+
+InitOnceExecuteOnce is resolved lazily inside uv_once, which runs
+before uv__winapi_init; the cached pointer is read and written with
+interlocked operations.
+
+advapi32, iphlpapi and shell32 are loaded by full system-directory path
+when not already mapped: XP lacks LOAD_LIBRARY_SEARCH_SYSTEM32, and a bare
+name would search the application directory first.
+---
+ src/win/thread.c |  23 ++++++
+ src/win/winapi.c | 193 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/win/winapi.h | 103 +++++++++++++++++++++++++
+ 3 files changed, 319 insertions(+)
+
+diff --git a/src/win/thread.c b/src/win/thread.c
+index 753cb6a34a5b9a6d332511596fb139fe071c2de3..e9e1f75356d785ed22d2dd78d03eb67c0e55b672 100644
+--- a/src/win/thread.c
++++ b/src/win/thread.c
+@@ -46,10 +46,33 @@ static BOOL WINAPI uv__once_inner(INIT_ONCE *once, void* param, void** context)
+   return TRUE;
+ }
+ 
++#if TAZ_LEGACY_FALLBACKS
++void uv_once(uv_once_t* guard, uv__once_cb callback) {
++  /* uv_once runs before uv__winapi_init (it guards uv__init), so this one
++   * pointer is resolved here. Racing threads store the same address; the
++   * interlocked load and store keep that well defined. */
++  static void* volatile init_once_execute_once;
++  uv__once_data_t data = { .callback = callback };
++  sInitOnceExecuteOnce fn;
++
++  fn = (sInitOnceExecuteOnce) InterlockedCompareExchangePointer(
++      &init_once_execute_once, NULL, NULL);
++  if (fn == NULL) {
++    fn = (sInitOnceExecuteOnce) GetProcAddress(
++        GetModuleHandleA("kernel32.dll"), "InitOnceExecuteOnce");
++    if (fn == NULL) {
++      uv_fatal_error(GetLastError(), "InitOnceExecuteOnce");
++    }
++    InterlockedExchangePointer(&init_once_execute_once, (void*) fn);
++  }
++  fn(&guard->init_once, uv__once_inner, (void*) &data, NULL);
++}
++#else
+ void uv_once(uv_once_t* guard, uv__once_cb callback) {
+   uv__once_data_t data = { .callback = callback };
+   InitOnceExecuteOnce(&guard->init_once, uv__once_inner, (void*) &data, NULL);
+ }
++#endif
+ 
+ 
+ /* Verify that uv_thread_t can be stored in a TLS slot. */
+diff --git a/src/win/winapi.c b/src/win/winapi.c
+index 315a0d49aff50bcf9c30c470afb4f542c09133f8..62cd1b2c025bd206660640a93fda69f9c206053e 100644
+--- a/src/win/winapi.c
++++ b/src/win/winapi.c
+@@ -48,6 +48,62 @@ uv_sGetHostNameW pGetHostNameW;
+ /* api-ms-win-core-file-l2-1-4.dll function pointer */
+ sGetFileInformationByName pGetFileInformationByName;
+ 
++#if TAZ_LEGACY_FALLBACKS
++sGetTickCount64 pGetTickCount64;
++sGetSystemTimePreciseAsFileTime pGetSystemTimePreciseAsFileTime;
++sGetCurrentProcessorNumber pGetCurrentProcessorNumber;
++sSystemFunction036 pSystemFunction036;
++sRegGetValueW pRegGetValueW;
++sCompareStringOrdinal pCompareStringOrdinal;
++sConvertInterfaceIndexToLuid pConvertInterfaceIndexToLuid;
++sConvertInterfaceLuidToNameW pConvertInterfaceLuidToNameW;
++sGetFinalPathNameByHandleW pGetFinalPathNameByHandleW;
++sReOpenFile pReOpenFile;
++sCreateSymbolicLinkW pCreateSymbolicLinkW;
++sGetFileInformationByHandleEx pGetFileInformationByHandleEx;
++sSetFileInformationByHandle pSetFileInformationByHandle;
++sSHGetKnownFolderPath pSHGetKnownFolderPath;
++sGetNamedPipeClientProcessId pGetNamedPipeClientProcessId;
++sGetNamedPipeServerProcessId pGetNamedPipeServerProcessId;
++sCancelSynchronousIo pCancelSynchronousIo;
++sNeedCurrentDirectoryForExePathW pNeedCurrentDirectoryForExePathW;
++sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
++sCancelIoEx pCancelIoEx;
++sSetFileCompletionNotificationModes pSetFileCompletionNotificationModes;
++sInitializeSRWLock pInitializeSRWLock;
++sAcquireSRWLockShared pAcquireSRWLockShared;
++sTryAcquireSRWLockShared pTryAcquireSRWLockShared;
++sReleaseSRWLockShared pReleaseSRWLockShared;
++sAcquireSRWLockExclusive pAcquireSRWLockExclusive;
++sTryAcquireSRWLockExclusive pTryAcquireSRWLockExclusive;
++sReleaseSRWLockExclusive pReleaseSRWLockExclusive;
++sInitializeConditionVariable pInitializeConditionVariable;
++sWakeConditionVariable pWakeConditionVariable;
++sWakeAllConditionVariable pWakeAllConditionVariable;
++sSleepConditionVariableCS pSleepConditionVariableCS;
++
++/* LoadLibrary from the system directory only: XP has no
++ * LOAD_LIBRARY_SEARCH_SYSTEM32, and a bare DLL name would search the
++ * application and current directories first. */
++static HMODULE uv__load_system_library(const WCHAR* name) {
++  WCHAR path[MAX_PATH];
++  UINT length;
++  UINT i;
++
++  length = GetSystemDirectoryW(path, MAX_PATH);
++  if (length == 0 || length >= MAX_PATH)
++    return NULL;
++  path[length++] = L'\\';
++  for (i = 0; name[i] != L'\0'; i++) {
++    if (length + 1 >= MAX_PATH)
++      return NULL;
++    path[length++] = name[i];
++  }
++  path[length] = L'\0';
++  return LoadLibraryW(path);
++}
++
++#endif
+ void uv__winapi_init(void) {
+   HMODULE ntdll_module;
+   HMODULE powrprof_module;
+@@ -141,4 +197,141 @@ void uv__winapi_init(void) {
+     pGetFileInformationByName = (sGetFileInformationByName)GetProcAddress(
+         api_win_core_file_module, "GetFileInformationByName");
+   }
++#if TAZ_LEGACY_FALLBACKS
++  {
++    HMODULE kernel32_module;
++    HMODULE advapi32_module;
++    HMODULE iphlpapi_module;
++    HMODULE shell32_module;
++
++    kernel32_module = GetModuleHandleA("kernel32.dll");
++    if (kernel32_module == NULL) {
++      uv_fatal_error(GetLastError(), "GetModuleHandleA");
++    }
++    pGetTickCount64 = (sGetTickCount64) GetProcAddress(kernel32_module, "GetTickCount64");
++    pGetSystemTimePreciseAsFileTime = (sGetSystemTimePreciseAsFileTime) GetProcAddress(kernel32_module, "GetSystemTimePreciseAsFileTime");
++    pGetCurrentProcessorNumber = (sGetCurrentProcessorNumber) GetProcAddress(kernel32_module, "GetCurrentProcessorNumber");
++    pCompareStringOrdinal = (sCompareStringOrdinal) GetProcAddress(kernel32_module, "CompareStringOrdinal");
++    pGetFinalPathNameByHandleW = (sGetFinalPathNameByHandleW) GetProcAddress(kernel32_module, "GetFinalPathNameByHandleW");
++    pReOpenFile = (sReOpenFile) GetProcAddress(kernel32_module, "ReOpenFile");
++    pCreateSymbolicLinkW = (sCreateSymbolicLinkW) GetProcAddress(kernel32_module, "CreateSymbolicLinkW");
++    pGetFileInformationByHandleEx = (sGetFileInformationByHandleEx) GetProcAddress(kernel32_module, "GetFileInformationByHandleEx");
++    pSetFileInformationByHandle = (sSetFileInformationByHandle) GetProcAddress(kernel32_module, "SetFileInformationByHandle");
++    pGetNamedPipeClientProcessId = (sGetNamedPipeClientProcessId) GetProcAddress(kernel32_module, "GetNamedPipeClientProcessId");
++    pGetNamedPipeServerProcessId = (sGetNamedPipeServerProcessId) GetProcAddress(kernel32_module, "GetNamedPipeServerProcessId");
++    pCancelSynchronousIo = (sCancelSynchronousIo) GetProcAddress(kernel32_module, "CancelSynchronousIo");
++    pNeedCurrentDirectoryForExePathW = (sNeedCurrentDirectoryForExePathW) GetProcAddress(kernel32_module, "NeedCurrentDirectoryForExePathW");
++    pGetQueuedCompletionStatusEx = (sGetQueuedCompletionStatusEx) GetProcAddress(kernel32_module, "GetQueuedCompletionStatusEx");
++    if (pGetQueuedCompletionStatusEx == NULL) {
++      uv_fatal_error(GetLastError(), "GetQueuedCompletionStatusEx");
++    }
++    pCancelIoEx = (sCancelIoEx) GetProcAddress(kernel32_module, "CancelIoEx");
++    if (pCancelIoEx == NULL) {
++      uv_fatal_error(GetLastError(), "CancelIoEx");
++    }
++    pSetFileCompletionNotificationModes = (sSetFileCompletionNotificationModes) GetProcAddress(kernel32_module, "SetFileCompletionNotificationModes");
++    if (pSetFileCompletionNotificationModes == NULL) {
++      uv_fatal_error(GetLastError(), "SetFileCompletionNotificationModes");
++    }
++    pInitializeSRWLock = (sInitializeSRWLock) GetProcAddress(kernel32_module, "InitializeSRWLock");
++    if (pInitializeSRWLock == NULL) {
++      uv_fatal_error(GetLastError(), "InitializeSRWLock");
++    }
++    pAcquireSRWLockShared = (sAcquireSRWLockShared) GetProcAddress(kernel32_module, "AcquireSRWLockShared");
++    if (pAcquireSRWLockShared == NULL) {
++      uv_fatal_error(GetLastError(), "AcquireSRWLockShared");
++    }
++    pTryAcquireSRWLockShared = (sTryAcquireSRWLockShared) GetProcAddress(kernel32_module, "TryAcquireSRWLockShared");
++    if (pTryAcquireSRWLockShared == NULL) {
++      uv_fatal_error(GetLastError(), "TryAcquireSRWLockShared");
++    }
++    pReleaseSRWLockShared = (sReleaseSRWLockShared) GetProcAddress(kernel32_module, "ReleaseSRWLockShared");
++    if (pReleaseSRWLockShared == NULL) {
++      uv_fatal_error(GetLastError(), "ReleaseSRWLockShared");
++    }
++    pAcquireSRWLockExclusive = (sAcquireSRWLockExclusive) GetProcAddress(kernel32_module, "AcquireSRWLockExclusive");
++    if (pAcquireSRWLockExclusive == NULL) {
++      uv_fatal_error(GetLastError(), "AcquireSRWLockExclusive");
++    }
++    pTryAcquireSRWLockExclusive = (sTryAcquireSRWLockExclusive) GetProcAddress(kernel32_module, "TryAcquireSRWLockExclusive");
++    if (pTryAcquireSRWLockExclusive == NULL) {
++      uv_fatal_error(GetLastError(), "TryAcquireSRWLockExclusive");
++    }
++    pReleaseSRWLockExclusive = (sReleaseSRWLockExclusive) GetProcAddress(kernel32_module, "ReleaseSRWLockExclusive");
++    if (pReleaseSRWLockExclusive == NULL) {
++      uv_fatal_error(GetLastError(), "ReleaseSRWLockExclusive");
++    }
++    pInitializeConditionVariable = (sInitializeConditionVariable) GetProcAddress(kernel32_module, "InitializeConditionVariable");
++    if (pInitializeConditionVariable == NULL) {
++      uv_fatal_error(GetLastError(), "InitializeConditionVariable");
++    }
++    pWakeConditionVariable = (sWakeConditionVariable) GetProcAddress(kernel32_module, "WakeConditionVariable");
++    if (pWakeConditionVariable == NULL) {
++      uv_fatal_error(GetLastError(), "WakeConditionVariable");
++    }
++    pWakeAllConditionVariable = (sWakeAllConditionVariable) GetProcAddress(kernel32_module, "WakeAllConditionVariable");
++    if (pWakeAllConditionVariable == NULL) {
++      uv_fatal_error(GetLastError(), "WakeAllConditionVariable");
++    }
++    pSleepConditionVariableCS = (sSleepConditionVariableCS) GetProcAddress(kernel32_module, "SleepConditionVariableCS");
++    if (pSleepConditionVariableCS == NULL) {
++      uv_fatal_error(GetLastError(), "SleepConditionVariableCS");
++    }
++
++    /* Fallback pointers may stay NULL; callers test them. */
++    advapi32_module = GetModuleHandleA("advapi32.dll");
++    if (advapi32_module == NULL) {
++      advapi32_module = uv__load_system_library(L"advapi32.dll");
++    }
++    if (advapi32_module != NULL) {
++      pSystemFunction036 = (sSystemFunction036)
++          GetProcAddress(advapi32_module, "SystemFunction036");
++      pRegGetValueW = (sRegGetValueW)
++          GetProcAddress(advapi32_module, "RegGetValueW");
++    }
++
++    iphlpapi_module = GetModuleHandleA("iphlpapi.dll");
++    if (iphlpapi_module == NULL) {
++      iphlpapi_module = uv__load_system_library(L"iphlpapi.dll");
++    }
++    if (iphlpapi_module != NULL) {
++      pConvertInterfaceIndexToLuid = (sConvertInterfaceIndexToLuid)
++          GetProcAddress(iphlpapi_module, "ConvertInterfaceIndexToLuid");
++      pConvertInterfaceLuidToNameW = (sConvertInterfaceLuidToNameW)
++          GetProcAddress(iphlpapi_module, "ConvertInterfaceLuidToNameW");
++    }
++
++    shell32_module = GetModuleHandleA("shell32.dll");
++    if (shell32_module == NULL) {
++      shell32_module = uv__load_system_library(L"shell32.dll");
++    }
++    if (shell32_module != NULL) {
++      pSHGetKnownFolderPath = (sSHGetKnownFolderPath)
++          GetProcAddress(shell32_module, "SHGetKnownFolderPath");
++    }
++  }
++
++#if TAZ_FORCE_LEGACY
++  /* Behave as if the host were pre-Vista: no fallback-capable function
++   * resolves, so every fallback path runs. */
++  pGetTickCount64 = NULL;
++  pGetSystemTimePreciseAsFileTime = NULL;
++  pGetCurrentProcessorNumber = NULL;
++  pSystemFunction036 = NULL;
++  pRegGetValueW = NULL;
++  pCompareStringOrdinal = NULL;
++  pConvertInterfaceIndexToLuid = NULL;
++  pConvertInterfaceLuidToNameW = NULL;
++  pGetFinalPathNameByHandleW = NULL;
++  pReOpenFile = NULL;
++  pCreateSymbolicLinkW = NULL;
++  pGetFileInformationByHandleEx = NULL;
++  pSetFileInformationByHandle = NULL;
++  pSHGetKnownFolderPath = NULL;
++  pGetNamedPipeClientProcessId = NULL;
++  pGetNamedPipeServerProcessId = NULL;
++  pCancelSynchronousIo = NULL;
++  pNeedCurrentDirectoryForExePathW = NULL;
++#endif
++#endif
+ }
+diff --git a/src/win/winapi.h b/src/win/winapi.h
+index b9c9f1abc8899ee4c665df6cc9a91fc03d2f636d..e480dea3911851afd6bdaa5d755beb4667e9d66c 100644
+--- a/src/win/winapi.h
++++ b/src/win/winapi.h
+@@ -4828,4 +4828,107 @@ typedef int (WINAPI *uv_sGetHostNameW)
+              int);
+ extern uv_sGetHostNameW pGetHostNameW;
+ 
++#if TAZ_LEGACY_FALLBACKS
++/* Kernel32, advapi32, iphlpapi and shell32 functions newer than Windows XP,
++ * resolved at run time. The prototypes are declared here by hand. */
++typedef ULONGLONG (WINAPI *sGetTickCount64)
++    (VOID);
++typedef VOID (WINAPI *sGetSystemTimePreciseAsFileTime)
++    (LPFILETIME);
++typedef DWORD (WINAPI *sGetCurrentProcessorNumber)
++    (VOID);
++typedef BOOLEAN (WINAPI *sSystemFunction036)
++    (PVOID, ULONG);
++typedef LONG (WINAPI *sRegGetValueW)
++    (HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWORD, PVOID, LPDWORD);
++typedef int (WINAPI *sCompareStringOrdinal)
++    (LPCWSTR, int, LPCWSTR, int, BOOL);
++typedef ULONG (WINAPI *sConvertInterfaceIndexToLuid)
++    (ULONG, PVOID);
++typedef ULONG (WINAPI *sConvertInterfaceLuidToNameW)
++    (const VOID*, PWSTR, SIZE_T);
++typedef DWORD (WINAPI *sGetFinalPathNameByHandleW)
++    (HANDLE, LPWSTR, DWORD, DWORD);
++typedef HANDLE (WINAPI *sReOpenFile)
++    (HANDLE, DWORD, DWORD, DWORD);
++typedef BOOLEAN (WINAPI *sCreateSymbolicLinkW)
++    (LPCWSTR, LPCWSTR, DWORD);
++typedef BOOL (WINAPI *sGetFileInformationByHandleEx)
++    (HANDLE, int, LPVOID, DWORD);
++typedef BOOL (WINAPI *sSetFileInformationByHandle)
++    (HANDLE, int, LPVOID, DWORD);
++typedef HRESULT (WINAPI *sSHGetKnownFolderPath)
++    (const GUID*, DWORD, HANDLE, PWSTR*);
++typedef BOOL (WINAPI *sGetNamedPipeClientProcessId)
++    (HANDLE, PULONG);
++typedef BOOL (WINAPI *sGetNamedPipeServerProcessId)
++    (HANDLE, PULONG);
++typedef BOOL (WINAPI *sCancelSynchronousIo)
++    (HANDLE);
++typedef BOOL (WINAPI *sNeedCurrentDirectoryForExePathW)
++    (LPCWSTR);
++typedef BOOL (WINAPI *sGetQueuedCompletionStatusEx)
++    (HANDLE, LPOVERLAPPED_ENTRY, ULONG, PULONG, DWORD, BOOL);
++typedef BOOL (WINAPI *sCancelIoEx)
++    (HANDLE, LPOVERLAPPED);
++typedef BOOL (WINAPI *sSetFileCompletionNotificationModes)
++    (HANDLE, UCHAR);
++typedef VOID (WINAPI *sInitializeSRWLock)
++    (PSRWLOCK);
++typedef VOID (WINAPI *sAcquireSRWLockShared)
++    (PSRWLOCK);
++typedef BOOLEAN (WINAPI *sTryAcquireSRWLockShared)
++    (PSRWLOCK);
++typedef VOID (WINAPI *sReleaseSRWLockShared)
++    (PSRWLOCK);
++typedef VOID (WINAPI *sAcquireSRWLockExclusive)
++    (PSRWLOCK);
++typedef BOOLEAN (WINAPI *sTryAcquireSRWLockExclusive)
++    (PSRWLOCK);
++typedef VOID (WINAPI *sReleaseSRWLockExclusive)
++    (PSRWLOCK);
++typedef VOID (WINAPI *sInitializeConditionVariable)
++    (PCONDITION_VARIABLE);
++typedef VOID (WINAPI *sWakeConditionVariable)
++    (PCONDITION_VARIABLE);
++typedef VOID (WINAPI *sWakeAllConditionVariable)
++    (PCONDITION_VARIABLE);
++typedef BOOL (WINAPI *sSleepConditionVariableCS)
++    (PCONDITION_VARIABLE, PCRITICAL_SECTION, DWORD);
++typedef BOOL (WINAPI *sInitOnceExecuteOnce)
++    (PINIT_ONCE, PINIT_ONCE_FN, PVOID, LPVOID*);
++
++extern sGetTickCount64 pGetTickCount64;
++extern sGetSystemTimePreciseAsFileTime pGetSystemTimePreciseAsFileTime;
++extern sGetCurrentProcessorNumber pGetCurrentProcessorNumber;
++extern sSystemFunction036 pSystemFunction036;
++extern sRegGetValueW pRegGetValueW;
++extern sCompareStringOrdinal pCompareStringOrdinal;
++extern sConvertInterfaceIndexToLuid pConvertInterfaceIndexToLuid;
++extern sConvertInterfaceLuidToNameW pConvertInterfaceLuidToNameW;
++extern sGetFinalPathNameByHandleW pGetFinalPathNameByHandleW;
++extern sReOpenFile pReOpenFile;
++extern sCreateSymbolicLinkW pCreateSymbolicLinkW;
++extern sGetFileInformationByHandleEx pGetFileInformationByHandleEx;
++extern sSetFileInformationByHandle pSetFileInformationByHandle;
++extern sSHGetKnownFolderPath pSHGetKnownFolderPath;
++extern sGetNamedPipeClientProcessId pGetNamedPipeClientProcessId;
++extern sGetNamedPipeServerProcessId pGetNamedPipeServerProcessId;
++extern sCancelSynchronousIo pCancelSynchronousIo;
++extern sNeedCurrentDirectoryForExePathW pNeedCurrentDirectoryForExePathW;
++extern sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
++extern sCancelIoEx pCancelIoEx;
++extern sSetFileCompletionNotificationModes pSetFileCompletionNotificationModes;
++extern sInitializeSRWLock pInitializeSRWLock;
++extern sAcquireSRWLockShared pAcquireSRWLockShared;
++extern sTryAcquireSRWLockShared pTryAcquireSRWLockShared;
++extern sReleaseSRWLockShared pReleaseSRWLockShared;
++extern sAcquireSRWLockExclusive pAcquireSRWLockExclusive;
++extern sTryAcquireSRWLockExclusive pTryAcquireSRWLockExclusive;
++extern sReleaseSRWLockExclusive pReleaseSRWLockExclusive;
++extern sInitializeConditionVariable pInitializeConditionVariable;
++extern sWakeConditionVariable pWakeConditionVariable;
++extern sWakeAllConditionVariable pWakeAllConditionVariable;
++extern sSleepConditionVariableCS pSleepConditionVariableCS;
++#endif
+ #endif /* UV_WIN_WINAPI_H_ */

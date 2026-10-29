@@ -42,6 +42,17 @@ from conan.tools.scm import Version
 
 required_conan_version = ">=2"
 
+# Preprocessor definitions each option adds to libuv's own build. A plain
+# literal: `tools/dev.py libuv-test` reads it to build the same variants.
+TAZ_DEFINES: dict[str, dict[str, str]] = {
+    "legacy_fallbacks": {
+        "TAZ_LEGACY_FALLBACKS": "1",
+        # Maps K32GetProcessMemoryInfo to psapi.dll's XP-era export.
+        "PSAPI_VERSION": "1",
+    },
+    "force_legacy": {"TAZ_FORCE_LEGACY": "1"},
+}
+
 
 class LibuvConan(ConanFile):
     name = "libuv"
@@ -104,10 +115,9 @@ class LibuvConan(ConanFile):
         if Version(self.version) < "1.47.0":
             # CMake 4 support
             tc.cache_variables["CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
-        if self.options.legacy_fallbacks:
-            tc.preprocessor_definitions["TAZ_LEGACY_FALLBACKS"] = "1"
-        if self.options.force_legacy:
-            tc.preprocessor_definitions["TAZ_FORCE_LEGACY"] = "1"
+        for option, defines in TAZ_DEFINES.items():
+            if self.options.get_safe(option):
+                tc.preprocessor_definitions.update(defines)
         tc.generate()
 
     def build(self):

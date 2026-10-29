@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:35:00 +0000
+Subject: [PATCH] win: pipe and net fallbacks for pre-Vista
+
+Uses the run-time pointers from the first patch, compiled only when the
+legacy-fallbacks macro is set; upstream lines are unchanged.
+
+- uv_if_indextoname: ConvertInterfaceIndexToLuid or
+  ConvertInterfaceLuidToNameW absent -> UV_ENOSYS (as 17eaa956).
+- uv__pipe_get_ipc_remote_pid, uv_pipe_open: GetNamedPipe{Client,Server}
+  ProcessId absent -> own pid / uv_os_getppid() (as before 357d28a2).
+- uv__pipe_interrupt_read: CancelSynchronousIo absent -> skip the cancel
+  and the acknowledge spin; the blocked read completes on its own.
+- uv__pipe_getname: CancelSynchronousIo absent and a worker still blocked
+  in ReadFile -> UV_EBUSY, since NtQueryInformationFile on the synchronous
+  handle would wait for that read.
+---
+ src/win/getaddrinfo.c | 14 +++++++++++
+ src/win/pipe.c        | 57 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 71 insertions(+)
+
+diff --git a/src/win/getaddrinfo.c b/src/win/getaddrinfo.c
+index 4b8ee75a0622f6b138ea366c7f42306960b61b3d..202cecddfb965c980b1cf036dc09ea4dc5d4f665 100644
+--- a/src/win/getaddrinfo.c
++++ b/src/win/getaddrinfo.c
+@@ -354,12 +354,26 @@ int uv_if_indextoname(unsigned int ifindex, char* buffer, size_t* size) {
+   if (buffer == NULL || size == NULL || *size == 0)
+     return UV_EINVAL;
+ 
++#if TAZ_LEGACY_FALLBACKS
++  /* Absent before Vista; as in 17eaa956. */
++  uv__once_init();
++  if (pConvertInterfaceIndexToLuid == NULL ||
++      pConvertInterfaceLuidToNameW == NULL)
++    return UV_ENOSYS;
++
++  r = pConvertInterfaceIndexToLuid(ifindex, &luid);
++#else
+   r = ConvertInterfaceIndexToLuid(ifindex, &luid);
++#endif
+ 
+   if (r != 0)
+     return uv_translate_sys_error(r);
+ 
++#if TAZ_LEGACY_FALLBACKS
++  r = pConvertInterfaceLuidToNameW(&luid, wname, ARRAY_SIZE(wname));
++#else
+   r = ConvertInterfaceLuidToNameW(&luid, wname, ARRAY_SIZE(wname));
++#endif
+ 
+   if (r != 0)
+     return uv_translate_sys_error(r);
+diff --git a/src/win/pipe.c b/src/win/pipe.c
+index d05bfd28aec8b9e6abdbcd32fe1005e005e0b5a9..8c45f804d195fd6559a54cd7390adc2d96f01129 100644
+--- a/src/win/pipe.c
++++ b/src/win/pipe.c
+@@ -1020,6 +1020,12 @@ void uv__pipe_interrupt_read(uv_pipe_t* handle) {
+     EnterCriticalSection(&handle->pipe.conn.readfile_thread_lock);
+ 
+     thread = *thread_ptr;
++#if TAZ_LEGACY_FALLBACKS
++    if (thread != NULL && pCancelSynchronousIo == NULL) {
++      /* Absent before Vista: cannot interrupt the blocked ReadFile, and
++       * spinning would wait on it indefinitely. It completes on its own. */
++    } else
++#endif
+     if (thread == NULL) {
+       /* The thread pool thread has not yet reached the point of blocking, we
+        * can pre-empt it by setting thread_handle to INVALID_HANDLE_VALUE. */
+@@ -1029,7 +1035,11 @@ void uv__pipe_interrupt_read(uv_pipe_t* handle) {
+       /* Spin until the thread has acknowledged (by setting the thread to
+        * INVALID_HANDLE_VALUE) that it is past the point of blocking. */
+       while (thread != INVALID_HANDLE_VALUE) {
++#if TAZ_LEGACY_FALLBACKS
++        r = pCancelSynchronousIo(thread);
++#else
+         r = CancelSynchronousIo(thread);
++#endif
+         assert(r || GetLastError() == ERROR_NOT_FOUND);
+         SwitchToThread(); /* Yield thread. */
+         thread = *thread_ptr;
+@@ -1732,12 +1742,27 @@ static DWORD uv__pipe_get_ipc_remote_pid(uv_pipe_t* handle) {
+   /* If the both ends of the IPC pipe are owned by the same process,
+    * the remote end pid may not yet be set. If so, do it here.
+    * TODO: this is weird; it'd probably better to use a handshake. */
++#if TAZ_LEGACY_FALLBACKS
++  /* Absent before Vista: assume the same process, as before 357d28a2. */
++  if (*pid == 0) {
++    if (pGetNamedPipeClientProcessId != NULL &&
++        pGetNamedPipeServerProcessId != NULL) {
++      pGetNamedPipeClientProcessId(handle->handle, pid);
++      if (*pid == GetCurrentProcessId()) {
++        pGetNamedPipeServerProcessId(handle->handle, pid);
++      }
++    } else {
++      *pid = GetCurrentProcessId();
++    }
++  }
++#else
+   if (*pid == 0) {
+     GetNamedPipeClientProcessId(handle->handle, pid);
+     if (*pid == GetCurrentProcessId()) {
+       GetNamedPipeServerProcessId(handle->handle, pid);
+     }
+   }
++#endif
+ 
+   return *pid;
+ }
+@@ -2490,10 +2515,25 @@ int uv_pipe_open(uv_pipe_t* pipe, uv_file file) {
+ 
+   if (pipe->ipc) {
+     assert(!(pipe->flags & UV_HANDLE_NON_OVERLAPPED_PIPE));
++#if TAZ_LEGACY_FALLBACKS
++    if (pGetNamedPipeClientProcessId != NULL &&
++        pGetNamedPipeServerProcessId != NULL) {
++      pGetNamedPipeClientProcessId(os_handle,
++                                   &pipe->pipe.conn.ipc_remote_pid);
++      if (pipe->pipe.conn.ipc_remote_pid == GetCurrentProcessId()) {
++        pGetNamedPipeServerProcessId(os_handle,
++                                     &pipe->pipe.conn.ipc_remote_pid);
++      }
++    } else {
++      /* Absent before Vista: the parent, as before 357d28a2. */
++      pipe->pipe.conn.ipc_remote_pid = uv_os_getppid();
++    }
++#else
+     GetNamedPipeClientProcessId(os_handle, &pipe->pipe.conn.ipc_remote_pid);
+     if (pipe->pipe.conn.ipc_remote_pid == GetCurrentProcessId()) {
+       GetNamedPipeServerProcessId(os_handle, &pipe->pipe.conn.ipc_remote_pid);
+     }
++#endif
+     assert(pipe->pipe.conn.ipc_remote_pid != (DWORD)(uv_pid_t) -1);
+   }
+   return 0;
+@@ -2532,6 +2572,23 @@ static int uv__pipe_getname(const uv_pipe_t* handle, char* buffer, size_t* size)
+   if (handle->flags & UV_HANDLE_CONNECTION &&
+       handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE) {
+     uv__pipe_interrupt_read((uv_pipe_t*) handle); /* cast away const warning */
++#if TAZ_LEGACY_FALLBACKS
++    if (pCancelSynchronousIo == NULL) {
++      /* Absent before Vista: a worker still blocked in ReadFile was not
++       * interrupted, and the query would wait for it. Fail instead. */
++      CRITICAL_SECTION* lock =
++          (CRITICAL_SECTION*) &handle->pipe.conn.readfile_thread_lock;
++      HANDLE thread;
++
++      EnterCriticalSection(lock);
++      thread = handle->pipe.conn.readfile_thread_handle;
++      LeaveCriticalSection(lock);
++      if (thread != NULL && thread != INVALID_HANDLE_VALUE) {
++        *size = 0;
++        return UV_EBUSY;
++      }
++    }
++#endif
+   }
+ 
+   nt_status = pNtQueryInformationFile(handle->handle,

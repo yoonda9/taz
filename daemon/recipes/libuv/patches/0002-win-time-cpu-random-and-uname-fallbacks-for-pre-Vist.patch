@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:18:24 +0000
+Subject: [PATCH] win: time, cpu, random and uname fallbacks for pre-Vista
+
+Uses the run-time pointers from the previous patch, compiled only when
+the legacy-fallbacks macro is set; the upstream lines move verbatim into
+the #else branches.
+
+- uv_uptime: GetTickCount64 absent -> CurrentTime - BootTime from
+  NtQuerySystemInformation(SystemTimeOfDayInformation), which neither
+  wraps nor depends on how often uv_uptime is called.
+- uv_clock_gettime(REALTIME): GetSystemTimePreciseAsFileTime absent ->
+  GetSystemTimeAsFileTime; uv__once_init() first, since the pointers are
+  not resolved before it.
+- uv_thread_getcpu: GetCurrentProcessorNumber absent -> UV_ENOTSUP.
+- uv__random_rtlgenrandom: SystemFunction036 absent -> CryptGenRandom
+  on a verify-context provider; the extern declaration moves into the
+  #else branch.
+- uv_os_uname: RegGetValueW absent -> RegQueryValueExW with a REG_SZ
+  check and forced NUL termination.
+
+Sources: uv_uptime replaces the pre-d0e500c8 performance-counter code
+with the kernel's boot timestamp (pNtQuerySystemInformation is already
+resolved). The GetSystemTimeAsFileTime, ENOTSUP, CryptGenRandom and
+RegQueryValueExW paths are written fresh; upstream never carried them in
+this form.
+---
+ src/win/thread.c |   9 ++++
+ src/win/util.c   | 122 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 131 insertions(+)
+
+diff --git a/src/win/thread.c b/src/win/thread.c
+index e9e1f75356d785ed22d2dd78d03eb67c0e55b672..125ecbbe3bf26c24e9df547c2674b9e1d5a0dda2 100644
+--- a/src/win/thread.c
++++ b/src/win/thread.c
+@@ -265,9 +265,18 @@ int uv_thread_getaffinity(uv_thread_t* tid,
+   return 0;
+ }
+ 
++#if TAZ_LEGACY_FALLBACKS
++int uv_thread_getcpu(void) {
++  uv__once_init();
++  if (pGetCurrentProcessorNumber == NULL)
++    return UV_ENOTSUP;
++  return pGetCurrentProcessorNumber();
++}
++#else
+ int uv_thread_getcpu(void) {
+   return GetCurrentProcessorNumber();
+ }
++#endif
+ 
+ uv_thread_t uv_thread_self(void) {
+   uv_thread_t key;
+diff --git a/src/win/util.c b/src/win/util.c
+index 57061bf8d703fe9bfe08a108423a881b0bce4286..4e70d6e8601b77ece3c7797b340773b941fcd757 100644
+--- a/src/win/util.c
++++ b/src/win/util.c
+@@ -38,6 +38,9 @@
+ #include <psapi.h>
+ #include <tlhelp32.h>
+ #include <windows.h>
++#if TAZ_LEGACY_FALLBACKS
++#include <wincrypt.h>
++#endif
+ /* clang-format on */
+ #include <userenv.h>
+ #include <math.h>
+@@ -64,11 +67,24 @@
+ 
+ 
+ /* A RtlGenRandom() by any other name... */
++#if TAZ_LEGACY_FALLBACKS
++#else
+ extern BOOLEAN NTAPI SystemFunction036(PVOID Buffer, ULONG BufferLength);
++#endif
+ 
+ /* Cached copy of the process title, plus a mutex guarding it. */
+ static char *process_title;
+ static CRITICAL_SECTION process_title_lock;
++#if TAZ_LEGACY_FALLBACKS
++
++/* The leading fields of SystemTimeOfDayInformation (class 3), in 100 ns
++ * units. NtQuerySystemInformation accepts a buffer shorter than the full
++ * structure on every NT version and fills only what fits. */
++typedef struct {
++  LARGE_INTEGER BootTime;
++  LARGE_INTEGER CurrentTime;
++} uv__time_of_day_t;
++#endif
+ 
+ /* Frequency of the high-resolution clock. */
+ static uint64_t hrtime_frequency_ = 0;
+@@ -440,7 +456,15 @@ int uv_clock_gettime(uv_clock_id clock_id, uv_timespec64_t* ts) {
+       ts->tv_nsec = t % 1000000000;
+       return 0;
+     case UV_CLOCK_REALTIME:
++#if TAZ_LEGACY_FALLBACKS
++      uv__once_init();
++      if (pGetSystemTimePreciseAsFileTime != NULL)
++        pGetSystemTimePreciseAsFileTime(&ft);
++      else
++        GetSystemTimeAsFileTime(&ft);
++#else
+       GetSystemTimePreciseAsFileTime(&ft);
++#endif
+       /* In 100-nanosecond increments from 1601-01-01 UTC because why not? */
+       t = (int64_t) ft.dwHighDateTime << 32 | ft.dwLowDateTime;
+       /* Convert to UNIX epoch, 1970-01-01. Still in 100 ns increments. */
+@@ -499,10 +523,37 @@ int uv_resident_set_memory(size_t* rss) {
+ }
+ 
+ 
++#if TAZ_LEGACY_FALLBACKS
++int uv_uptime(double* uptime) {
++  uv__time_of_day_t info;
++  NTSTATUS status;
++
++  uv__once_init();
++  if (pGetTickCount64 != NULL) {
++    *uptime = pGetTickCount64() / 1000.0;
++    return 0;
++  }
++
++  /* GetTickCount wraps every 49.7 days, so take the time since boot from
++   * the kernel's boot timestamp instead. */
++  status = pNtQuerySystemInformation(3 /* SystemTimeOfDayInformation */,
++                                     &info,
++                                     sizeof(info),
++                                     NULL);
++  if (!NT_SUCCESS(status)) {
++    *uptime = 0;
++    return uv_translate_sys_error(pRtlNtStatusToDosError(status));
++  }
++
++  *uptime = (info.CurrentTime.QuadPart - info.BootTime.QuadPart) / 1e7;
++  return 0;
++}
++#else
+ int uv_uptime(double* uptime) {
+   *uptime = GetTickCount64() / 1000.0;
+   return 0;
+ }
++#endif
+ 
+ 
+ unsigned int uv_available_parallelism(void) {
+@@ -1592,6 +1643,34 @@ int uv_os_uname(uv_utsname_t* buffer) {
+ 
+   if (r == ERROR_SUCCESS) {
+     product_name_w_size = sizeof(product_name_w);
++#if TAZ_LEGACY_FALLBACKS
++    if (pRegGetValueW != NULL) {
++      r = pRegGetValueW(registry_key,
++                        NULL,
++                        L"ProductName",
++                        RRF_RT_REG_SZ,
++                        NULL,
++                        (PVOID) product_name_w,
++                        &product_name_w_size);
++    } else {
++      DWORD type;
++
++      /* Leave room for the terminator RegQueryValueExW does not promise. */
++      product_name_w_size = sizeof(product_name_w) - sizeof(WCHAR);
++      r = RegQueryValueExW(registry_key,
++                           L"ProductName",
++                           NULL,
++                           &type,
++                           (LPBYTE) product_name_w,
++                           &product_name_w_size);
++      if (r == ERROR_SUCCESS && type != REG_SZ)
++        r = ERROR_UNSUPPORTED_TYPE;
++      if (r == ERROR_SUCCESS) {
++        product_name_w[product_name_w_size / sizeof(WCHAR)] = L'\0';
++        product_name_w_size += sizeof(WCHAR);
++      }
++    }
++#else
+     r = RegGetValueW(registry_key,
+                      NULL,
+                      L"ProductName",
+@@ -1599,6 +1678,7 @@ int uv_os_uname(uv_utsname_t* buffer) {
+                      NULL,
+                      (PVOID) product_name_w,
+                      &product_name_w_size);
++#endif
+     RegCloseKey(registry_key);
+ 
+     if (r == ERROR_SUCCESS) {
+@@ -1735,6 +1815,47 @@ int uv_gettimeofday(uv_timeval64_t* tv) {
+   return 0;
+ }
+ 
++#if TAZ_LEGACY_FALLBACKS
++int uv__random_rtlgenrandom(void* buf, size_t buflen) {
++  HCRYPTPROV provider;
++  BYTE* p;
++  DWORD chunk;
++  int r;
++
++  if (buflen == 0)
++    return 0;
++
++  uv__once_init();
++  if (pSystemFunction036 != NULL) {
++    if (pSystemFunction036(buf, buflen) == FALSE)
++      return UV_EIO;
++    return 0;
++  }
++
++  if (!CryptAcquireContextW(&provider,
++                            NULL,
++                            NULL,
++                            PROV_RSA_FULL,
++                            CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
++    return UV_EIO;
++  }
++
++  r = 0;
++  p = buf;
++  while (buflen > 0) {
++    chunk = buflen > 0x10000000 ? 0x10000000 : (DWORD) buflen;
++    if (!CryptGenRandom(provider, chunk, p)) {
++      r = UV_EIO;
++      break;
++    }
++    p += chunk;
++    buflen -= chunk;
++  }
++
++  CryptReleaseContext(provider, 0);
++  return r;
++}
++#else
+ int uv__random_rtlgenrandom(void* buf, size_t buflen) {
+   if (buflen == 0)
+     return 0;
+@@ -1744,6 +1865,7 @@ int uv__random_rtlgenrandom(void* buf, size_t buflen) {
+ 
+   return 0;
+ }
++#endif
+ 
+ void uv_sleep(unsigned int msec) {
+   Sleep(msec);
