@@ -481,7 +481,14 @@ def host_profiles_for(preset: str) -> list[str]:
         name = "linux-musl" if arch == DEFAULT_MUSL_ARCH else f"linux-musl-{arch}"
         return [str(PROFILES_DIR / name)]
     if preset.startswith("windows-"):
-        return ["default", str(PROFILES_DIR / "windows-static")]
+        chain = ["default", str(PROFILES_DIR / "windows-static")]
+        # Composed after windows-static so its legacy_fallbacks=False pin flips.
+        # The forced prefix is checked first; neither is a prefix of the other.
+        if preset.startswith("windows-forced-legacy-"):
+            chain.append(str(PROFILES_DIR / "windows-forced-legacy"))
+        elif preset.startswith("windows-legacy-"):
+            chain.append(str(PROFILES_DIR / "windows-legacy"))
+        return chain
     if preset.startswith("linux-fuzz") or preset.startswith("linux-clang"):
         return [
             "clang",

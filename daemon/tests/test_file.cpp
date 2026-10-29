@@ -233,9 +233,9 @@ TEST_F(FileHandlerTest, SymlinkReportsKindSymlinkAndTarget)
                                  link.c_str(), 0, nullptr);
     uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-    if (rc == UV_EPERM || rc == UV_EACCES)
+    if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
     {
-        GTEST_SKIP() << "no symlink privilege on this Windows host";
+        GTEST_SKIP() << "symlinks unavailable on this Windows host";
     }
 #endif
     ASSERT_EQ(rc, 0);
@@ -668,9 +668,9 @@ TEST_F(FileHandlerTest, DeleteSymlinkRemovesLinkNotTarget)
                                  link.c_str(), 0, nullptr);
     uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-    if (rc == UV_EPERM || rc == UV_EACCES)
+    if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
     {
-        GTEST_SKIP() << "no symlink privilege on this Windows host";
+        GTEST_SKIP() << "symlinks unavailable on this Windows host";
     }
 #endif
     ASSERT_EQ(rc, 0);

@@ -125,6 +125,20 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
     },
     {
+      "name": "windows-legacy-debug",
+      "displayName": "Windows Debug (static CRT, libuv legacy_fallbacks)",
+      "description": "tazd against libuv built with legacy_fallbacks=True",
+      "inherits": "windows-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "windows-forced-legacy-debug",
+      "displayName": "Windows Debug (static CRT, libuv legacy_fallbacks + force_legacy)",
+      "description": "tazd against libuv built with legacy_fallbacks=True and force_legacy=True",
+      "inherits": "windows-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
       "name": "windows-release",
       "displayName": "Windows Release (static CRT)",
       "inherits": "windows-base",
@@ -185,6 +199,14 @@
     { "name": "linux-tsan", "configurePreset": "linux-tsan" },
     { "name": "linux-fuzz", "configurePreset": "linux-fuzz" },
     { "name": "windows-debug", "configurePreset": "windows-debug" },
+    {
+      "name": "windows-legacy-debug",
+      "configurePreset": "windows-legacy-debug"
+    },
+    {
+      "name": "windows-forced-legacy-debug",
+      "configurePreset": "windows-forced-legacy-debug"
+    },
     { "name": "windows-release", "configurePreset": "windows-release" },
     { "name": "windows-asan", "configurePreset": "windows-asan" }
   ],
@@ -244,6 +266,16 @@
     {
       "name": "windows-debug",
       "configurePreset": "windows-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-legacy-debug",
+      "configurePreset": "windows-legacy-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-forced-legacy-debug",
+      "configurePreset": "windows-forced-legacy-debug",
       "output": { "outputOnFailure": true }
     },
     {

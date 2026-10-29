@@ -1,0 +1,6 @@
+# Partial Conan host profile: windows-legacy plus force_legacy, which NULLs the
+# lookups that have a fallback so Windows 10+ runs the fallback code.
+# Composed AFTER windows-static. Used by windows-forced-legacy-debug only.
+[options]
+libuv/*:legacy_fallbacks=True
+libuv/*:force_legacy=True

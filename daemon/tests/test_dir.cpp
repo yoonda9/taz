@@ -328,9 +328,9 @@ TEST_F(FileHandlerTest, DirMakeWithParentsThroughSymlinkedDirSucceeds)
                                  link_path.c_str(), UV_FS_SYMLINK_DIR, nullptr);
     uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-    if (rc == UV_EPERM || rc == UV_EACCES)
+    if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
     {
-        GTEST_SKIP() << "no symlink privilege on this Windows host";
+        GTEST_SKIP() << "symlinks unavailable on this Windows host";
     }
 #endif
     ASSERT_EQ(rc, 0);
@@ -372,9 +372,9 @@ TEST_F(FileHandlerTest, DirMakeWithParentsOnExistingSymlinkedDirSucceeds)
                                  link_path.c_str(), UV_FS_SYMLINK_DIR, nullptr);
     uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-    if (rc == UV_EPERM || rc == UV_EACCES)
+    if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
     {
-        GTEST_SKIP() << "no symlink privilege on this Windows host";
+        GTEST_SKIP() << "symlinks unavailable on this Windows host";
     }
 #endif
     ASSERT_EQ(rc, 0);
@@ -516,7 +516,7 @@ TEST_F(FileHandlerTest, DirListReturnsEntriesWithKindsAndSizes)
                                      JoinDir("link").c_str(), 0, nullptr);
         uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-        if (rc == UV_EPERM || rc == UV_EACCES)
+        if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
         {
             have_symlink = false;
         }
@@ -588,9 +588,9 @@ TEST_F(FileHandlerTest, DirListOfSymlinkToDirectoryListsTargetEntries)
                                  link_path.c_str(), UV_FS_SYMLINK_DIR, nullptr);
     uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-    if (rc == UV_EPERM || rc == UV_EACCES)
+    if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
     {
-        GTEST_SKIP() << "no symlink privilege on this Windows host";
+        GTEST_SKIP() << "symlinks unavailable on this Windows host";
     }
 #endif
     ASSERT_EQ(rc, 0);
@@ -623,9 +623,9 @@ TEST_F(FileHandlerTest, DirListOfDanglingSymlinkReturnsNotFound)
                                  link_path.c_str(), 0, nullptr);
     uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-    if (rc == UV_EPERM || rc == UV_EACCES)
+    if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
     {
-        GTEST_SKIP() << "no symlink privilege on this Windows host";
+        GTEST_SKIP() << "symlinks unavailable on this Windows host";
     }
 #endif
     ASSERT_EQ(rc, 0);
@@ -980,7 +980,7 @@ TEST_F(FileHandlerTest,
                                      UV_FS_SYMLINK_DIR, nullptr);
         uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-        if (rc == UV_EPERM || rc == UV_EACCES)
+        if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
         {
             have_symlink = false;
         }
@@ -1043,9 +1043,9 @@ TEST_F(FileHandlerTest,
                                  UV_FS_SYMLINK_DIR, nullptr);
     uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-    if (rc == UV_EPERM || rc == UV_EACCES)
+    if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
     {
-        GTEST_SKIP() << "no symlink privilege on this Windows host";
+        GTEST_SKIP() << "symlinks unavailable on this Windows host";
     }
 #endif
     ASSERT_EQ(rc, 0);
@@ -1084,9 +1084,9 @@ TEST_F(FileHandlerTest, DirRemoveRecursiveOnSymlinkToDirLeavesTargetUntouched)
                                  UV_FS_SYMLINK_DIR, nullptr);
     uv_fs_req_cleanup(&symlink_req);
 #ifdef _WIN32
-    if (rc == UV_EPERM || rc == UV_EACCES)
+    if (rc == UV_EPERM || rc == UV_EACCES || rc == UV_ENOTSUP)
     {
-        GTEST_SKIP() << "no symlink privilege on this Windows host";
+        GTEST_SKIP() << "symlinks unavailable on this Windows host";
     }
 #endif
     ASSERT_EQ(rc, 0);

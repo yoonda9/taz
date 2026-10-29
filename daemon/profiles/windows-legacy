@@ -1,0 +1,5 @@
+# Partial Conan host profile: libuv with the XP load-time fallbacks on.
+# Composed AFTER windows-static so the legacy_fallbacks=False pin it sets
+# visibly flips here. Used by the windows-legacy-debug preset only.
+[options]
+libuv/*:legacy_fallbacks=True

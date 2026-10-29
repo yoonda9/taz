@@ -265,6 +265,53 @@ def test_host_profiles_for_existing_presets_unchanged() -> None:
     ]
 
 
+def test_host_profiles_for_legacy_presets_compose_after_windows_static() -> None:
+    profiles_dir = dev.PROFILES_DIR
+    assert dev.host_profiles_for("windows-legacy-debug") == [
+        "default",
+        str(profiles_dir / "windows-static"),
+        str(profiles_dir / "windows-legacy"),
+    ]
+    assert dev.host_profiles_for("windows-forced-legacy-debug") == [
+        "default",
+        str(profiles_dir / "windows-static"),
+        str(profiles_dir / "windows-forced-legacy"),
+    ]
+
+
+def _profile_options(name: str) -> list[str]:
+    lines = (dev.PROFILES_DIR / name).read_text().splitlines()
+    options: list[str] = []
+    in_options = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_options = stripped == "[options]"
+        elif in_options and stripped and not stripped.startswith("#"):
+            options.append(stripped)
+    return options
+
+
+def test_legacy_profiles_set_the_libuv_options() -> None:
+    assert _profile_options("windows-legacy") == ["libuv/*:legacy_fallbacks=True"]
+    assert _profile_options("windows-forced-legacy") == [
+        "libuv/*:legacy_fallbacks=True",
+        "libuv/*:force_legacy=True",
+    ]
+    assert "libuv/*:legacy_fallbacks=False" in _profile_options("windows-static")
+
+
+def test_cmake_presets_list_the_legacy_presets_in_every_section() -> None:
+    presets = json.loads((dev.PROFILES_DIR.parent / "CMakePresets.json").read_text())
+    for section in ("configurePresets", "buildPresets", "testPresets"):
+        names = {p["name"] for p in presets[section]}
+        assert {"windows-legacy-debug", "windows-forced-legacy-debug"} <= names
+    configure = {p["name"]: p for p in presets["configurePresets"]}
+    for name in ("windows-legacy-debug", "windows-forced-legacy-debug"):
+        assert configure[name]["inherits"] == "windows-base"
+        assert configure[name]["cacheVariables"] == {"CMAKE_BUILD_TYPE": "Debug"}
+
+
 def test_host_profiles_for_musl_is_a_standalone_complete_profile() -> None:
     assert dev.host_profiles_for("linux-musl-release") == [
         str(dev.PROFILES_DIR / "linux-musl")
