@@ -298,7 +298,7 @@ index 27605ca36f44348a6c2f24adce93d9d9b3e8b6da..282b2c2a08ef70e0104ad71694763b2c
          SymSetOptions(sym_options);
          CloseHandle(hDumpFile);
 diff --git a/src/win/winapi.c b/src/win/winapi.c
-index 62cd1b2c025bd206660640a93fda69f9c206053e..8671b93e9fe81c99fbcf247c057b22bdcc382d0b 100644
+index ceb88debf9084638c3610640150ec8e26ba07628..aaf6a174891fbc8bbf632aa9d086811bd573f929 100644
 --- a/src/win/winapi.c
 +++ b/src/win/winapi.c
 @@ -81,6 +81,7 @@ sInitializeConditionVariable pInitializeConditionVariable;

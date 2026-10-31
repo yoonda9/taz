@@ -1369,6 +1369,12 @@ LIBUV_TEST_ACCEPTED: dict[tuple[str, str], frozenset[str]] = {
             "pipe_getsockname_blocking",
             # GetCurrentProcessorNumber is absent: uv_thread_getcpu is ENOTSUP
             "thread_affinity",
+            # SetFileCompletionNotificationModes is absent: the UDP send
+            # completes through the port instead of inline, the receive of
+            # the same datagram completes first, and the test closes the
+            # handle in both callbacks (handle.c:71, `assert(0)` on a closing
+            # handle); it fails the same way with only that function missing
+            "udp_open",
         }
     ),
 }

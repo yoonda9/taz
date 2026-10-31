@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:29:42 +0000
+Subject: [PATCH] win: skip SetFileCompletionNotificationModes when it is
+ missing
+
+Without the function (before Vista) the TCP and UDP sockets leave
+UV_HANDLE_SYNC_BYPASS_IOCP clear, as libuv did before a7493d8a (v1.21),
+so every completion goes through the port. The UDP socket keeps the
+WSARecv/WSARecvFrom defaults instead of the uv__wsarecv*_workaround
+pair. UV_SUCCEEDED_WITHOUT_IOCP is the only reader of the flag, and the
+clear-flag path is the one non-IFS LSPs and EMULATE_IOCP handles already
+take. With the function present the behaviour is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ src/win/tcp.c | 7 +++++++
+ src/win/udp.c | 7 +++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/src/win/tcp.c b/src/win/tcp.c
+index 2cb00753168b56319f7dbd1db91eb28914889e65..ecb86ba4137d4214f09cd530daa02f34d740ff2f 100644
+--- a/src/win/tcp.c
++++ b/src/win/tcp.c
+@@ -116,7 +116,14 @@ static int uv__tcp_set_socket(uv_loop_t* loop,
+     non_ifs_lsp = uv_tcp_non_ifs_lsp_ipv4;
+   }
+ 
++#if TAZ_LEGACY_FALLBACKS
++  /* Without SetFileCompletionNotificationModes the bypass flag stays clear and
++   * every completion goes through the port, as for a non-IFS LSP. */
++  if (!(handle->flags & UV_HANDLE_EMULATE_IOCP) && !non_ifs_lsp &&
++      pSetFileCompletionNotificationModes != NULL) {
++#else
+   if (!(handle->flags & UV_HANDLE_EMULATE_IOCP) && !non_ifs_lsp) {
++#endif
+     UCHAR sfcnm_flags =
+         FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+ #if TAZ_LEGACY_FALLBACKS
+diff --git a/src/win/udp.c b/src/win/udp.c
+index e3b02bd179eeaad3d46911c5a642a0fca450fd1a..0a4f5c3a1ee63a15d2bb6e1e8c58e7c8da94adb0 100644
+--- a/src/win/udp.c
++++ b/src/win/udp.c
+@@ -95,7 +95,14 @@ static int uv__udp_set_socket(uv_loop_t* loop, uv_udp_t* handle, SOCKET socket,
+     return GetLastError();
+   }
+ 
++#if TAZ_LEGACY_FALLBACKS
++  /* Without SetFileCompletionNotificationModes the bypass flag stays clear and
++   * the receive functions keep their WSARecv defaults. */
++  if (info.ProtocolChain.ChainLen == 1 &&
++      pSetFileCompletionNotificationModes != NULL) {
++#else
+   if (info.ProtocolChain.ChainLen == 1) {
++#endif
+ #if TAZ_LEGACY_FALLBACKS
+     if (pSetFileCompletionNotificationModes(
+ #else

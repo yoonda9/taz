@@ -1,18 +1,19 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: David Yoon <5332544+yoonda9@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 17:41:41 +0000
-Subject: [PATCH] win: lookup-only wiring for I/O, SRW and condvar calls
+Subject: [PATCH] win: route I/O, SRW and condvar calls through run-time
+ pointers
 
-Routes the functions that have no fallback yet through the run-time
-pointers added in the lookup patch: GetQueuedCompletionStatusEx in
-uv__poll, CancelIoEx in tcp.c and pipe.c,
-SetFileCompletionNotificationModes in tcp.c and udp.c, the seven SRW
-lock functions and the condition-variable functions in thread.c.
-uv_rwlock_init and uv_cond_init call uv__once_init first because they
-are usable before any loop exists. The pointers are fatal-at-init when
-missing, so no call goes through NULL. Behaviour is unchanged where
-they resolve. Fallbacks follow in later steps (I/O path, sync
-primitives); this is the mechanism of a7493d8a run in reverse.
+Routes GetQueuedCompletionStatusEx in uv__poll, CancelIoEx in tcp.c and
+pipe.c, SetFileCompletionNotificationModes in tcp.c and udp.c, the seven
+SRW lock functions and the condition-variable functions in thread.c
+through the run-time pointers added in the lookup patch. uv_rwlock_init
+and uv_cond_init call uv__once_init first because they are usable before
+any loop exists. The SRW and condition-variable pointers are
+fatal-at-init when missing, so no call goes through NULL; the three I/O
+pointers may be NULL, and the patches that follow add their fallbacks,
+each guarding the call. Behaviour is unchanged where they resolve. This
+is the mechanism of a7493d8a run in reverse.
 ---
  src/win/core.c   |  4 ++++
  src/win/pipe.c   |  8 ++++++++

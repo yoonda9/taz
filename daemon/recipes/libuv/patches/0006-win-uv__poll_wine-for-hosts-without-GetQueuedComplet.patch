@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:29:42 +0000
+Subject: [PATCH] win: uv__poll_wine for hosts without
+ GetQueuedCompletionStatusEx
+
+Resurrects uv__poll_wine from libuv v1.49.2 (src/win/core.c, removed by
+6af08fb5 in v1.50.0) behind the legacy guard, reshaped to the semantics
+of v1.51.0's uv__poll: a dequeued packet is detected by a non-NULL
+overlapped before the BOOL (a failed I/O completion returns FALSE with
+the I/O error), events_waiting is counted as in uv__poll, and an empty
+wake packet does not read a stale GetLastError. After one blocking
+GetQueuedCompletionStatus it takes the packets already queued, up to
+uv__poll's batch of 128 and skipping wake packets as uv__poll does, so
+one round's requests are processed together and in queue order. One
+packet per round, as in v1.49.2, ran close callbacks ahead of the write
+callbacks queued behind them (tcp_close_reset_accepted*). uv_run
+dispatches on pGetQueuedCompletionStatusEx as v1.49.2 did.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ src/win/core.c | 116 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 116 insertions(+)
+
+diff --git a/src/win/core.c b/src/win/core.c
+index 4ff67905a062670db4c4f805f9ec17d1676619ed..0e44e5678ce2f7fbdf76a61b8ea624419c496559 100644
+--- a/src/win/core.c
++++ b/src/win/core.c
+@@ -423,6 +423,115 @@ int uv_backend_timeout(const uv_loop_t* loop) {
+ }
+ 
+ 
++#if TAZ_LEGACY_FALLBACKS
++/* For hosts without GetQueuedCompletionStatusEx (before Vista): after
++ * uv__poll_wine in libuv v1.49.2, with the semantics of uv__poll below and its
++ * batch: one blocking GetQueuedCompletionStatus, then the packets already
++ * queued. A failed I/O completion makes GetQueuedCompletionStatus return FALSE
++ * with a non-NULL overlapped and the I/O error in GetLastError(); it is still
++ * a dequeued packet, so overlapped is tested before the result. */
++static void uv__poll_wine(uv_loop_t* loop, DWORD timeout) {
++  uv__loop_internal_fields_t* lfields;
++  BOOL success;
++  DWORD bytes;
++  ULONG_PTR key;
++  OVERLAPPED* overlapped;
++  uv_req_t* req;
++  int repeat;
++  int i;
++  uint64_t timeout_time;
++  uint64_t user_timeout;
++  uint64_t actual_timeout;
++  int reset_timeout;
++
++  lfields = uv__get_internal_fields(loop);
++  timeout_time = loop->time + timeout;
++
++  if (lfields->flags & UV_METRICS_IDLE_TIME) {
++    reset_timeout = 1;
++    user_timeout = timeout;
++    timeout = 0;
++  } else {
++    reset_timeout = 0;
++  }
++
++  for (repeat = 0; ; repeat++) {
++    actual_timeout = timeout;
++
++    if (timeout != 0)
++      uv__metrics_set_provider_entry_time(loop);
++
++    lfields->current_timeout = timeout;
++
++    overlapped = NULL;
++    success = GetQueuedCompletionStatus(loop->iocp,
++                                        &bytes,
++                                        &key,
++                                        &overlapped,
++                                        timeout);
++
++    if (reset_timeout != 0) {
++      timeout = user_timeout;
++      reset_timeout = 0;
++    }
++
++    uv__metrics_update_idle_time(loop);
++
++    if (overlapped != NULL || success) {
++      /* Take what is already queued too, up to the batch of uv__poll, so that
++       * the requests of one round are processed together and in queue order.
++       */
++      for (i = 0; i < 128; i++) {
++        if (i > 0) {
++          overlapped = NULL;
++          success = GetQueuedCompletionStatus(loop->iocp,
++                                              &bytes,
++                                              &key,
++                                              &overlapped,
++                                              0);
++          if (overlapped == NULL && !success)
++            break;
++        }
++
++        /* Package was dequeued, successful or not, but see if it is not an
++         * empty package meant only to wake us up.
++         */
++        if (overlapped != NULL) {
++          uv__metrics_inc_events(loop, 1);
++          if (actual_timeout == 0)
++            uv__metrics_inc_events_waiting(loop, 1);
++
++          req = uv__overlapped_to_req(overlapped);
++          uv__insert_pending_req(loop, req);
++        }
++      }
++
++      /* Some time might have passed waiting for I/O,
++       * so update the loop time here.
++       */
++      uv_update_time(loop);
++    } else if (GetLastError() != WAIT_TIMEOUT) {
++      /* Serious error */
++      uv_fatal_error(GetLastError(), "GetQueuedCompletionStatus");
++    } else if (timeout > 0) {
++      /* GetQueuedCompletionStatus can occasionally return a little early.
++       * Make sure that the desired timeout target time is reached.
++       */
++      uv_update_time(loop);
++      if (timeout_time > loop->time) {
++        timeout = (DWORD)(timeout_time - loop->time);
++        /* Increase the timeout exponentially starting on the third round so
++         * that a busy loop cannot happen, as in uv__poll.
++         */
++        timeout += repeat ? (1 << (repeat - 1)) : 0;
++        continue;
++      }
++    }
++    break;
++  }
++}
++
++#endif
+ static void uv__poll(uv_loop_t* loop, DWORD timeout) {
+   uv__loop_internal_fields_t* lfields;
+   BOOL success;
+@@ -560,7 +669,14 @@ int uv_run(uv_loop_t *loop, uv_run_mode mode) {
+ 
+     uv__metrics_inc_loop_count(loop);
+ 
++#if TAZ_LEGACY_FALLBACKS
++    if (pGetQueuedCompletionStatusEx != NULL)
++      uv__poll(loop, timeout);
++    else
++      uv__poll_wine(loop, timeout);
++#else
+     uv__poll(loop, timeout);
++#endif
+ 
+     /* Process immediate callbacks (e.g. write_cb) a small fixed number of
+      * times to avoid loop starvation.*/

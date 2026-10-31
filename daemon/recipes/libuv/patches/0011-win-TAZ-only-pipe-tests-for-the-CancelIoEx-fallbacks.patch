@@ -1,0 +1,419 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:29:42 +0000
+Subject: [PATCH] win: TAZ-only pipe tests for the CancelIoEx fallbacks
+
+Four tests in test/test-pipe-connect-multiple.c, registered in
+test-list.h, all under the legacy guard so they vanish from the neutral
+tree:
+- taz_pipe_read_exact_fill: a read that exactly fills the buffer is
+  delivered whole, then EOF, and in the forced build no zero read.
+- taz_pipe_close_read_pending: uv_close cancels a pending read while a
+  duplicate handle keeps the pipe open, so closing cannot abort it.
+- taz_pipe_read_stop_write_pending: uv_read_stop with a write pending
+  does not cancel the write, and a later uv_close completes with a
+  duplicate handle open.
+- taz_pipe_shutdown_after_read_stop: a uv_shutdown after that
+  uv_read_stop does not report EOF to the stopped reader (Windows only:
+  elsewhere a pipe's uv_shutdown sends EOF at once).
+
+Existing tests drive the other fallback paths in the forced build: a
+failed I/O packet in tcp_close_reset_client* and
+tcp_close_reset_accepted* (the reset completes the pending read with an
+error), and a TCP close with only a read pending in
+tcp_close_after_read_timeout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ test/test-list.h                  |  12 +
+ test/test-pipe-connect-multiple.c | 349 ++++++++++++++++++++++++++++++
+ 2 files changed, 361 insertions(+)
+
+diff --git a/test/test-list.h b/test/test-list.h
+index 0dea544699d75fcf11d4a8b6a7f0d5f4242f892a..397f18b712821d24f27dafe8d7f1bd403e0b9c96 100644
+--- a/test/test-list.h
++++ b/test/test-list.h
+@@ -203,6 +203,12 @@ TEST_DECLARE   (pipe_bind_error_addrnotavail)
+ TEST_DECLARE   (pipe_bind_error_inval)
+ TEST_DECLARE   (pipe_connect_close_multiple)
+ TEST_DECLARE   (pipe_connect_multiple)
++#if TAZ_LEGACY_FALLBACKS
++TEST_DECLARE   (taz_pipe_read_exact_fill)
++TEST_DECLARE   (taz_pipe_close_read_pending)
++TEST_DECLARE   (taz_pipe_read_stop_write_pending)
++TEST_DECLARE   (taz_pipe_shutdown_after_read_stop)
++#endif
+ TEST_DECLARE   (pipe_listen_without_bind)
+ TEST_DECLARE   (pipe_bind_or_listen_error_after_close)
+ TEST_DECLARE   (pipe_overlong_path)
+@@ -835,6 +841,12 @@ TASK_LIST_START
+   TEST_ENTRY  (pipe_bind_error_inval)
+   TEST_ENTRY  (pipe_connect_close_multiple)
+   TEST_ENTRY  (pipe_connect_multiple)
++#if TAZ_LEGACY_FALLBACKS
++  TEST_ENTRY  (taz_pipe_read_exact_fill)
++  TEST_ENTRY  (taz_pipe_close_read_pending)
++  TEST_ENTRY  (taz_pipe_read_stop_write_pending)
++  TEST_ENTRY  (taz_pipe_shutdown_after_read_stop)
++#endif
+   TEST_ENTRY  (pipe_listen_without_bind)
+   TEST_ENTRY  (pipe_bind_or_listen_error_after_close)
+   TEST_ENTRY  (pipe_overlong_path)
+diff --git a/test/test-pipe-connect-multiple.c b/test/test-pipe-connect-multiple.c
+index 69a09ec6cddad99cbdb1d90d67b2e6049cf8498b..cf5a64e1775a255501568a29cd448df6951a292f 100644
+--- a/test/test-pipe-connect-multiple.c
++++ b/test/test-pipe-connect-multiple.c
+@@ -176,3 +176,352 @@ TEST_IMPL(pipe_connect_close_multiple) {
+   MAKE_VALGRIND_HAPPY(loop);
+   return 0;
+ }
++#if TAZ_LEGACY_FALLBACKS
++
++/* Pipe tests for the fallbacks that stand in for CancelIoEx. */
++
++#define TAZ_FILL_SIZE 4096
++#define TAZ_BIG_SIZE (1024 * 1024)
++
++static uv_pipe_t taz_server;
++static uv_pipe_t taz_peer;
++static uv_pipe_t taz_client;
++static uv_connect_t taz_connect_req;
++static uv_write_t taz_write_req;
++static uv_shutdown_t taz_shutdown_req;
++static uv_timer_t taz_timer;
++static char taz_fill_storage[TAZ_FILL_SIZE];
++static char taz_chunk_storage[65536];
++static char taz_big[TAZ_BIG_SIZE];
++static size_t taz_read_total;
++static int taz_zero_reads;
++static int taz_eof_seen;
++static int taz_write_cb_called;
++static int taz_shutdown_cb_called;
++static int taz_peer_read_cb_called;
++static int taz_peer_close_cb_called;
++#ifdef _WIN32
++static HANDLE taz_peer_dup;
++#endif
++
++
++static void taz_init(void) {
++  taz_read_total = 0;
++  taz_zero_reads = 0;
++  taz_eof_seen = 0;
++  taz_write_cb_called = 0;
++  taz_shutdown_cb_called = 0;
++  taz_peer_read_cb_called = 0;
++  taz_peer_close_cb_called = 0;
++}
++
++
++static void taz_alloc_fill_cb(uv_handle_t* handle,
++                              size_t suggested_size,
++                              uv_buf_t* buf) {
++  *buf = uv_buf_init(taz_fill_storage, sizeof(taz_fill_storage));
++}
++
++
++static void taz_alloc_chunk_cb(uv_handle_t* handle,
++                               size_t suggested_size,
++                               uv_buf_t* buf) {
++  *buf = uv_buf_init(taz_chunk_storage, sizeof(taz_chunk_storage));
++}
++
++
++static void taz_read_cb(uv_stream_t* stream,
++                        ssize_t nread,
++                        const uv_buf_t* buf) {
++  if (nread > 0) {
++    taz_read_total += nread;
++    return;
++  }
++  if (nread == 0) {
++    taz_zero_reads++;
++    return;
++  }
++  ASSERT_EQ(nread, UV_EOF);
++  taz_eof_seen = 1;
++  if (!uv_is_closing((uv_handle_t*) &taz_server))
++    uv_close((uv_handle_t*) &taz_server, NULL);
++  if (!uv_is_closing((uv_handle_t*) &taz_peer))
++    uv_close((uv_handle_t*) &taz_peer, NULL);
++  if (!uv_is_closing((uv_handle_t*) &taz_client))
++    uv_close((uv_handle_t*) &taz_client, NULL);
++}
++
++
++/* The peer's reads never get data: the client does not write. */
++static void taz_peer_read_cb(uv_stream_t* stream,
++                             ssize_t nread,
++                             const uv_buf_t* buf) {
++  taz_peer_read_cb_called++;
++}
++
++
++static void taz_peer_close_cb(uv_handle_t* handle) {
++  taz_peer_close_cb_called++;
++#ifdef _WIN32
++  ASSERT(CloseHandle(taz_peer_dup));
++#endif
++}
++
++
++/* Closes the peer while a duplicate of its handle keeps its end of the pipe
++ * open, so that closing the handle cannot abort a read that uv_close failed to
++ * cancel. The client reads EOF once the duplicate is closed as well. */
++static void taz_close_peer_cb(uv_timer_t* timer) {
++#ifdef _WIN32
++  uv_os_fd_t fd;
++
++  ASSERT_OK(uv_fileno((uv_handle_t*) &taz_peer, &fd));
++  ASSERT(DuplicateHandle(GetCurrentProcess(),
++                         fd,
++                         GetCurrentProcess(),
++                         &taz_peer_dup,
++                         0,
++                         FALSE,
++                         DUPLICATE_SAME_ACCESS));
++#endif
++  uv_close((uv_handle_t*) &taz_peer, taz_peer_close_cb);
++}
++
++
++static void taz_connect_cb(uv_connect_t* req, int status) {
++  ASSERT_OK(status);
++}
++
++
++static void taz_reading_connect_cb(uv_connect_t* req, int status) {
++  ASSERT_OK(status);
++  ASSERT_OK(uv_read_start((uv_stream_t*) &taz_client,
++                          taz_alloc_chunk_cb,
++                          taz_read_cb));
++}
++
++
++static void taz_exact_fill_write_cb(uv_write_t* req, int status) {
++  ASSERT_OK(status);
++  taz_write_cb_called++;
++  uv_close((uv_handle_t*) &taz_client, NULL);
++}
++
++
++static void taz_exact_fill_connect_cb(uv_connect_t* req, int status) {
++  uv_buf_t buf;
++
++  ASSERT_OK(status);
++
++  /* One write that exactly fills the reader's buffer, then EOF. */
++  memset(taz_big, 'x', TAZ_FILL_SIZE);
++  buf = uv_buf_init(taz_big, TAZ_FILL_SIZE);
++  ASSERT_OK(uv_write(&taz_write_req,
++                     req->handle,
++                     &buf,
++                     1,
++                     taz_exact_fill_write_cb));
++}
++
++
++static void taz_exact_fill_connection_cb(uv_stream_t* server, int status) {
++  ASSERT_OK(status);
++  ASSERT_OK(uv_pipe_init(server->loop, &taz_peer, 0));
++  ASSERT_OK(uv_accept(server, (uv_stream_t*) &taz_peer));
++  ASSERT_OK(uv_read_start((uv_stream_t*) &taz_peer,
++                          taz_alloc_fill_cb,
++                          taz_read_cb));
++}
++
++
++/* A read that fills the buffer exactly must be delivered whole, followed by
++ * EOF and nothing else. */
++TEST_IMPL(taz_pipe_read_exact_fill) {
++  uv_loop_t* loop;
++
++  loop = uv_default_loop();
++  taz_init();
++
++  ASSERT_OK(uv_pipe_init(loop, &taz_server, 0));
++  ASSERT_OK(uv_pipe_bind(&taz_server, TEST_PIPENAME));
++  ASSERT_OK(uv_listen((uv_stream_t*) &taz_server,
++                      1,
++                      taz_exact_fill_connection_cb));
++  ASSERT_OK(uv_pipe_init(loop, &taz_client, 0));
++  uv_pipe_connect(&taz_connect_req,
++                  &taz_client,
++                  TEST_PIPENAME,
++                  taz_exact_fill_connect_cb);
++
++  ASSERT_OK(uv_run(loop, UV_RUN_DEFAULT));
++
++  ASSERT_EQ(taz_read_total, TAZ_FILL_SIZE);
++  ASSERT_EQ(taz_write_cb_called, 1);
++  ASSERT_EQ(taz_eof_seen, 1);
++#if TAZ_FORCE_LEGACY
++  /* The read capped at the bytes available does not ask for more. Upstream
++   * reads again after a full buffer and reports the cancelled read as 0. */
++  ASSERT_EQ(taz_zero_reads, 0);
++#endif
++
++  MAKE_VALGRIND_HAPPY(loop);
++  return 0;
++}
++
++
++static void taz_close_connection_cb(uv_stream_t* server, int status) {
++  ASSERT_OK(status);
++  ASSERT_OK(uv_pipe_init(server->loop, &taz_peer, 0));
++  ASSERT_OK(uv_accept(server, (uv_stream_t*) &taz_peer));
++  ASSERT_OK(uv_read_start((uv_stream_t*) &taz_peer,
++                          taz_alloc_chunk_cb,
++                          taz_peer_read_cb));
++  ASSERT_OK(uv_timer_start(&taz_timer, taz_close_peer_cb, 50, 0));
++}
++
++
++/* uv_close must cancel a pending read, even with the pipe held open by another
++ * handle. */
++TEST_IMPL(taz_pipe_close_read_pending) {
++  uv_loop_t* loop;
++
++  loop = uv_default_loop();
++  taz_init();
++
++  ASSERT_OK(uv_timer_init(loop, &taz_timer));
++  ASSERT_OK(uv_pipe_init(loop, &taz_server, 0));
++  ASSERT_OK(uv_pipe_bind(&taz_server, TEST_PIPENAME));
++  ASSERT_OK(uv_listen((uv_stream_t*) &taz_server,
++                      1,
++                      taz_close_connection_cb));
++  ASSERT_OK(uv_pipe_init(loop, &taz_client, 0));
++  uv_pipe_connect(&taz_connect_req,
++                  &taz_client,
++                  TEST_PIPENAME,
++                  taz_reading_connect_cb);
++
++  ASSERT_OK(uv_run(loop, UV_RUN_DEFAULT));
++
++  ASSERT_EQ(taz_peer_close_cb_called, 1);
++  ASSERT_EQ(taz_peer_read_cb_called, 0);
++  ASSERT_EQ(taz_eof_seen, 1);
++
++  MAKE_VALGRIND_HAPPY(loop);
++  return 0;
++}
++
++
++static void taz_drain_timer_cb(uv_timer_t* timer) {
++  /* The peer stopped reading with its write still pending; now drain it. */
++  ASSERT_OK(uv_read_start((uv_stream_t*) &taz_client,
++                          taz_alloc_chunk_cb,
++                          taz_read_cb));
++}
++
++
++static void taz_stop_write_cb(uv_write_t* req, int status) {
++  /* The write must complete, not be cancelled by the uv_read_stop. */
++  ASSERT_OK(status);
++  taz_write_cb_called++;
++  ASSERT_OK(uv_timer_start(&taz_timer, taz_close_peer_cb, 50, 0));
++}
++
++
++static void taz_shutdown_cb(uv_shutdown_t* req, int status) {
++  ASSERT_OK(status);
++  taz_shutdown_cb_called++;
++  /* Past the 50 ms in which a reading pipe waits for the other end's EOF. */
++  ASSERT_OK(uv_timer_start(&taz_timer, taz_close_peer_cb, 200, 0));
++}
++
++
++static void taz_stop_shutdown_write_cb(uv_write_t* req, int status) {
++  ASSERT_OK(status);
++  taz_write_cb_called++;
++  ASSERT_OK(uv_shutdown(&taz_shutdown_req, req->handle, taz_shutdown_cb));
++}
++
++
++/* The peer starts reading, writes more than the pipe holds and stops reading
++ * with that write pending; the client drains it later. */
++static void taz_stop_with_write_pending(uv_stream_t* server,
++                                        uv_write_cb write_cb) {
++  uv_buf_t buf;
++
++  ASSERT_OK(uv_pipe_init(server->loop, &taz_peer, 0));
++  ASSERT_OK(uv_accept(server, (uv_stream_t*) &taz_peer));
++  ASSERT_OK(uv_read_start((uv_stream_t*) &taz_peer,
++                          taz_alloc_chunk_cb,
++                          taz_peer_read_cb));
++
++  memset(taz_big, 'y', sizeof(taz_big));
++  buf = uv_buf_init(taz_big, sizeof(taz_big));
++  ASSERT_OK(uv_write(&taz_write_req, (uv_stream_t*) &taz_peer, &buf, 1,
++                     write_cb));
++  ASSERT_GT(uv_stream_get_write_queue_size((uv_stream_t*) &taz_peer), 0);
++
++  ASSERT_OK(uv_read_stop((uv_stream_t*) &taz_peer));
++
++  ASSERT_OK(uv_timer_start(&taz_timer, taz_drain_timer_cb, 50, 0));
++}
++
++
++static void taz_stop_connection_cb(uv_stream_t* server, int status) {
++  ASSERT_OK(status);
++  taz_stop_with_write_pending(server, taz_stop_write_cb);
++}
++
++
++static void taz_stop_shutdown_connection_cb(uv_stream_t* server, int status) {
++  ASSERT_OK(status);
++  taz_stop_with_write_pending(server, taz_stop_shutdown_write_cb);
++}
++
++
++static int taz_run_stop_with_write_pending(uv_connection_cb connection_cb) {
++  uv_loop_t* loop;
++
++  loop = uv_default_loop();
++  taz_init();
++
++  ASSERT_OK(uv_timer_init(loop, &taz_timer));
++  ASSERT_OK(uv_pipe_init(loop, &taz_server, 0));
++  ASSERT_OK(uv_pipe_bind(&taz_server, TEST_PIPENAME));
++  ASSERT_OK(uv_listen((uv_stream_t*) &taz_server, 1, connection_cb));
++  ASSERT_OK(uv_pipe_init(loop, &taz_client, 0));
++  uv_pipe_connect(&taz_connect_req, &taz_client, TEST_PIPENAME, taz_connect_cb);
++
++  ASSERT_OK(uv_run(loop, UV_RUN_DEFAULT));
++
++  ASSERT_EQ(taz_write_cb_called, 1);
++  ASSERT_EQ(taz_read_total, TAZ_BIG_SIZE);
++  ASSERT_EQ(taz_eof_seen, 1);
++  ASSERT_EQ(taz_peer_close_cb_called, 1);
++  ASSERT_EQ(taz_peer_read_cb_called, 0);
++
++  MAKE_VALGRIND_HAPPY(loop);
++  return 0;
++}
++
++
++/* uv_read_stop with a write pending must not cancel the write, and the read it
++ * stopped must not keep a later uv_close from completing. */
++TEST_IMPL(taz_pipe_read_stop_write_pending) {
++  return taz_run_stop_with_write_pending(taz_stop_connection_cb);
++}
++
++
++/* A uv_shutdown after uv_read_stop with a write pending must not report EOF to
++ * the stopped reader. */
++TEST_IMPL(taz_pipe_shutdown_after_read_stop) {
++  int r;
++
++#ifndef _WIN32
++  RETURN_SKIP("uv_shutdown sends EOF to the client at once here");
++#endif
++  r = taz_run_stop_with_write_pending(taz_stop_shutdown_connection_cb);
++  ASSERT_EQ(taz_shutdown_cb_called, 1);
++  return r;
++}
++
++#endif

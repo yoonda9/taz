@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:29:42 +0000
+Subject: [PATCH] win: retry uv_socketpair sockets without
+ WSA_FLAG_NO_HANDLE_INHERIT
+
+The flag needs Windows 7 SP1, and WSASocketW fails with it before that.
+A helper tries the flagged socket first and retries without the flag on
+any failure: uv_socketpair already clears the inheritance of every
+socket with SetHandleInformation(HANDLE_FLAG_INHERIT) right after
+creating it, and a failure that has nothing to do with the flag fails
+the retry too. The forced build skips the flagged attempt so the retry
+path runs in the tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ src/win/tcp.c | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/src/win/tcp.c b/src/win/tcp.c
+index 49a5de6838491c7d36b048de2788eb8be1235e58..1177903df5e9691d15ac9fdd5eb46c6ea4f09592 100644
+--- a/src/win/tcp.c
++++ b/src/win/tcp.c
+@@ -1595,6 +1595,27 @@ int uv__tcp_connect(uv_connect_t* req,
+ }
+ 
+ 
++#if TAZ_LEGACY_FALLBACKS
++/* WSA_FLAG_NO_HANDLE_INHERIT needs Windows 7 SP1, and WSASocketW fails with it
++ * before that. Retry without it on any failure: uv_socketpair clears the
++ * inheritance of every socket with SetHandleInformation right after creating
++ * it, and a failure that has nothing to do with the flag fails the retry too.
++ */
++static SOCKET uv__socketpair_socket(int type, int protocol, DWORD flags) {
++#if TAZ_FORCE_LEGACY
++  /* Take the retry path deliberately, so the tests run it. */
++#else
++  SOCKET sock;
++
++  sock = WSASocketW(AF_INET, type, protocol, NULL, 0,
++                    flags | WSA_FLAG_NO_HANDLE_INHERIT);
++  if (sock != INVALID_SOCKET)
++    return sock;
++#endif
++  return WSASocketW(AF_INET, type, protocol, NULL, 0, flags);
++}
++
++#endif
+ int uv_socketpair(int type, int protocol, uv_os_sock_t fds[2], int flags0, int flags1) {
+   SOCKET server = INVALID_SOCKET;
+   SOCKET client0 = INVALID_SOCKET;
+@@ -1607,16 +1628,25 @@ int uv_socketpair(int type, int protocol, uv_os_sock_t fds[2], int flags0, int f
+   int err;
+   DWORD bytes;
+   DWORD flags;
++#if TAZ_LEGACY_FALLBACKS
++  DWORD client0_flags = 0;
++  DWORD client1_flags = 0;
++#else
+   DWORD client0_flags = WSA_FLAG_NO_HANDLE_INHERIT;
+   DWORD client1_flags = WSA_FLAG_NO_HANDLE_INHERIT;
++#endif
+ 
+   if (flags0 & UV_NONBLOCK_PIPE)
+       client0_flags |= WSA_FLAG_OVERLAPPED;
+   if (flags1 & UV_NONBLOCK_PIPE)
+       client1_flags |= WSA_FLAG_OVERLAPPED;
+ 
++#if TAZ_LEGACY_FALLBACKS
++  server = uv__socketpair_socket(type, protocol, WSA_FLAG_OVERLAPPED);
++#else
+   server = WSASocketW(AF_INET, type, protocol, NULL, 0,
+                       WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
++#endif
+   if (server == INVALID_SOCKET)
+     goto wsaerror;
+   if (!SetHandleInformation((HANDLE) server, HANDLE_FLAG_INHERIT, 0))
+@@ -1631,14 +1661,22 @@ int uv_socketpair(int type, int protocol, uv_os_sock_t fds[2], int flags0, int f
+   namelen = sizeof(name);
+   if (getsockname(server, (SOCKADDR*) &name, &namelen) != 0)
+     goto wsaerror;
++#if TAZ_LEGACY_FALLBACKS
++  client0 = uv__socketpair_socket(type, protocol, client0_flags);
++#else
+   client0 = WSASocketW(AF_INET, type, protocol, NULL, 0, client0_flags);
++#endif
+   if (client0 == INVALID_SOCKET)
+     goto wsaerror;
+   if (!SetHandleInformation((HANDLE) client0, HANDLE_FLAG_INHERIT, 0))
+     goto error;
+   if (connect(client0, (SOCKADDR*) &name, sizeof(name)) != 0)
+     goto wsaerror;
++#if TAZ_LEGACY_FALLBACKS
++  client1 = uv__socketpair_socket(type, protocol, client1_flags);
++#else
+   client1 = WSASocketW(AF_INET, type, protocol, NULL, 0, client1_flags);
++#endif
+   if (client1 == INVALID_SOCKET)
+     goto wsaerror;
+   if (!SetHandleInformation((HANDLE) client1, HANDLE_FLAG_INHERIT, 0))

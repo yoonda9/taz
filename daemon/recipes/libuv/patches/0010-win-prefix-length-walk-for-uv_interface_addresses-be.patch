@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:29:42 +0000
+Subject: [PATCH] win: prefix-length walk for uv_interface_addresses before
+ Vista
+
+IP_ADAPTER_UNICAST_ADDRESS ends before OnLinkPrefixLength on XP, so reading it
+there is out of bounds. A runtime check through the NULL-checked pRtlGetVersion
+picks the path: Vista and later keep the field, earlier hosts (and the forced
+build) compute the prefix length with the FirstPrefix longest-match walk and
+address_prefix_match from libuv before a7b16bfb (v1.45), with
+GAA_FLAG_INCLUDE_PREFIX. The XP SP1 check is dropped (the floor is XP SP3).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ src/win/util.c | 103 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 103 insertions(+)
+
+diff --git a/src/win/util.c b/src/win/util.c
+index 4e70d6e8601b77ece3c7797b340773b941fcd757..1f22ef9f8787f65d4df506cb188095b899e42fe9 100644
+--- a/src/win/util.c
++++ b/src/win/util.c
+@@ -702,6 +702,93 @@ int uv_cpu_info(uv_cpu_info_t** cpu_infos_ptr, int* cpu_count_ptr) {
+ }
+ 
+ 
++#if TAZ_LEGACY_FALLBACKS
++/* IP_ADAPTER_UNICAST_ADDRESS has no OnLinkPrefixLength before Vista; reading
++ * it there is out of bounds. Without a version, take the walk, which never
++ * reads past the XP struct. */
++static int uv__is_vista_or_greater(void) {
++#if TAZ_FORCE_LEGACY
++  return 0;
++#else
++  RTL_OSVERSIONINFOW os_info;
++
++  if (pRtlGetVersion == NULL)
++    return 0;
++  memset(&os_info, 0, sizeof(os_info));
++  os_info.dwOSVersionInfoSize = sizeof(os_info);
++  pRtlGetVersion(&os_info);
++  return os_info.dwMajorVersion >= 6;
++#endif
++}
++
++
++/* From libuv before a7b16bfb (v1.45). */
++static int address_prefix_match(int family,
++                                struct sockaddr* address,
++                                struct sockaddr* prefix_address,
++                                int prefix_len) {
++  uint8_t* address_data;
++  uint8_t* prefix_address_data;
++  int i;
++
++  assert(address->sa_family == family);
++  assert(prefix_address->sa_family == family);
++
++  if (family == AF_INET6) {
++    address_data = (uint8_t*) &(((struct sockaddr_in6 *) address)->sin6_addr);
++    prefix_address_data =
++      (uint8_t*) &(((struct sockaddr_in6 *) prefix_address)->sin6_addr);
++  } else {
++    address_data = (uint8_t*) &(((struct sockaddr_in *) address)->sin_addr);
++    prefix_address_data =
++      (uint8_t*) &(((struct sockaddr_in *) prefix_address)->sin_addr);
++  }
++
++  for (i = 0; i < prefix_len >> 3; i++) {
++    if (address_data[i] != prefix_address_data[i])
++      return 0;
++  }
++
++  if (prefix_len % 8)
++    return prefix_address_data[i] ==
++      (address_data[i] & (0xff << (8 - prefix_len % 8)));
++
++  return 1;
++}
++
++
++/* Prior to Windows Vista the FirstPrefix pointed to the list with single
++ * prefix for each IP address assigned to the adapter. Order of FirstPrefix
++ * does not match order of FirstUnicastAddress, so find the corresponding
++ * prefix (longest match). */
++static ULONG uv__prefix_len_walk(IP_ADAPTER_ADDRESSES* adapter,
++                                 struct sockaddr* sa) {
++  IP_ADAPTER_PREFIX* prefix;
++  ULONG prefix_len;
++
++  prefix_len = 0;
++
++  for (prefix = adapter->FirstPrefix; prefix; prefix = prefix->Next) {
++    /* We want the longest matching prefix. */
++    if (prefix->Address.lpSockaddr->sa_family != sa->sa_family ||
++        prefix->PrefixLength <= prefix_len)
++      continue;
++
++    if (address_prefix_match(sa->sa_family, sa,
++        prefix->Address.lpSockaddr, prefix->PrefixLength)) {
++      prefix_len = prefix->PrefixLength;
++    }
++  }
++
++  /* If there is no matching prefix information, return a single-host subnet
++   * mask (e.g. 255.255.255.255 for IPv4). */
++  if (!prefix_len)
++    prefix_len = (sa->sa_family == AF_INET6) ? 128 : 32;
++
++  return prefix_len;
++}
++
++#endif
+ int uv_interface_addresses(uv_interface_address_t** addresses_ptr,
+     int* count_ptr) {
+   IP_ADAPTER_ADDRESSES* win_address_buf;
+@@ -715,12 +802,20 @@ int uv_interface_addresses(uv_interface_address_t** addresses_ptr,
+ 
+   int count;
+   ULONG flags;
++#if TAZ_LEGACY_FALLBACKS
++  int is_vista_or_greater;
++#endif
+ 
+   *addresses_ptr = NULL;
+   *count_ptr = 0;
+ 
+   flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+     GAA_FLAG_SKIP_DNS_SERVER;
++#if TAZ_LEGACY_FALLBACKS
++  is_vista_or_greater = uv__is_vista_or_greater();
++  if (!is_vista_or_greater)
++    flags |= GAA_FLAG_INCLUDE_PREFIX;
++#endif
+ 
+   /* Fetch the size of the adapters reported by windows, and then get the list
+    * itself. */
+@@ -868,8 +963,16 @@ int uv_interface_addresses(uv_interface_address_t** addresses_ptr,
+ 
+       sa = unicast_address->Address.lpSockaddr;
+ 
++#if TAZ_LEGACY_FALLBACKS
++      if (is_vista_or_greater)
++        prefix_len =
++          ((IP_ADAPTER_UNICAST_ADDRESS_LH*) unicast_address)->OnLinkPrefixLength;
++      else
++        prefix_len = uv__prefix_len_walk(adapter, sa);
++#else
+       prefix_len =
+         ((IP_ADAPTER_UNICAST_ADDRESS_LH*) unicast_address)->OnLinkPrefixLength;
++#endif
+ 
+       memset(uv_address, 0, sizeof *uv_address);
+ 

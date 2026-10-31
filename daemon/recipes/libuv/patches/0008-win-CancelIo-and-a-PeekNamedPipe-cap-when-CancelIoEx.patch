@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:29:42 +0000
+Subject: [PATCH] win: CancelIo and a PeekNamedPipe cap when CancelIoEx is
+ missing
+
+TCP close (uv__tcp_try_cancel_reqs, both sites): CancelIo on the socket.
+Every pending operation on it was issued by the loop thread, so it
+cancels the read and the writes, which were cancelled with CancelIo
+anyway (99eb736b, v1.42).
+
+Pipe uv__pipe_interrupt_read, overlapped branch: CancelIo when no write
+is pending, and on close, which cancels the writes too, as a TCP close
+does. With a write pending, uv_read_stop leaves the zero-read pending
+and the cancellation unrecorded, and uv__process_pipe_write_req cancels
+it once the last write is done; a completion before that is ignored by
+uv__process_pipe_read_req, as before 4f60e0c1 (v1.21). So a later
+uv_close does not wait on a read that closing the handle cannot abort
+(another handle to the pipe is open), and a uv_shutdown cannot report
+EOF to the stopped reader.
+
+Pipe uv__pipe_read_data, overlapped branch: the read is capped at the
+bytes PeekNamedPipe reports so that it completes without pending, as the
+non-overlapped branch does. If a concurrent reader of the same pipe end
+drained it in between (the race 727ee723, v1.49, fixed), the read pends:
+CancelIo when no write is pending, else wait for the peer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ src/win/pipe.c | 75 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ src/win/tcp.c  | 16 +++++++++--
+ 2 files changed, 88 insertions(+), 3 deletions(-)
+
+diff --git a/src/win/pipe.c b/src/win/pipe.c
+index d9d3f85fea2594825ad24ca67313c6990bcdf757..aaabf29ddc3f28e67ac568cf4fa8a15f7d4434e0 100644
+--- a/src/win/pipe.c
++++ b/src/win/pipe.c
+@@ -1010,7 +1010,22 @@ void uv__pipe_interrupt_read(uv_pipe_t* handle) {
+   if (!(handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE)) {
+     /* Cancel asynchronous read. */
+ #if TAZ_LEGACY_FALLBACKS
+-    r = pCancelIoEx(handle->handle, &handle->read_req.u.io.overlapped);
++    if (pCancelIoEx != NULL) {
++      r = pCancelIoEx(handle->handle, &handle->read_req.u.io.overlapped);
++    } else if (handle->stream.conn.write_reqs_pending == 0 ||
++               (handle->flags & UV_HANDLE_CLOSING)) {
++      /* CancelIo cancels every operation the loop thread issued on the
++       * handle, so it stands in for CancelIoEx when no write is pending, and
++       * on close, which cancels the writes too, as uv_close on a TCP handle
++       * does. */
++      r = CancelIo(handle->handle);
++    } else {
++      /* A write is pending: leave the zero-read pending and the cancellation
++       * unrecorded. uv__process_pipe_write_req cancels it once the last write
++       * is done; a completion before that reaches uv__process_pipe_read_req,
++       * which ignores it when not reading. */
++      return;
++    }
+ #else
+     r = CancelIoEx(handle->handle, &handle->read_req.u.io.overlapped);
+ #endif
+@@ -1976,6 +1991,49 @@ static DWORD uv__pipe_read_exactly(uv_pipe_t* handle, void* buffer, DWORD count)
+ }
+ 
+ 
++#if TAZ_LEGACY_FALLBACKS
++/* Overlapped read for hosts without CancelIoEx. The zero-read completing means
++ * data was available, so the read is capped at the bytes available and
++ * completes without pending. If another reader drained the pipe between the
++ * peek and the read, it pends: cancel it with CancelIo when no write is
++ * pending (CancelIo would cancel the writes too), else wait for the peer. */
++static DWORD uv__pipe_read_capped(uv_pipe_t* handle,
++                                  char* base,
++                                  DWORD* max_bytes,
++                                  DWORD* bytes_read,
++                                  DWORD* bytes_available) {
++  uv_read_t* req;
++  DWORD r;
++
++  *bytes_read = 0;
++  *bytes_available = 0;
++  if (!PeekNamedPipe(handle->handle, NULL, 0, NULL, bytes_available, NULL))
++    return GetLastError();
++
++  if (*max_bytes > *bytes_available)
++    *max_bytes = *bytes_available;
++  if (*max_bytes == 0)
++    return ERROR_SUCCESS;
++
++  req = &handle->read_req;
++  memset(&req->u.io.overlapped, 0, sizeof(req->u.io.overlapped));
++  req->u.io.overlapped.hEvent = (HANDLE) ((uintptr_t) req->event_handle | 1);
++  if (ReadFile(handle->handle, base, *max_bytes, bytes_read, &req->u.io.overlapped))
++    return ERROR_SUCCESS;
++
++  r = GetLastError();
++  *bytes_read = 0;
++  if (r != ERROR_IO_PENDING)
++    return r;
++  if (handle->stream.conn.write_reqs_pending == 0)
++    CancelIo(handle->handle);
++  if (GetOverlappedResult(handle->handle, &req->u.io.overlapped, bytes_read, TRUE))
++    return ERROR_SUCCESS;
++  *bytes_read = 0;
++  return GetLastError();
++}
++
++#endif
+ static int uv__pipe_read_data(uv_loop_t* loop,
+                               uv_pipe_t* handle,
+                               DWORD* bytes_read, /* inout argument */
+@@ -2019,7 +2077,14 @@ static int uv__pipe_read_data(uv_loop_t* loop,
+         r = GetLastError();
+     }
+     more = max_bytes < bytes_available;
++#if TAZ_LEGACY_FALLBACKS
++  } else if (pCancelIoEx == NULL) {
++    r = uv__pipe_read_capped(handle, buf.base, &max_bytes, bytes_read, &bytes_available);
++    more = max_bytes < bytes_available;
++  } else {
++#else
+   } else {
++#endif
+     /* Read into the user buffer.
+      * Prepare an Event so that we can cancel if it doesn't complete immediately.
+      */
+@@ -2242,6 +2307,14 @@ void uv__process_pipe_write_req(uv_loop_t* loop, uv_pipe_t* handle,
+ 
+   handle->stream.conn.write_reqs_pending--;
+ 
++#if TAZ_LEGACY_FALLBACKS
++  /* Without CancelIoEx, uv__pipe_interrupt_read leaves a stopped read pending
++   * while a write is; cancel it now that the last one is done. */
++  if (pCancelIoEx == NULL && handle->stream.conn.write_reqs_pending == 0 &&
++      !(handle->flags & UV_HANDLE_READING))
++    uv__pipe_interrupt_read(handle);
++
++#endif
+   if (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE &&
+       handle->pipe.conn.non_overlapped_writes_tail) {
+     assert(handle->stream.conn.write_reqs_pending > 0);
+diff --git a/src/win/tcp.c b/src/win/tcp.c
+index ecb86ba4137d4214f09cd530daa02f34d740ff2f..49a5de6838491c7d36b048de2788eb8be1235e58 100644
+--- a/src/win/tcp.c
++++ b/src/win/tcp.c
+@@ -1399,6 +1399,18 @@ int uv_tcp_simultaneous_accepts(uv_tcp_t* handle, int enable) {
+ }
+ 
+ 
++#if TAZ_LEGACY_FALLBACKS
++/* Cancel the pending zero-read. Without CancelIoEx, CancelIo cancels every
++ * operation the loop thread issued on the socket: at close that is the read
++ * and the writes, and the writes are cancelled right after anyway. */
++static void uv__tcp_cancel_read(SOCKET socket, OVERLAPPED* overlapped) {
++  if (pCancelIoEx != NULL)
++    pCancelIoEx((HANDLE) socket, overlapped);
++  else
++    CancelIo((HANDLE) socket);
++}
++
++#endif
+ static void uv__tcp_try_cancel_reqs(uv_tcp_t* tcp) {
+   SOCKET socket;
+   int non_ifs_lsp;
+@@ -1415,7 +1427,7 @@ static void uv__tcp_try_cancel_reqs(uv_tcp_t* tcp) {
+    * them each explicitly with CancelIoEx (like unix). */
+   if (reading)
+ #if TAZ_LEGACY_FALLBACKS
+-    pCancelIoEx((HANDLE) socket, &tcp->read_req.u.io.overlapped);
++    uv__tcp_cancel_read(socket, &tcp->read_req.u.io.overlapped);
+ #else
+     CancelIoEx((HANDLE) socket, &tcp->read_req.u.io.overlapped);
+ #endif
+@@ -1449,7 +1461,7 @@ static void uv__tcp_try_cancel_reqs(uv_tcp_t* tcp) {
+   if (socket != tcp->socket) {
+     if (reading)
+ #if TAZ_LEGACY_FALLBACKS
+-      pCancelIoEx((HANDLE) socket, &tcp->read_req.u.io.overlapped);
++      uv__tcp_cancel_read(socket, &tcp->read_req.u.io.overlapped);
+ #else
+       CancelIoEx((HANDLE) socket, &tcp->read_req.u.io.overlapped);
+ #endif

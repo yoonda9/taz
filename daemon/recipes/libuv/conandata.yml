@@ -16,6 +16,24 @@ patches:
     - patch_file: patches/0004-win-pipe-and-net-fallbacks-for-pre-Vista.patch
       patch_description: "win: pipe and net fallbacks for pre-Vista"
       patch_type: portability
-    - patch_file: patches/0005-win-lookup-only-wiring-for-I-O-SRW-and-condvar-calls.patch
-      patch_description: "win: lookup-only wiring for I/O, SRW and condvar calls"
+    - patch_file: patches/0005-win-route-I-O-SRW-and-condvar-calls-through-run-time.patch
+      patch_description: "win: route I/O, SRW and condvar calls through run-time pointers"
+      patch_type: portability
+    - patch_file: patches/0006-win-uv__poll_wine-for-hosts-without-GetQueuedComplet.patch
+      patch_description: "win: uv__poll_wine for hosts without GetQueuedCompletionStatusEx"
+      patch_type: portability
+    - patch_file: patches/0007-win-skip-SetFileCompletionNotificationModes-when-it-.patch
+      patch_description: "win: skip SetFileCompletionNotificationModes when it is missing"
+      patch_type: portability
+    - patch_file: patches/0008-win-CancelIo-and-a-PeekNamedPipe-cap-when-CancelIoEx.patch
+      patch_description: "win: CancelIo and a PeekNamedPipe cap when CancelIoEx is missing"
+      patch_type: portability
+    - patch_file: patches/0009-win-retry-uv_socketpair-sockets-without-WSA_FLAG_NO_.patch
+      patch_description: "win: retry uv_socketpair sockets without WSA_FLAG_NO_HANDLE_INHERIT"
+      patch_type: portability
+    - patch_file: patches/0010-win-prefix-length-walk-for-uv_interface_addresses-be.patch
+      patch_description: "win: prefix-length walk for uv_interface_addresses before Vista"
+      patch_type: portability
+    - patch_file: patches/0011-win-TAZ-only-pipe-tests-for-the-CancelIoEx-fallbacks.patch
+      patch_description: "win: TAZ-only pipe tests for the CancelIoEx fallbacks"
       patch_type: portability

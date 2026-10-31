@@ -20,13 +20,12 @@ GetFinalPathNameByHandleW, ReOpenFile, CreateSymbolicLinkW,
 GetFileInformationByHandleEx, SetFileInformationByHandle,
 SHGetKnownFolderPath, GetNamedPipeClientProcessId,
 GetNamedPipeServerProcessId, CancelSynchronousIo,
-NeedCurrentDirectoryForExePathW. The force-legacy macro sets exactly
-these to NULL after the lookups.
+NeedCurrentDirectoryForExePathW, GetQueuedCompletionStatusEx,
+CancelIoEx, SetFileCompletionNotificationModes. The force-legacy macro
+sets exactly these to NULL after the lookups.
 
-Lookup-only pointers (fatal at init, named, when missing):
-GetQueuedCompletionStatusEx, CancelIoEx,
-SetFileCompletionNotificationModes, the seven SRW lock functions and
-the four condition-variable functions.
+Lookup-only pointers (fatal at init, named, when missing): the seven
+SRW lock functions and the four condition-variable functions.
 
 InitOnceExecuteOnce is resolved lazily inside uv_once, which runs
 before uv__winapi_init; the cached pointer is read and written with
@@ -37,9 +36,9 @@ when not already mapped: XP lacks LOAD_LIBRARY_SEARCH_SYSTEM32, and a bare
 name would search the application directory first.
 ---
  src/win/thread.c |  23 ++++++
- src/win/winapi.c | 193 +++++++++++++++++++++++++++++++++++++++++++++++
- src/win/winapi.h | 103 +++++++++++++++++++++++++
- 3 files changed, 319 insertions(+)
+ src/win/winapi.c | 187 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/win/winapi.h | 103 ++++++++++++++++++++++++++
+ 3 files changed, 313 insertions(+)
 
 diff --git a/src/win/thread.c b/src/win/thread.c
 index 753cb6a34a5b9a6d332511596fb139fe071c2de3..e9e1f75356d785ed22d2dd78d03eb67c0e55b672 100644
@@ -80,7 +79,7 @@ index 753cb6a34a5b9a6d332511596fb139fe071c2de3..e9e1f75356d785ed22d2dd78d03eb67c
  
  /* Verify that uv_thread_t can be stored in a TLS slot. */
 diff --git a/src/win/winapi.c b/src/win/winapi.c
-index 315a0d49aff50bcf9c30c470afb4f542c09133f8..62cd1b2c025bd206660640a93fda69f9c206053e 100644
+index 315a0d49aff50bcf9c30c470afb4f542c09133f8..ceb88debf9084638c3610640150ec8e26ba07628 100644
 --- a/src/win/winapi.c
 +++ b/src/win/winapi.c
 @@ -48,6 +48,62 @@ uv_sGetHostNameW pGetHostNameW;
@@ -146,7 +145,7 @@ index 315a0d49aff50bcf9c30c470afb4f542c09133f8..62cd1b2c025bd206660640a93fda69f9
  void uv__winapi_init(void) {
    HMODULE ntdll_module;
    HMODULE powrprof_module;
-@@ -141,4 +197,141 @@ void uv__winapi_init(void) {
+@@ -141,4 +197,135 @@ void uv__winapi_init(void) {
      pGetFileInformationByName = (sGetFileInformationByName)GetProcAddress(
          api_win_core_file_module, "GetFileInformationByName");
    }
@@ -175,17 +174,8 @@ index 315a0d49aff50bcf9c30c470afb4f542c09133f8..62cd1b2c025bd206660640a93fda69f9
 +    pCancelSynchronousIo = (sCancelSynchronousIo) GetProcAddress(kernel32_module, "CancelSynchronousIo");
 +    pNeedCurrentDirectoryForExePathW = (sNeedCurrentDirectoryForExePathW) GetProcAddress(kernel32_module, "NeedCurrentDirectoryForExePathW");
 +    pGetQueuedCompletionStatusEx = (sGetQueuedCompletionStatusEx) GetProcAddress(kernel32_module, "GetQueuedCompletionStatusEx");
-+    if (pGetQueuedCompletionStatusEx == NULL) {
-+      uv_fatal_error(GetLastError(), "GetQueuedCompletionStatusEx");
-+    }
 +    pCancelIoEx = (sCancelIoEx) GetProcAddress(kernel32_module, "CancelIoEx");
-+    if (pCancelIoEx == NULL) {
-+      uv_fatal_error(GetLastError(), "CancelIoEx");
-+    }
 +    pSetFileCompletionNotificationModes = (sSetFileCompletionNotificationModes) GetProcAddress(kernel32_module, "SetFileCompletionNotificationModes");
-+    if (pSetFileCompletionNotificationModes == NULL) {
-+      uv_fatal_error(GetLastError(), "SetFileCompletionNotificationModes");
-+    }
 +    pInitializeSRWLock = (sInitializeSRWLock) GetProcAddress(kernel32_module, "InitializeSRWLock");
 +    if (pInitializeSRWLock == NULL) {
 +      uv_fatal_error(GetLastError(), "InitializeSRWLock");
@@ -285,6 +275,9 @@ index 315a0d49aff50bcf9c30c470afb4f542c09133f8..62cd1b2c025bd206660640a93fda69f9
 +  pGetNamedPipeServerProcessId = NULL;
 +  pCancelSynchronousIo = NULL;
 +  pNeedCurrentDirectoryForExePathW = NULL;
++  pGetQueuedCompletionStatusEx = NULL;
++  pCancelIoEx = NULL;
++  pSetFileCompletionNotificationModes = NULL;
 +#endif
 +#endif
  }
