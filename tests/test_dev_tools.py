@@ -2147,6 +2147,30 @@ def test_libuv_test_verdict_lists_regressions_against_the_baseline() -> None:
     )
 
 
+def test_libuv_test_extras_lists_what_the_baseline_lacks() -> None:
+    results = {"a": "pass", "z_taz": "pass", "m_taz": "skip"}
+    assert dev.libuv_test_extras(results, {"a": "pass"}) == ["m_taz", "z_taz"]
+    assert dev.libuv_test_extras(results, dict(results)) == []
+
+
+def test_libuv_test_extras_is_empty_without_a_baseline() -> None:
+    assert dev.libuv_test_extras({"a": "pass"}, None) == []
+
+
+def test_libuv_test_verdict_fails_an_extra_without_calling_it_a_regression() -> None:
+    results = {"a": "pass", "extra": "fail"}
+    assert dev.libuv_test_verdict(results, frozenset(), {"a": "pass"}) == (
+        ["extra"],
+        [],
+    )
+    assert dev.libuv_test_verdict(
+        {"a": "pass", "extra": "pass"}, frozenset(), {"a": "pass"}
+    ) == (
+        [],
+        [],
+    )
+
+
 class LibuvTestRun:
     """Stands in for the logged subprocess runners and records each command.
 
@@ -2452,6 +2476,36 @@ def test_libuv_test_flags_a_regression_against_the_baseline(
     libuv_test_run.outcomes = {"tcp_open": outcome}
     with pytest.raises(SystemExit, match="failing tests: tcp_open"):
         _libuv_test("legacy", baseline=baseline)
+
+
+def test_libuv_test_reports_the_tests_the_baseline_lacks(
+    libuv_test_run: LibuvTestRun,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline = tmp_path / "stock.json"
+    baseline.write_text(json.dumps({"loop_alive": "pass"}))
+    _libuv_test("legacy", baseline=baseline)
+    out = capsys.readouterr().out
+    assert "regressions vs baseline: none; not in baseline: 1 (tcp_open);" in out
+
+
+def test_libuv_test_says_when_the_baseline_lacks_nothing(
+    libuv_test_run: LibuvTestRun,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline = tmp_path / "stock.json"
+    baseline.write_text(json.dumps({"loop_alive": "pass", "tcp_open": "pass"}))
+    _libuv_test("legacy", baseline=baseline)
+    assert "not in baseline: none;" in capsys.readouterr().out
+
+
+def test_libuv_test_summary_is_unchanged_without_a_baseline(
+    libuv_test_run: LibuvTestRun, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _libuv_test()
+    assert "not in baseline" not in capsys.readouterr().out
 
 
 def test_libuv_test_needs_an_existing_baseline(

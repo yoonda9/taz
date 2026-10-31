@@ -104,6 +104,8 @@ TAZ layer.
   (`tools/dev.py`, with reasons) are exempt. With `--baseline
 out/libuv-test/stock/results.json`, a flake the baseline shares is
   tolerated, and a test the baseline passed must not be skipped or missing.
+  Tests only the patched trees have (`taz_*`, under the legacy guard) are
+  reported as `not in baseline`; they fail the run only if they fail.
   On Windows run `just win libuv-test` with the same variant (commit first:
   `just win` pushes HEAD).
 - **`just libuv-imports <variant>`** (Windows, after `just win libuv-test` with

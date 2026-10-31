@@ -16,7 +16,8 @@ Subcommands:
                          TAZ macros off (check)
     libuv-test VARIANT [--build-only] [--baseline results.json] [--jobs N]
                          build the recipe's libuv series (stock|legacy|forced) and
-                         run uv_run_tests_a test by test; logs go to out/libuv-test/
+                         run uv_run_tests_a test by test; logs go to out/libuv-test/;
+                         with --baseline, tests the baseline lacks are reported
     libuv-imports VARIANT   dumpbin the built libuv.lib (Windows) and fail on post-XP
                          imports (legacy/forced) or a missing modern import (stock)
     deps PRESET          conan install (preset's profiles, daemon/conan.lock)
@@ -1467,6 +1468,17 @@ def libuv_test_verdict(
     return failures, regressions
 
 
+def libuv_test_extras(
+    results: dict[str, str], baseline: dict[str, str] | None
+) -> list[str]:
+    """Tests this run has that the baseline lacks (the TAZ-only ones, compiled
+    in under legacy_fallbacks); reported, not judged: a failing one already
+    fails in `libuv_test_verdict`."""
+    if baseline is None:
+        return []
+    return sorted(set(results) - set(baseline))
+
+
 def _libuv_test_log(log: Path, cmd: Sequence[str | Path], cwd: Path) -> int:
     """Run `cmd` appending its stdout+stderr to `log`; return the exit status."""
     with log.open("ab") as handle:
@@ -1678,10 +1690,15 @@ def cmd_libuv_test(
     flaky = sorted(n for n, r in results.items() if r == "flaky")
     hit = sum(r in ("fail", "flaky") and n in accepted for n, r in results.items())
     note = ", ".join(regressions) if regressions else "none"
+    segment = ""
+    if base is not None:
+        extras = libuv_test_extras(results, base)
+        listed = f"{len(extras)} ({', '.join(extras)})" if extras else "none"
+        segment = f"; not in baseline: {listed}"
     print(
         f"libuv-test {variant}: {count['pass']} passed, {count['fail']} failed, "
         f"{len(flaky)} flaky, {count['skip']} skipped ({hit} accepted); "
-        f"regressions vs baseline: {note}; logs: {variant_dir}"
+        f"regressions vs baseline: {note}{segment}; logs: {variant_dir}"
     )
     if flaky:
         print(f"flaky (failed once, passed on rerun): {', '.join(flaky)}")
