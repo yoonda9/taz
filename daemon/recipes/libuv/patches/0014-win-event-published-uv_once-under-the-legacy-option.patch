@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:27:34 +0000
+Subject: [PATCH] win: event-published uv_once under the legacy option
+
+With the legacy option on, uv_once publishes a manual-reset event with
+InterlockedCompareExchangePointer on every host instead of calling
+InitOnceExecuteOnce, which is Vista+. The native code stays in the #else
+branch.
+
+Source: abc97670^ (src/win/thread.c), the uv__once_inner every host used
+until v1.49. It is that code unchanged except for field access: guard->ran
+is guard->unused and guard->event is guard->init_once.Ptr, so the layout of
+uv_once_t and UV_ONCE_INIT ({ 0, NULL }) are untouched. As in history, the
+event is never closed: there is one per guard.
+
+uv_once guards uv__init, which is what runs uv__winapi_init, so no run-time
+lookup of an InitOnce function can happen there; a replacement that needs
+no import is the only option.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ src/win/thread.c | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/src/win/thread.c b/src/win/thread.c
+index 5db442242f2d363891061ae5c16cda562d1b800f..75f62e908377bc15833759ad5917c21f5a146353 100644
+--- a/src/win/thread.c
++++ b/src/win/thread.c
+@@ -34,6 +34,51 @@
+ 
+ typedef void (*uv__once_cb)(void);
+ 
++#if TAZ_LEGACY_FALLBACKS
++/* A manual-reset event published with a compare-and-swap stands in for
++ * InitOnceExecuteOnce. The guard's `unused` byte is the "ran" flag and
++ * `init_once.Ptr` holds the event, so UV_ONCE_INIT still means "not run". The
++ * event is never closed: there is one per guard. */
++static void uv__once_inner(uv_once_t* guard, uv__once_cb callback) {
++  DWORD result;
++  HANDLE existing_event, created_event;
++
++  created_event = CreateEvent(NULL, 1, 0, NULL);
++  if (created_event == 0) {
++    /* Could fail in a low-memory situation? */
++    uv_fatal_error(GetLastError(), "CreateEvent");
++  }
++
++  existing_event = InterlockedCompareExchangePointer(
++      (PVOID volatile*) &guard->init_once.Ptr, created_event, NULL);
++
++  if (existing_event == NULL) {
++    /* We won the race */
++    callback();
++
++    result = SetEvent(created_event);
++    assert(result);
++    guard->unused = 1;
++
++  } else {
++    /* We lost the race. Destroy the event we created and wait for the existing
++     * one to become signaled. */
++    CloseHandle(created_event);
++    result = WaitForSingleObject(existing_event, INFINITE);
++    assert(result == WAIT_OBJECT_0);
++  }
++}
++
++
++void uv_once(uv_once_t* guard, uv__once_cb callback) {
++  /* Fast case - avoid WaitForSingleObject. */
++  if (guard->unused) {
++    return;
++  }
++
++  uv__once_inner(guard, callback);
++}
++#else
+ typedef struct {
+   uv__once_cb callback;
+ } uv__once_data_t;
+@@ -50,6 +95,7 @@ void uv_once(uv_once_t* guard, uv__once_cb callback) {
+   uv__once_data_t data = { .callback = callback };
+   InitOnceExecuteOnce(&guard->init_once, uv__once_inner, (void*) &data, NULL);
+ }
++#endif
+ 
+ 
+ /* Verify that uv_thread_t can be stored in a TLS slot. */

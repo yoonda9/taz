@@ -31,10 +31,10 @@ this form.
  2 files changed, 131 insertions(+)
 
 diff --git a/src/win/thread.c b/src/win/thread.c
-index e9e1f75356d785ed22d2dd78d03eb67c0e55b672..125ecbbe3bf26c24e9df547c2674b9e1d5a0dda2 100644
+index 753cb6a34a5b9a6d332511596fb139fe071c2de3..5b8a8284f37e1fd70204d0414bc64b5c2874fe09 100644
 --- a/src/win/thread.c
 +++ b/src/win/thread.c
-@@ -265,9 +265,18 @@ int uv_thread_getaffinity(uv_thread_t* tid,
+@@ -242,9 +242,18 @@ int uv_thread_getaffinity(uv_thread_t* tid,
    return 0;
  }
  

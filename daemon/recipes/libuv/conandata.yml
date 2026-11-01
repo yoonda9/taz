@@ -16,8 +16,8 @@ patches:
     - patch_file: patches/0004-win-pipe-and-net-fallbacks-for-pre-Vista.patch
       patch_description: "win: pipe and net fallbacks for pre-Vista"
       patch_type: portability
-    - patch_file: patches/0005-win-route-I-O-SRW-and-condvar-calls-through-run-time.patch
-      patch_description: "win: route I/O, SRW and condvar calls through run-time pointers"
+    - patch_file: patches/0005-win-route-I-O-calls-through-run-time-pointers.patch
+      patch_description: "win: route I/O calls through run-time pointers"
       patch_type: portability
     - patch_file: patches/0006-win-uv__poll_wine-for-hosts-without-GetQueuedComplet.patch
       patch_description: "win: uv__poll_wine for hosts without GetQueuedCompletionStatusEx"
@@ -36,4 +36,16 @@ patches:
       patch_type: portability
     - patch_file: patches/0011-win-TAZ-only-pipe-tests-for-the-CancelIoEx-fallbacks.patch
       patch_description: "win: TAZ-only pipe tests for the CancelIoEx fallbacks"
+      patch_type: portability
+    - patch_file: patches/0012-win-critical-section-and-semaphore-rwlock-under-the-.patch
+      patch_description: "win: critical-section and semaphore rwlock under the legacy option"
+      patch_type: portability
+    - patch_file: patches/0013-win-per-waiter-event-condition-variable-under-the-le.patch
+      patch_description: "win: per-waiter event condition variable under the legacy option"
+      patch_type: portability
+    - patch_file: patches/0014-win-event-published-uv_once-under-the-legacy-option.patch
+      patch_description: "win: event-published uv_once under the legacy option"
+      patch_type: portability
+    - patch_file: patches/0015-win-TAZ-only-sync-tests-for-the-legacy-fallbacks.patch
+      patch_description: "win: TAZ-only sync tests for the legacy fallbacks"
       patch_type: portability

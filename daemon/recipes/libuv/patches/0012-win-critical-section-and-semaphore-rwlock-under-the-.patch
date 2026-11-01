@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:13:01 +0000
+Subject: [PATCH] win: critical-section and semaphore rwlock under the legacy
+ option
+
+With the legacy option on, uv_rwlock_* uses a critical section and a
+semaphore on every host instead of SRW locks, which are Windows 7+ for
+the try-lock calls. The upstream SRW code stays in the #else branch.
+
+Source: a3e02e5e^ (src/win/thread.c), the lock of 3eb6764a and 9a4fd268
+(2015, after CVE-2014-9748) that every Windows host used until v1.44.
+The six lock functions are that code unchanged except for field access:
+rwlock->state_.x becomes state->x.
+
+The state (reader count, its critical section, the write semaphore) is
+allocated by uv_rwlock_init and kept behind read_write_lock_.Ptr, so
+nothing depends on the size of the public struct. init returns UV_ENOMEM
+when the allocation fails. Upstream's uv_rwlock_destroy does nothing;
+this one deletes the critical section, closes the semaphore and frees
+the state, so the lock owns one handle for its lifetime.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ src/win/thread.c | 155 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 155 insertions(+)
+
+diff --git a/src/win/thread.c b/src/win/thread.c
+index 5b8a8284f37e1fd70204d0414bc64b5c2874fe09..0759920faf6fbf5e3c92f8e474705a8f0f13fbc1 100644
+--- a/src/win/thread.c
++++ b/src/win/thread.c
+@@ -416,6 +416,160 @@ STATIC_ASSERT(sizeof(uv_rwlock_t) == 80);
+ STATIC_ASSERT(sizeof(uv_rwlock_t) == 48);
+ #endif
+ 
++#if TAZ_LEGACY_FALLBACKS
++/* A critical section and a semaphore stand in for the SRW lock. The state
++ * lives on the heap behind the lock's first word, so nothing depends on how
++ * large uv_rwlock_t is. */
++typedef struct uv__rwlock_state_s {
++  CRITICAL_SECTION num_readers_lock_;
++  unsigned int num_readers_;
++  HANDLE write_semaphore_;
++} uv__rwlock_state_t;
++
++
++static uv__rwlock_state_t* uv__rwlock_state(uv_rwlock_t* rwlock) {
++  return (uv__rwlock_state_t*) rwlock->read_write_lock_.Ptr;
++}
++
++
++int uv_rwlock_init(uv_rwlock_t* rwlock) {
++  uv__rwlock_state_t* state;
++  HANDLE handle;
++  DWORD err;
++
++  memset(rwlock, 0, sizeof(*rwlock));
++
++  state = uv__malloc(sizeof(*state));
++  if (state == NULL)
++    return UV_ENOMEM;
++
++  /* Initialize the semaphore that acts as the write lock. */
++  handle = CreateSemaphoreW(NULL, 1, 1, NULL);
++  if (handle == NULL) {
++    err = GetLastError();
++    uv__free(state);
++    return uv_translate_sys_error(err);
++  }
++  state->write_semaphore_ = handle;
++
++  /* Initialize the critical section protecting the reader count. */
++  InitializeCriticalSection(&state->num_readers_lock_);
++
++  /* Initialize the reader count. */
++  state->num_readers_ = 0;
++
++  rwlock->read_write_lock_.Ptr = state;
++  return 0;
++}
++
++
++void uv_rwlock_destroy(uv_rwlock_t* rwlock) {
++  uv__rwlock_state_t* state;
++
++  state = uv__rwlock_state(rwlock);
++  DeleteCriticalSection(&state->num_readers_lock_);
++  CloseHandle(state->write_semaphore_);
++  uv__free(state);
++  rwlock->read_write_lock_.Ptr = NULL;
++}
++
++
++void uv_rwlock_rdlock(uv_rwlock_t* rwlock) {
++  uv__rwlock_state_t* state;
++
++  state = uv__rwlock_state(rwlock);
++
++  /* Acquire the lock that protects the reader count. */
++  EnterCriticalSection(&state->num_readers_lock_);
++
++  /* Increase the reader count, and lock for write if this is the first
++   * reader.
++   */
++  if (++state->num_readers_ == 1) {
++    DWORD r = WaitForSingleObject(state->write_semaphore_, INFINITE);
++    if (r != WAIT_OBJECT_0)
++      uv_fatal_error(GetLastError(), "WaitForSingleObject");
++  }
++
++  /* Release the lock that protects the reader count. */
++  LeaveCriticalSection(&state->num_readers_lock_);
++}
++
++
++int uv_rwlock_tryrdlock(uv_rwlock_t* rwlock) {
++  uv__rwlock_state_t* state;
++  int err;
++
++  state = uv__rwlock_state(rwlock);
++
++  if (!TryEnterCriticalSection(&state->num_readers_lock_))
++    return UV_EBUSY;
++
++  err = 0;
++
++  if (state->num_readers_ == 0) {
++    /* Currently there are no other readers, which means that the write lock
++     * needs to be acquired.
++     */
++    DWORD r = WaitForSingleObject(state->write_semaphore_, 0);
++    if (r == WAIT_OBJECT_0)
++      state->num_readers_++;
++    else if (r == WAIT_TIMEOUT)
++      err = UV_EBUSY;
++    else if (r == WAIT_FAILED)
++      uv_fatal_error(GetLastError(), "WaitForSingleObject");
++
++  } else {
++    /* The write lock has already been acquired because there are other
++     * active readers.
++     */
++    state->num_readers_++;
++  }
++
++  LeaveCriticalSection(&state->num_readers_lock_);
++  return err;
++}
++
++
++void uv_rwlock_rdunlock(uv_rwlock_t* rwlock) {
++  uv__rwlock_state_t* state;
++
++  state = uv__rwlock_state(rwlock);
++  EnterCriticalSection(&state->num_readers_lock_);
++
++  if (--state->num_readers_ == 0) {
++    if (!ReleaseSemaphore(state->write_semaphore_, 1, NULL))
++      uv_fatal_error(GetLastError(), "ReleaseSemaphore");
++  }
++
++  LeaveCriticalSection(&state->num_readers_lock_);
++}
++
++
++void uv_rwlock_wrlock(uv_rwlock_t* rwlock) {
++  DWORD r = WaitForSingleObject(uv__rwlock_state(rwlock)->write_semaphore_,
++                                INFINITE);
++  if (r != WAIT_OBJECT_0)
++    uv_fatal_error(GetLastError(), "WaitForSingleObject");
++}
++
++
++int uv_rwlock_trywrlock(uv_rwlock_t* rwlock) {
++  DWORD r = WaitForSingleObject(uv__rwlock_state(rwlock)->write_semaphore_, 0);
++  if (r == WAIT_OBJECT_0)
++    return 0;
++  else if (r == WAIT_TIMEOUT)
++    return UV_EBUSY;
++  else
++    uv_fatal_error(GetLastError(), "WaitForSingleObject");
++}
++
++
++void uv_rwlock_wrunlock(uv_rwlock_t* rwlock) {
++  if (!ReleaseSemaphore(uv__rwlock_state(rwlock)->write_semaphore_, 1, NULL))
++    uv_fatal_error(GetLastError(), "ReleaseSemaphore");
++}
++#else
+ int uv_rwlock_init(uv_rwlock_t* rwlock) {
+   memset(rwlock, 0, sizeof(*rwlock));
+   InitializeSRWLock(&rwlock->read_write_lock_);
+@@ -464,6 +618,7 @@ int uv_rwlock_trywrlock(uv_rwlock_t* rwlock) {
+ void uv_rwlock_wrunlock(uv_rwlock_t* rwlock) {
+   ReleaseSRWLockExclusive(&rwlock->read_write_lock_);
+ }
++#endif
+ 
+ 
+ int uv_sem_init(uv_sem_t* sem, unsigned int value) {

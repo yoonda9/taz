@@ -298,18 +298,18 @@ index 27605ca36f44348a6c2f24adce93d9d9b3e8b6da..282b2c2a08ef70e0104ad71694763b2c
          SymSetOptions(sym_options);
          CloseHandle(hDumpFile);
 diff --git a/src/win/winapi.c b/src/win/winapi.c
-index ceb88debf9084638c3610640150ec8e26ba07628..aaf6a174891fbc8bbf632aa9d086811bd573f929 100644
+index 94241a6d08342e8a9c8cbf21c081856c7a39279b..81a87fd12847d1eeb668db534d1480834101453e 100644
 --- a/src/win/winapi.c
 +++ b/src/win/winapi.c
-@@ -81,6 +81,7 @@ sInitializeConditionVariable pInitializeConditionVariable;
- sWakeConditionVariable pWakeConditionVariable;
- sWakeAllConditionVariable pWakeAllConditionVariable;
- sSleepConditionVariableCS pSleepConditionVariableCS;
+@@ -70,6 +70,7 @@ sNeedCurrentDirectoryForExePathW pNeedCurrentDirectoryForExePathW;
+ sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
+ sCancelIoEx pCancelIoEx;
+ sSetFileCompletionNotificationModes pSetFileCompletionNotificationModes;
 +sRtlUpcaseUnicodeChar pRtlUpcaseUnicodeChar;
  
  /* LoadLibrary from the system directory only: XP has no
   * LOAD_LIBRARY_SEARCH_SYSTEM32, and a bare DLL name would search the
-@@ -103,6 +104,35 @@ static HMODULE uv__load_system_library(const WCHAR* name) {
+@@ -92,6 +93,35 @@ static HMODULE uv__load_system_library(const WCHAR* name) {
    return LoadLibraryW(path);
  }
  
@@ -345,7 +345,7 @@ index ceb88debf9084638c3610640150ec8e26ba07628..aaf6a174891fbc8bbf632aa9d086811b
  #endif
  void uv__winapi_init(void) {
    HMODULE ntdll_module;
-@@ -212,6 +242,10 @@ void uv__winapi_init(void) {
+@@ -201,6 +231,10 @@ void uv__winapi_init(void) {
      pGetSystemTimePreciseAsFileTime = (sGetSystemTimePreciseAsFileTime) GetProcAddress(kernel32_module, "GetSystemTimePreciseAsFileTime");
      pGetCurrentProcessorNumber = (sGetCurrentProcessorNumber) GetProcAddress(kernel32_module, "GetCurrentProcessorNumber");
      pCompareStringOrdinal = (sCompareStringOrdinal) GetProcAddress(kernel32_module, "CompareStringOrdinal");
@@ -357,22 +357,22 @@ index ceb88debf9084638c3610640150ec8e26ba07628..aaf6a174891fbc8bbf632aa9d086811b
      pReOpenFile = (sReOpenFile) GetProcAddress(kernel32_module, "ReOpenFile");
      pCreateSymbolicLinkW = (sCreateSymbolicLinkW) GetProcAddress(kernel32_module, "CreateSymbolicLinkW");
 diff --git a/src/win/winapi.h b/src/win/winapi.h
-index e480dea3911851afd6bdaa5d755beb4667e9d66c..71873c25ba90f1e3e0b31130eb60e718d828c1a1 100644
+index 942d077fd18a4ee7afe484777626025d5c7ada76..cd8b0e66a6efb245ca9465722578f47d00b1c01e 100644
 --- a/src/win/winapi.h
 +++ b/src/win/winapi.h
-@@ -4897,6 +4897,8 @@ typedef BOOL (WINAPI *sSleepConditionVariableCS)
-     (PCONDITION_VARIABLE, PCRITICAL_SECTION, DWORD);
- typedef BOOL (WINAPI *sInitOnceExecuteOnce)
-     (PINIT_ONCE, PINIT_ONCE_FN, PVOID, LPVOID*);
+@@ -4873,6 +4873,8 @@ typedef BOOL (WINAPI *sCancelIoEx)
+     (HANDLE, LPOVERLAPPED);
+ typedef BOOL (WINAPI *sSetFileCompletionNotificationModes)
+     (HANDLE, UCHAR);
 +typedef WCHAR (NTAPI *sRtlUpcaseUnicodeChar)
 +    (WCHAR);
  
  extern sGetTickCount64 pGetTickCount64;
  extern sGetSystemTimePreciseAsFileTime pGetSystemTimePreciseAsFileTime;
-@@ -4930,5 +4932,10 @@ extern sInitializeConditionVariable pInitializeConditionVariable;
- extern sWakeConditionVariable pWakeConditionVariable;
- extern sWakeAllConditionVariable pWakeAllConditionVariable;
- extern sSleepConditionVariableCS pSleepConditionVariableCS;
+@@ -4895,5 +4897,10 @@ extern sNeedCurrentDirectoryForExePathW pNeedCurrentDirectoryForExePathW;
+ extern sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
+ extern sCancelIoEx pCancelIoEx;
+ extern sSetFileCompletionNotificationModes pSetFileCompletionNotificationModes;
 +extern sRtlUpcaseUnicodeChar pRtlUpcaseUnicodeChar;
 +
 +/* FileStandardInfo through GetFileInformationByHandleEx, or through

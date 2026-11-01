@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:19:43 +0000
+Subject: [PATCH] win: per-waiter event condition variable under the legacy
+ option
+
+With the legacy option on, uv_cond_* queues each waiter with its own
+auto-reset event on every host instead of using CONDITION_VARIABLE, which
+is Vista+. The native code stays in the #else branch.
+
+uv_cond_signal sets the event of the oldest queued waiter and
+uv_cond_broadcast those of all queued waiters, under the state's critical
+section. A waiter queues itself before it releases the mutex, so any
+signal sent after that reaches it, and since a signal only goes to a
+record queued before it was sent, a thread that signals and then waits
+cannot take its own signal back. A waiter that times out takes its record
+out of the queue unless a signal already reached it, in which case the
+wait reports the wakeup. Records keep their event on an idle list between
+waits. uv_cond_init creates the first one, so a lone waiter never
+allocates; a further concurrent waiter that cannot get a record aborts,
+since uv_cond_wait cannot report it.
+
+This is new code, not libuv history. libuv's own pre-Vista fallback
+(13e8b15e^, the SetEvent solution of Schmidt's win32-cv-1) deadlocks
+with today's callers: a thread that signals and then waits can consume
+its own signal, which hangs a two-thread handoff such as
+thread_rwlock_trylock's within a few handoffs on one CPU, and resetting
+the broadcast event outside the lock loses broadcasts, which deadlocks
+thread-common.c's condition-variable barrier with three or more parties.
+That barrier arrived in 964f79f7 (2023), after the fallback left libuv
+in v1.21, so the two never shipped together.
+
+The state is allocated by uv_cond_init and kept behind cond_var.Ptr, the
+one word uv_barrier_t's CONDITION_VARIABLE has room for (thread-common.c
+casts it to uv_cond_t*), so nothing here depends on sizeof(uv_cond_t) and
+uv_cond_t is never memset. init returns UV_ENOMEM or the CreateEvent
+error; destroy closes the event of every idle record, deletes the
+critical section and frees the state.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ src/win/thread.c | 200 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 200 insertions(+)
+
+diff --git a/src/win/thread.c b/src/win/thread.c
+index 0759920faf6fbf5e3c92f8e474705a8f0f13fbc1..5db442242f2d363891061ae5c16cda562d1b800f 100644
+--- a/src/win/thread.c
++++ b/src/win/thread.c
+@@ -662,6 +662,205 @@ int uv_sem_trywait(uv_sem_t* sem) {
+ }
+ 
+ 
++#if TAZ_LEGACY_FALLBACKS
++/* Each waiter queues a record with its own auto-reset event, and the signal
++ * and broadcast calls set the events of records already in the queue: signal
++ * the oldest one, broadcast all of them. A signal only goes to a record that
++ * was queued before it was sent, so a thread that signals and then waits
++ * cannot take its own signal back, and nothing is left set for a later waiter
++ * to find. A waiter that times out takes its record out of the queue, unless
++ * a signal reached it first, in which case the wait counts as signalled.
++ *
++ * Records keep their event between waits on an idle list, and uv_cond_init
++ * makes the first one, so a single waiter never allocates in uv_cond_wait.
++ *
++ * The state lives on the heap behind the first word of uv_cond_t, because
++ * uv_barrier_t holds only a pointer-sized CONDITION_VARIABLE and casts it to
++ * uv_cond_t*, so nothing may touch more than that word.
++ */
++typedef struct uv__cond_waiter_s {
++  struct uv__queue member;
++  HANDLE event;
++  int signaled;
++} uv__cond_waiter_t;
++
++typedef struct uv__cond_state_s {
++  CRITICAL_SECTION lock;
++  struct uv__queue waiters;
++  struct uv__queue idle;
++} uv__cond_state_t;
++
++
++static uv__cond_state_t* uv__cond_state(uv_cond_t* cond) {
++  return (uv__cond_state_t*) cond->cond_var.Ptr;
++}
++
++
++static int uv__cond_waiter_new(uv__cond_waiter_t** waiter_out) {
++  uv__cond_waiter_t* waiter;
++  DWORD err;
++
++  waiter = uv__malloc(sizeof(*waiter));
++  if (waiter == NULL)
++    return UV_ENOMEM;
++
++  waiter->event = CreateEvent(NULL, FALSE, FALSE, NULL);
++  if (waiter->event == NULL) {
++    err = GetLastError();
++    uv__free(waiter);
++    return uv_translate_sys_error(err);
++  }
++
++  *waiter_out = waiter;
++  return 0;
++}
++
++
++/* Called with the state's lock held. */
++static void uv__cond_wake(uv__cond_state_t* state) {
++  struct uv__queue* q;
++  uv__cond_waiter_t* waiter;
++
++  q = uv__queue_head(&state->waiters);
++  uv__queue_remove(q);
++  uv__queue_init(q);
++
++  waiter = uv__queue_data(q, uv__cond_waiter_t, member);
++  waiter->signaled = 1;
++  if (!SetEvent(waiter->event))
++    abort();
++}
++
++
++int uv_cond_init(uv_cond_t* cond) {
++  uv__cond_state_t* state;
++  uv__cond_waiter_t* waiter;
++  int err;
++
++  state = uv__malloc(sizeof(*state));
++  if (state == NULL)
++    return UV_ENOMEM;
++
++  err = uv__cond_waiter_new(&waiter);
++  if (err) {
++    uv__free(state);
++    return err;
++  }
++
++  InitializeCriticalSection(&state->lock);
++  uv__queue_init(&state->waiters);
++  uv__queue_init(&state->idle);
++  uv__queue_insert_tail(&state->idle, &waiter->member);
++
++  cond->cond_var.Ptr = state;
++  return 0;
++}
++
++
++void uv_cond_destroy(uv_cond_t* cond) {
++  uv__cond_state_t* state;
++  uv__cond_waiter_t* waiter;
++  struct uv__queue* q;
++
++  state = uv__cond_state(cond);
++  while (!uv__queue_empty(&state->idle)) {
++    q = uv__queue_head(&state->idle);
++    uv__queue_remove(q);
++    waiter = uv__queue_data(q, uv__cond_waiter_t, member);
++    if (!CloseHandle(waiter->event))
++      abort();
++    uv__free(waiter);
++  }
++  DeleteCriticalSection(&state->lock);
++  uv__free(state);
++  cond->cond_var.Ptr = NULL;
++}
++
++
++void uv_cond_signal(uv_cond_t* cond) {
++  uv__cond_state_t* state;
++
++  state = uv__cond_state(cond);
++  EnterCriticalSection(&state->lock);
++  if (!uv__queue_empty(&state->waiters))
++    uv__cond_wake(state);
++  LeaveCriticalSection(&state->lock);
++}
++
++
++void uv_cond_broadcast(uv_cond_t* cond) {
++  uv__cond_state_t* state;
++
++  state = uv__cond_state(cond);
++  EnterCriticalSection(&state->lock);
++  while (!uv__queue_empty(&state->waiters))
++    uv__cond_wake(state);
++  LeaveCriticalSection(&state->lock);
++}
++
++
++static int uv_cond_wait_helper(uv_cond_t* cond, uv_mutex_t* mutex,
++    DWORD dwMilliseconds) {
++  uv__cond_state_t* state;
++  uv__cond_waiter_t* waiter;
++  struct uv__queue* q;
++  DWORD result;
++
++  state = uv__cond_state(cond);
++
++  /* Queue up while still holding the mutex, so that any signal sent after
++   * the mutex is released finds this waiter. */
++  EnterCriticalSection(&state->lock);
++  if (uv__queue_empty(&state->idle)) {
++    if (uv__cond_waiter_new(&waiter))
++      abort();
++  } else {
++    q = uv__queue_head(&state->idle);
++    uv__queue_remove(q);
++    waiter = uv__queue_data(q, uv__cond_waiter_t, member);
++  }
++  waiter->signaled = 0;
++  uv__queue_insert_tail(&state->waiters, &waiter->member);
++  LeaveCriticalSection(&state->lock);
++
++  uv_mutex_unlock(mutex);
++
++  result = WaitForSingleObject(waiter->event, dwMilliseconds);
++  if (result != WAIT_OBJECT_0 && result != WAIT_TIMEOUT)
++    abort();
++
++  EnterCriticalSection(&state->lock);
++  if (result == WAIT_TIMEOUT) {
++    if (waiter->signaled) {
++      /* Signalled after the wait gave up: the event is already set, since
++       * signal and broadcast set it under the lock. Consume it so the record
++       * can be reused, and report the wakeup. */
++      if (WaitForSingleObject(waiter->event, INFINITE) != WAIT_OBJECT_0)
++        abort();
++      result = WAIT_OBJECT_0;
++    } else {
++      uv__queue_remove(&waiter->member);
++    }
++  }
++  uv__queue_insert_tail(&state->idle, &waiter->member);
++  LeaveCriticalSection(&state->lock);
++
++  uv_mutex_lock(mutex);
++
++  return result == WAIT_OBJECT_0 ? 0 : UV_ETIMEDOUT;
++}
++
++
++void uv_cond_wait(uv_cond_t* cond, uv_mutex_t* mutex) {
++  if (uv_cond_wait_helper(cond, mutex, INFINITE))
++    abort();
++}
++
++
++int uv_cond_timedwait(uv_cond_t* cond, uv_mutex_t* mutex, uint64_t timeout) {
++  return uv_cond_wait_helper(cond, mutex, (DWORD)(timeout / 1e6));
++}
++#else
+ int uv_cond_init(uv_cond_t* cond) {
+   InitializeConditionVariable(&cond->cond_var);
+   return 0;
+@@ -697,6 +896,7 @@ int uv_cond_timedwait(uv_cond_t* cond, uv_mutex_t* mutex, uint64_t timeout) {
+     abort();
+   return UV_ETIMEDOUT;
+ }
++#endif
+ 
+ 
+ int uv_key_create(uv_key_t* key) {

@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Yoon <5332544+yoonda9@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:41:41 +0000
+Subject: [PATCH] win: route I/O calls through run-time pointers
+
+Routes GetQueuedCompletionStatusEx in uv__poll, CancelIoEx in tcp.c and
+pipe.c and SetFileCompletionNotificationModes in tcp.c and udp.c through
+the run-time pointers added in the lookup patch. The three pointers may
+be NULL, and the patches that follow add their fallbacks, each guarding
+the call. Behaviour is unchanged where they resolve. This is the
+mechanism of a7493d8a run in reverse.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VxaFcyye2fdVEcaK7N8Jnn
+---
+ src/win/core.c |  4 ++++
+ src/win/pipe.c |  8 ++++++++
+ src/win/tcp.c  | 12 ++++++++++++
+ src/win/udp.c  |  4 ++++
+ 4 files changed, 28 insertions(+)
+
+diff --git a/src/win/core.c b/src/win/core.c
+index 5f41c87ad5ed137c51b43e4941414c89ddff5216..4ff67905a062670db4c4f805f9ec17d1676619ed 100644
+--- a/src/win/core.c
++++ b/src/win/core.c
+@@ -462,7 +462,11 @@ static void uv__poll(uv_loop_t* loop, DWORD timeout) {
+      */
+     lfields->current_timeout = timeout;
+ 
++#if TAZ_LEGACY_FALLBACKS
++    success = pGetQueuedCompletionStatusEx(loop->iocp,
++#else
+     success = GetQueuedCompletionStatusEx(loop->iocp,
++#endif
+                                           overlappeds,
+                                           ARRAY_SIZE(overlappeds),
+                                           &count,
+diff --git a/src/win/pipe.c b/src/win/pipe.c
+index 8c45f804d195fd6559a54cd7390adc2d96f01129..d9d3f85fea2594825ad24ca67313c6990bcdf757 100644
+--- a/src/win/pipe.c
++++ b/src/win/pipe.c
+@@ -1009,7 +1009,11 @@ void uv__pipe_interrupt_read(uv_pipe_t* handle) {
+ 
+   if (!(handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE)) {
+     /* Cancel asynchronous read. */
++#if TAZ_LEGACY_FALLBACKS
++    r = pCancelIoEx(handle->handle, &handle->read_req.u.io.overlapped);
++#else
+     r = CancelIoEx(handle->handle, &handle->read_req.u.io.overlapped);
++#endif
+     assert(r || GetLastError() == ERROR_NOT_FOUND);
+     (void) r;
+   } else {
+@@ -2028,7 +2032,11 @@ static int uv__pipe_read_data(uv_loop_t* loop,
+       r = GetLastError();
+       *bytes_read = 0;
+       if (r == ERROR_IO_PENDING) {
++#if TAZ_LEGACY_FALLBACKS
++        r = pCancelIoEx(handle->handle, &req->u.io.overlapped);
++#else
+         r = CancelIoEx(handle->handle, &req->u.io.overlapped);
++#endif
+         assert(r || GetLastError() == ERROR_NOT_FOUND);
+         if (GetOverlappedResult(handle->handle, &req->u.io.overlapped, bytes_read, TRUE)) {
+           r = ERROR_SUCCESS;
+diff --git a/src/win/tcp.c b/src/win/tcp.c
+index c452c12e8f06f13e519a198f786eec63faebe2bf..2cb00753168b56319f7dbd1db91eb28914889e65 100644
+--- a/src/win/tcp.c
++++ b/src/win/tcp.c
+@@ -119,7 +119,11 @@ static int uv__tcp_set_socket(uv_loop_t* loop,
+   if (!(handle->flags & UV_HANDLE_EMULATE_IOCP) && !non_ifs_lsp) {
+     UCHAR sfcnm_flags =
+         FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
++#if TAZ_LEGACY_FALLBACKS
++    if (!pSetFileCompletionNotificationModes((HANDLE) socket, sfcnm_flags))
++#else
+     if (!SetFileCompletionNotificationModes((HANDLE) socket, sfcnm_flags))
++#endif
+       return GetLastError();
+     handle->flags |= UV_HANDLE_SYNC_BYPASS_IOCP;
+   }
+@@ -1403,7 +1407,11 @@ static void uv__tcp_try_cancel_reqs(uv_tcp_t* tcp) {
+   /* TODO: in libuv v2, keep explicit track of write_reqs, so we can cancel
+    * them each explicitly with CancelIoEx (like unix). */
+   if (reading)
++#if TAZ_LEGACY_FALLBACKS
++    pCancelIoEx((HANDLE) socket, &tcp->read_req.u.io.overlapped);
++#else
+     CancelIoEx((HANDLE) socket, &tcp->read_req.u.io.overlapped);
++#endif
+   if (writing)
+     CancelIo((HANDLE) socket);
+ 
+@@ -1433,7 +1441,11 @@ static void uv__tcp_try_cancel_reqs(uv_tcp_t* tcp) {
+ 
+   if (socket != tcp->socket) {
+     if (reading)
++#if TAZ_LEGACY_FALLBACKS
++      pCancelIoEx((HANDLE) socket, &tcp->read_req.u.io.overlapped);
++#else
+       CancelIoEx((HANDLE) socket, &tcp->read_req.u.io.overlapped);
++#endif
+     if (writing)
+       CancelIo((HANDLE) socket);
+   }
+diff --git a/src/win/udp.c b/src/win/udp.c
+index e0873c2a899c244b7bc3a8334b4dc2501ea1cc4f..e3b02bd179eeaad3d46911c5a642a0fca450fd1a 100644
+--- a/src/win/udp.c
++++ b/src/win/udp.c
+@@ -96,7 +96,11 @@ static int uv__udp_set_socket(uv_loop_t* loop, uv_udp_t* handle, SOCKET socket,
+   }
+ 
+   if (info.ProtocolChain.ChainLen == 1) {
++#if TAZ_LEGACY_FALLBACKS
++    if (pSetFileCompletionNotificationModes(
++#else
+     if (SetFileCompletionNotificationModes(
++#endif
+             (HANDLE) socket,
+             FILE_SKIP_SET_EVENT_ON_HANDLE |
+                 FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)) {

@@ -24,65 +24,24 @@ NeedCurrentDirectoryForExePathW, GetQueuedCompletionStatusEx,
 CancelIoEx, SetFileCompletionNotificationModes. The force-legacy macro
 sets exactly these to NULL after the lookups.
 
-Lookup-only pointers (fatal at init, named, when missing): the seven
-SRW lock functions and the four condition-variable functions.
-
-InitOnceExecuteOnce is resolved lazily inside uv_once, which runs
-before uv__winapi_init; the cached pointer is read and written with
-interlocked operations.
+Every pointer here has a fallback: the three I/O names through the
+I/O fallback patches later in the series. libuv's own sync code
+replaces the SRW lock, condition variable and InitOnce calls outright
+under the legacy option, so none of them is looked up.
 
 advapi32, iphlpapi and shell32 are loaded by full system-directory path
 when not already mapped: XP lacks LOAD_LIBRARY_SEARCH_SYSTEM32, and a bare
 name would search the application directory first.
 ---
- src/win/thread.c |  23 ++++++
- src/win/winapi.c | 187 +++++++++++++++++++++++++++++++++++++++++++++++
- src/win/winapi.h | 103 ++++++++++++++++++++++++++
- 3 files changed, 313 insertions(+)
+ src/win/winapi.c | 132 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/win/winapi.h |  68 ++++++++++++++++++++++++
+ 2 files changed, 200 insertions(+)
 
-diff --git a/src/win/thread.c b/src/win/thread.c
-index 753cb6a34a5b9a6d332511596fb139fe071c2de3..e9e1f75356d785ed22d2dd78d03eb67c0e55b672 100644
---- a/src/win/thread.c
-+++ b/src/win/thread.c
-@@ -46,10 +46,33 @@ static BOOL WINAPI uv__once_inner(INIT_ONCE *once, void* param, void** context)
-   return TRUE;
- }
- 
-+#if TAZ_LEGACY_FALLBACKS
-+void uv_once(uv_once_t* guard, uv__once_cb callback) {
-+  /* uv_once runs before uv__winapi_init (it guards uv__init), so this one
-+   * pointer is resolved here. Racing threads store the same address; the
-+   * interlocked load and store keep that well defined. */
-+  static void* volatile init_once_execute_once;
-+  uv__once_data_t data = { .callback = callback };
-+  sInitOnceExecuteOnce fn;
-+
-+  fn = (sInitOnceExecuteOnce) InterlockedCompareExchangePointer(
-+      &init_once_execute_once, NULL, NULL);
-+  if (fn == NULL) {
-+    fn = (sInitOnceExecuteOnce) GetProcAddress(
-+        GetModuleHandleA("kernel32.dll"), "InitOnceExecuteOnce");
-+    if (fn == NULL) {
-+      uv_fatal_error(GetLastError(), "InitOnceExecuteOnce");
-+    }
-+    InterlockedExchangePointer(&init_once_execute_once, (void*) fn);
-+  }
-+  fn(&guard->init_once, uv__once_inner, (void*) &data, NULL);
-+}
-+#else
- void uv_once(uv_once_t* guard, uv__once_cb callback) {
-   uv__once_data_t data = { .callback = callback };
-   InitOnceExecuteOnce(&guard->init_once, uv__once_inner, (void*) &data, NULL);
- }
-+#endif
- 
- 
- /* Verify that uv_thread_t can be stored in a TLS slot. */
 diff --git a/src/win/winapi.c b/src/win/winapi.c
-index 315a0d49aff50bcf9c30c470afb4f542c09133f8..ceb88debf9084638c3610640150ec8e26ba07628 100644
+index 315a0d49aff50bcf9c30c470afb4f542c09133f8..94241a6d08342e8a9c8cbf21c081856c7a39279b 100644
 --- a/src/win/winapi.c
 +++ b/src/win/winapi.c
-@@ -48,6 +48,62 @@ uv_sGetHostNameW pGetHostNameW;
+@@ -48,6 +48,51 @@ uv_sGetHostNameW pGetHostNameW;
  /* api-ms-win-core-file-l2-1-4.dll function pointer */
  sGetFileInformationByName pGetFileInformationByName;
  
@@ -108,17 +67,6 @@ index 315a0d49aff50bcf9c30c470afb4f542c09133f8..ceb88debf9084638c3610640150ec8e2
 +sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
 +sCancelIoEx pCancelIoEx;
 +sSetFileCompletionNotificationModes pSetFileCompletionNotificationModes;
-+sInitializeSRWLock pInitializeSRWLock;
-+sAcquireSRWLockShared pAcquireSRWLockShared;
-+sTryAcquireSRWLockShared pTryAcquireSRWLockShared;
-+sReleaseSRWLockShared pReleaseSRWLockShared;
-+sAcquireSRWLockExclusive pAcquireSRWLockExclusive;
-+sTryAcquireSRWLockExclusive pTryAcquireSRWLockExclusive;
-+sReleaseSRWLockExclusive pReleaseSRWLockExclusive;
-+sInitializeConditionVariable pInitializeConditionVariable;
-+sWakeConditionVariable pWakeConditionVariable;
-+sWakeAllConditionVariable pWakeAllConditionVariable;
-+sSleepConditionVariableCS pSleepConditionVariableCS;
 +
 +/* LoadLibrary from the system directory only: XP has no
 + * LOAD_LIBRARY_SEARCH_SYSTEM32, and a bare DLL name would search the
@@ -145,7 +93,7 @@ index 315a0d49aff50bcf9c30c470afb4f542c09133f8..ceb88debf9084638c3610640150ec8e2
  void uv__winapi_init(void) {
    HMODULE ntdll_module;
    HMODULE powrprof_module;
-@@ -141,4 +197,135 @@ void uv__winapi_init(void) {
+@@ -141,4 +186,91 @@ void uv__winapi_init(void) {
      pGetFileInformationByName = (sGetFileInformationByName)GetProcAddress(
          api_win_core_file_module, "GetFileInformationByName");
    }
@@ -176,50 +124,6 @@ index 315a0d49aff50bcf9c30c470afb4f542c09133f8..ceb88debf9084638c3610640150ec8e2
 +    pGetQueuedCompletionStatusEx = (sGetQueuedCompletionStatusEx) GetProcAddress(kernel32_module, "GetQueuedCompletionStatusEx");
 +    pCancelIoEx = (sCancelIoEx) GetProcAddress(kernel32_module, "CancelIoEx");
 +    pSetFileCompletionNotificationModes = (sSetFileCompletionNotificationModes) GetProcAddress(kernel32_module, "SetFileCompletionNotificationModes");
-+    pInitializeSRWLock = (sInitializeSRWLock) GetProcAddress(kernel32_module, "InitializeSRWLock");
-+    if (pInitializeSRWLock == NULL) {
-+      uv_fatal_error(GetLastError(), "InitializeSRWLock");
-+    }
-+    pAcquireSRWLockShared = (sAcquireSRWLockShared) GetProcAddress(kernel32_module, "AcquireSRWLockShared");
-+    if (pAcquireSRWLockShared == NULL) {
-+      uv_fatal_error(GetLastError(), "AcquireSRWLockShared");
-+    }
-+    pTryAcquireSRWLockShared = (sTryAcquireSRWLockShared) GetProcAddress(kernel32_module, "TryAcquireSRWLockShared");
-+    if (pTryAcquireSRWLockShared == NULL) {
-+      uv_fatal_error(GetLastError(), "TryAcquireSRWLockShared");
-+    }
-+    pReleaseSRWLockShared = (sReleaseSRWLockShared) GetProcAddress(kernel32_module, "ReleaseSRWLockShared");
-+    if (pReleaseSRWLockShared == NULL) {
-+      uv_fatal_error(GetLastError(), "ReleaseSRWLockShared");
-+    }
-+    pAcquireSRWLockExclusive = (sAcquireSRWLockExclusive) GetProcAddress(kernel32_module, "AcquireSRWLockExclusive");
-+    if (pAcquireSRWLockExclusive == NULL) {
-+      uv_fatal_error(GetLastError(), "AcquireSRWLockExclusive");
-+    }
-+    pTryAcquireSRWLockExclusive = (sTryAcquireSRWLockExclusive) GetProcAddress(kernel32_module, "TryAcquireSRWLockExclusive");
-+    if (pTryAcquireSRWLockExclusive == NULL) {
-+      uv_fatal_error(GetLastError(), "TryAcquireSRWLockExclusive");
-+    }
-+    pReleaseSRWLockExclusive = (sReleaseSRWLockExclusive) GetProcAddress(kernel32_module, "ReleaseSRWLockExclusive");
-+    if (pReleaseSRWLockExclusive == NULL) {
-+      uv_fatal_error(GetLastError(), "ReleaseSRWLockExclusive");
-+    }
-+    pInitializeConditionVariable = (sInitializeConditionVariable) GetProcAddress(kernel32_module, "InitializeConditionVariable");
-+    if (pInitializeConditionVariable == NULL) {
-+      uv_fatal_error(GetLastError(), "InitializeConditionVariable");
-+    }
-+    pWakeConditionVariable = (sWakeConditionVariable) GetProcAddress(kernel32_module, "WakeConditionVariable");
-+    if (pWakeConditionVariable == NULL) {
-+      uv_fatal_error(GetLastError(), "WakeConditionVariable");
-+    }
-+    pWakeAllConditionVariable = (sWakeAllConditionVariable) GetProcAddress(kernel32_module, "WakeAllConditionVariable");
-+    if (pWakeAllConditionVariable == NULL) {
-+      uv_fatal_error(GetLastError(), "WakeAllConditionVariable");
-+    }
-+    pSleepConditionVariableCS = (sSleepConditionVariableCS) GetProcAddress(kernel32_module, "SleepConditionVariableCS");
-+    if (pSleepConditionVariableCS == NULL) {
-+      uv_fatal_error(GetLastError(), "SleepConditionVariableCS");
-+    }
 +
 +    /* Fallback pointers may stay NULL; callers test them. */
 +    advapi32_module = GetModuleHandleA("advapi32.dll");
@@ -282,10 +186,10 @@ index 315a0d49aff50bcf9c30c470afb4f542c09133f8..ceb88debf9084638c3610640150ec8e2
 +#endif
  }
 diff --git a/src/win/winapi.h b/src/win/winapi.h
-index b9c9f1abc8899ee4c665df6cc9a91fc03d2f636d..e480dea3911851afd6bdaa5d755beb4667e9d66c 100644
+index b9c9f1abc8899ee4c665df6cc9a91fc03d2f636d..942d077fd18a4ee7afe484777626025d5c7ada76 100644
 --- a/src/win/winapi.h
 +++ b/src/win/winapi.h
-@@ -4828,4 +4828,107 @@ typedef int (WINAPI *uv_sGetHostNameW)
+@@ -4828,4 +4828,72 @@ typedef int (WINAPI *uv_sGetHostNameW)
               int);
  extern uv_sGetHostNameW pGetHostNameW;
  
@@ -334,30 +238,6 @@ index b9c9f1abc8899ee4c665df6cc9a91fc03d2f636d..e480dea3911851afd6bdaa5d755beb46
 +    (HANDLE, LPOVERLAPPED);
 +typedef BOOL (WINAPI *sSetFileCompletionNotificationModes)
 +    (HANDLE, UCHAR);
-+typedef VOID (WINAPI *sInitializeSRWLock)
-+    (PSRWLOCK);
-+typedef VOID (WINAPI *sAcquireSRWLockShared)
-+    (PSRWLOCK);
-+typedef BOOLEAN (WINAPI *sTryAcquireSRWLockShared)
-+    (PSRWLOCK);
-+typedef VOID (WINAPI *sReleaseSRWLockShared)
-+    (PSRWLOCK);
-+typedef VOID (WINAPI *sAcquireSRWLockExclusive)
-+    (PSRWLOCK);
-+typedef BOOLEAN (WINAPI *sTryAcquireSRWLockExclusive)
-+    (PSRWLOCK);
-+typedef VOID (WINAPI *sReleaseSRWLockExclusive)
-+    (PSRWLOCK);
-+typedef VOID (WINAPI *sInitializeConditionVariable)
-+    (PCONDITION_VARIABLE);
-+typedef VOID (WINAPI *sWakeConditionVariable)
-+    (PCONDITION_VARIABLE);
-+typedef VOID (WINAPI *sWakeAllConditionVariable)
-+    (PCONDITION_VARIABLE);
-+typedef BOOL (WINAPI *sSleepConditionVariableCS)
-+    (PCONDITION_VARIABLE, PCRITICAL_SECTION, DWORD);
-+typedef BOOL (WINAPI *sInitOnceExecuteOnce)
-+    (PINIT_ONCE, PINIT_ONCE_FN, PVOID, LPVOID*);
 +
 +extern sGetTickCount64 pGetTickCount64;
 +extern sGetSystemTimePreciseAsFileTime pGetSystemTimePreciseAsFileTime;
@@ -380,16 +260,5 @@ index b9c9f1abc8899ee4c665df6cc9a91fc03d2f636d..e480dea3911851afd6bdaa5d755beb46
 +extern sGetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx;
 +extern sCancelIoEx pCancelIoEx;
 +extern sSetFileCompletionNotificationModes pSetFileCompletionNotificationModes;
-+extern sInitializeSRWLock pInitializeSRWLock;
-+extern sAcquireSRWLockShared pAcquireSRWLockShared;
-+extern sTryAcquireSRWLockShared pTryAcquireSRWLockShared;
-+extern sReleaseSRWLockShared pReleaseSRWLockShared;
-+extern sAcquireSRWLockExclusive pAcquireSRWLockExclusive;
-+extern sTryAcquireSRWLockExclusive pTryAcquireSRWLockExclusive;
-+extern sReleaseSRWLockExclusive pReleaseSRWLockExclusive;
-+extern sInitializeConditionVariable pInitializeConditionVariable;
-+extern sWakeConditionVariable pWakeConditionVariable;
-+extern sWakeAllConditionVariable pWakeAllConditionVariable;
-+extern sSleepConditionVariableCS pSleepConditionVariableCS;
 +#endif
  #endif /* UV_WIN_WINAPI_H_ */
