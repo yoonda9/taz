@@ -2603,13 +2603,19 @@ def test_libuv_lib_undefined_excludes_defined_symbols() -> None:
 
 
 ALWAYS = set(dev.LIBUV_ALWAYS_IMPORTED)
+SYNC_NAMES = set(dev.LIBUV_LEGACY_SYNC_NAMES)
 
 
 def test_judge_libuv_imports_stock_needs_the_modern_imports() -> None:
-    assert dev.judge_libuv_imports("stock", ALWAYS | dev.LIBUV_STOCK_MUST_IMPORT) == []
-    assert dev.judge_libuv_imports("stock", ALWAYS | {"GetTickCount64"}) == [
+    stock = ALWAYS | dev.LIBUV_STOCK_MUST_IMPORT
+    assert dev.judge_libuv_imports("stock", stock, named=SYNC_NAMES) == []
+    assert dev.judge_libuv_imports(
+        "stock", ALWAYS | {"GetTickCount64"}, named=SYNC_NAMES
+    ) == [
         "stock lib does not import AcquireSRWLockExclusive",
         "stock lib does not import GetQueuedCompletionStatusEx",
+        "stock lib does not import InitOnceExecuteOnce",
+        "stock lib does not import InitializeConditionVariable",
     ]
 
 
@@ -2637,6 +2643,121 @@ def test_legacy_import_names_cover_the_inventory() -> None:
         "InitOnceExecuteOnce",
     } <= dev.LIBUV_LEGACY_IMPORTS
     assert dev.LIBUV_STOCK_MUST_IMPORT <= dev.LIBUV_LEGACY_IMPORTS
+
+
+def test_libuv_lib_names_finds_names_embedded_in_bytes() -> None:
+    data = b"\x00InitializeSRWLock\x00junk\x00WakeConditionVariable\x00"
+    assert dev.libuv_lib_names(data, dev.LIBUV_LEGACY_SYNC_NAMES) == {
+        "InitializeSRWLock",
+        "WakeConditionVariable",
+    }
+
+
+def test_libuv_lib_names_is_empty_without_a_hit() -> None:
+    assert dev.libuv_lib_names(b"GetProcAddress", dev.LIBUV_LEGACY_SYNC_NAMES) == set()
+
+
+def test_libuv_lib_names_counts_a_name_inside_a_longer_one() -> None:
+    assert dev.libuv_lib_names(b"InitializeSRWLockX", {"InitializeSRWLock"}) == {
+        "InitializeSRWLock"
+    }
+    assert dev.libuv_lib_names(
+        b"\x00TryAcquireSRWLockShared\x00", dev.LIBUV_LEGACY_SYNC_NAMES
+    ) == {"TryAcquireSRWLockShared", "AcquireSRWLockShared"}
+
+
+def test_legacy_sync_names_are_twelve_legacy_imports() -> None:
+    assert len(dev.LIBUV_LEGACY_SYNC_NAMES) == 12
+    assert dev.LIBUV_LEGACY_SYNC_NAMES <= dev.LIBUV_LEGACY_IMPORTS
+
+
+def test_judge_libuv_imports_legacy_rejects_a_sync_name_in_the_bytes() -> None:
+    assert dev.judge_libuv_imports(
+        "legacy", ALWAYS, named={"WakeConditionVariable"}
+    ) == ["legacy lib still names WakeConditionVariable"]
+    assert dev.judge_libuv_imports("forced", ALWAYS, named=set()) == []
+
+
+def test_judge_libuv_imports_stock_needs_every_sync_name_in_the_bytes() -> None:
+    stock = ALWAYS | dev.LIBUV_STOCK_MUST_IMPORT
+    assert dev.judge_libuv_imports("stock", stock, named=SYNC_NAMES) == []
+    assert dev.judge_libuv_imports(
+        "stock", stock, named=SYNC_NAMES - {"WakeConditionVariable"}
+    ) == ["byte scan finds no WakeConditionVariable in the stock lib"]
+    (first, *rest) = dev.judge_libuv_imports("stock", stock)
+    assert len(rest) == len(SYNC_NAMES) - 1
+    assert first == "byte scan finds no AcquireSRWLockExclusive in the stock lib"
+
+
+def test_judge_libuv_imports_stock_needs_the_sync_imports() -> None:
+    assert {"InitializeConditionVariable", "InitOnceExecuteOnce"} <= (
+        dev.LIBUV_STOCK_MUST_IMPORT
+    )
+    lacking = ALWAYS | (dev.LIBUV_STOCK_MUST_IMPORT - {"InitOnceExecuteOnce"})
+    assert dev.judge_libuv_imports("stock", lacking, named=SYNC_NAMES) == [
+        "stock lib does not import InitOnceExecuteOnce"
+    ]
+
+
+def test_libuv_imports_reports_sync_names_found_in_a_legacy_lib(
+    monkeypatch: pytest.MonkeyPatch,
+    libuv_lib_on_windows: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lib = libuv_lib_on_windows("legacy")
+    lib.write_bytes(b"!<arch>\n\x00WakeConditionVariable\x00")
+    _fake_dumpbin(
+        monkeypatch,
+        "".join(
+            f"00{i} 00000000 UNDEF  notype       External     | __imp_{name}\n"
+            for i, name in enumerate(sorted(ALWAYS))
+        ),
+    )
+    with pytest.raises(
+        SystemExit, match="legacy lib still names WakeConditionVariable"
+    ):
+        dev.cmd_libuv_imports("legacy")
+    assert "sync names present: ['WakeConditionVariable']" in capsys.readouterr().out
+
+
+def test_libuv_imports_stock_lists_the_sync_names_it_imports(
+    monkeypatch: pytest.MonkeyPatch,
+    libuv_lib_on_windows: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lib = libuv_lib_on_windows("stock")
+    lib.write_bytes(
+        b"!<arch>\n"
+        + b"\x00".join(n.encode() for n in sorted(dev.LIBUV_LEGACY_SYNC_NAMES))
+    )
+    _fake_dumpbin(
+        monkeypatch,
+        "".join(
+            f"00{i} 00000000 UNDEF  notype       External     | __imp_{name}\n"
+            for i, name in enumerate(sorted(dev.LIBUV_STOCK_MUST_IMPORT | ALWAYS))
+        ),
+    )
+    dev.cmd_libuv_imports("stock")
+    out = capsys.readouterr().out
+    assert f"sync names present: {sorted(dev.LIBUV_LEGACY_SYNC_NAMES)}" in out
+    assert "libuv-imports stock: pass" in out
+
+
+def test_libuv_imports_fails_a_stock_lib_the_scan_finds_no_sync_names_in(
+    monkeypatch: pytest.MonkeyPatch,
+    libuv_lib_on_windows: Callable[[str], Path],
+) -> None:
+    lib = libuv_lib_on_windows("stock")
+    lib.write_bytes(b"!<arch>\n\x00junk\x00")
+    _fake_dumpbin(
+        monkeypatch,
+        "".join(
+            f"00{i} 00000000 UNDEF  notype       External     | __imp_{name}\n"
+            for i, name in enumerate(sorted(dev.LIBUV_STOCK_MUST_IMPORT | ALWAYS))
+        ),
+    )
+    with pytest.raises(SystemExit, match="byte scan finds no AcquireSRWLockExclusive"):
+        dev.cmd_libuv_imports("stock")
 
 
 def test_libuv_imports_refuses_to_run_off_windows(
@@ -2692,6 +2813,7 @@ def test_libuv_imports_passes_a_stock_lib_with_the_modern_imports(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     lib = libuv_lib_on_windows("stock")
+    lib.write_bytes(b"!<arch>\n" + "\0".join(sorted(SYNC_NAMES)).encode())
     dump = "".join(
         f"00{i} 00000000 UNDEF  notype       External     | __imp_{name}\n"
         for i, name in enumerate(sorted(dev.LIBUV_STOCK_MUST_IMPORT | ALWAYS))

@@ -110,9 +110,13 @@ out/libuv-test/stock/results.json`, a flake the baseline shares is
   `just win` pushes HEAD).
 - **`just libuv-imports <variant>`** (Windows, after `just win libuv-test` with
   `--build-only`): reads libuv's static lib with `dumpbin`. The legacy and
-  forced libs must import none of the post-XP functions the patches look up
-  at runtime (`LIBUV_LEGACY_IMPORTS`); stock must still import the native
-  ones.
+  forced libs must import none of the post-XP functions in
+  `LIBUV_LEGACY_IMPORTS`, which the patches look up at runtime or replace at
+  compile time; stock must still import the native ones. The legacy and
+  forced libs must also name none of the 12 SRW-lock, condition-variable and
+  InitOnce functions (`LIBUV_LEGACY_SYNC_NAMES`) in their bytes, since the
+  compile-time fallbacks replace them, and the stock lib must name all 12,
+  which shows the byte scan works.
 - **Legacy presets:** `windows-legacy-debug` (`legacy_fallbacks=True`) and
   `windows-forced-legacy-debug` (also `force_legacy=True`) compose a partial
   profile after `windows-static`, so the pin flips for libuv only.

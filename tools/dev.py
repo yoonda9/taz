@@ -19,7 +19,9 @@ Subcommands:
                          run uv_run_tests_a test by test; logs go to out/libuv-test/;
                          with --baseline, tests the baseline lacks are reported
     libuv-imports VARIANT   dumpbin the built libuv.lib (Windows) and fail on post-XP
-                         imports (legacy/forced) or a missing modern import (stock)
+                         imports (legacy/forced) or a missing modern import (stock);
+                         also fails if legacy/forced still names a sync primitive
+                         or the scan finds one missing from stock
     deps PRESET          conan install (preset's profiles, daemon/conan.lock)
     lock-deps PRESET     re-resolve daemon/conan.lock to the newest Conan revisions
     configure PRESET     deps + cmake --preset
@@ -1717,8 +1719,9 @@ def cmd_libuv_test(
 # ---------------------------------------------------------------------------
 # libuv static lib: post-XP imports (just libuv-imports, Windows only)
 # ---------------------------------------------------------------------------
-# Every post-XP function the patches look up at runtime instead of importing,
-# plus the K32 names that PSAPI_VERSION=1 maps to psapi.dll's XP-era exports.
+# Every post-XP function the legacy libs must not import: the ones the patches
+# look up at runtime, the sync functions their compile-time fallbacks replace,
+# and the K32 names that PSAPI_VERSION=1 maps to psapi.dll's XP-era exports.
 LIBUV_LEGACY_IMPORTS: frozenset[str] = frozenset(
     {
         "GetTickCount64",
@@ -1758,10 +1761,35 @@ LIBUV_LEGACY_IMPORTS: frozenset[str] = frozenset(
         "K32GetModuleBaseNameW",
     }
 )
+# The SRW-lock, condition-variable and InitOnce functions. The legacy fallbacks
+# replace them at compile time, so the legacy and forced libs must not contain
+# these names at all, as an import or as a GetProcAddress string.
+LIBUV_LEGACY_SYNC_NAMES: frozenset[str] = frozenset(
+    {
+        "InitializeSRWLock",
+        "AcquireSRWLockShared",
+        "TryAcquireSRWLockShared",
+        "ReleaseSRWLockShared",
+        "AcquireSRWLockExclusive",
+        "TryAcquireSRWLockExclusive",
+        "ReleaseSRWLockExclusive",
+        "InitializeConditionVariable",
+        "WakeConditionVariable",
+        "WakeAllConditionVariable",
+        "SleepConditionVariableCS",
+        "InitOnceExecuteOnce",
+    }
+)
 # What the stock lib must still import: proof that legacy_fallbacks=False is
 # upstream libuv, which imports the native primitives directly.
 LIBUV_STOCK_MUST_IMPORT: frozenset[str] = frozenset(
-    {"AcquireSRWLockExclusive", "GetQueuedCompletionStatusEx", "GetTickCount64"}
+    {
+        "AcquireSRWLockExclusive",
+        "GetQueuedCompletionStatusEx",
+        "GetTickCount64",
+        "InitializeConditionVariable",
+        "InitOnceExecuteOnce",
+    }
 )
 # Imports every libuv build has; their absence means the dump is not of a
 # libuv static lib (or its format changed), so nothing else can be judged.
@@ -1783,23 +1811,50 @@ def libuv_lib_undefined(text: str) -> set[str]:
     return names
 
 
-def judge_libuv_imports(variant: str, undefined: set[str]) -> list[str]:
+def libuv_lib_names(data: bytes, names: Iterable[str]) -> set[str]:
+    """The names whose ASCII bytes occur anywhere in a static lib's bytes.
+
+    This is a substring scan, so an import symbol, a GetProcAddress string and
+    a debug string all count, and a longer name that contains one of `names`
+    counts as that name too (TryAcquireSRWLockShared contains
+    AcquireSRWLockShared). It is meant to be strict: a hit is a reason to look,
+    not proof of an import.
+    """
+    return {name for name in names if name.encode("ascii") in data}
+
+
+def judge_libuv_imports(
+    variant: str, undefined: set[str], named: Iterable[str] = ()
+) -> list[str]:
     """Errors for one variant's undefined names; empty when the lib passes.
 
-    stock must still import the modern-lane functions; legacy and forced must
-    reference none of the post-XP inventory directly.
+    `named` holds the sync names found anywhere in the lib's bytes. stock must
+    still import the modern-lane functions and name every sync function:
+    upstream libuv calls them all, so if the scan misses one in stock, the
+    scan is what is broken. legacy and forced must reference none of the
+    post-XP inventory directly and name none of the sync functions.
     """
     if missing := sorted(LIBUV_ALWAYS_IMPORTED - undefined):
         return [f"no import of {', '.join(missing)}: not a libuv static lib's dump"]
     if variant == "stock":
-        return [
+        errors = [
             f"stock lib does not import {name}"
             for name in sorted(LIBUV_STOCK_MUST_IMPORT - undefined)
         ]
-    return [
+        errors += [
+            f"byte scan finds no {name} in the stock lib"
+            for name in sorted(LIBUV_LEGACY_SYNC_NAMES - set(named))
+        ]
+        return errors
+    errors = [
         f"{variant} lib still imports {name}"
         for name in sorted(undefined & LIBUV_LEGACY_IMPORTS)
     ]
+    errors += [
+        f"{variant} lib still names {name}"
+        for name in sorted(set(named) & LIBUV_LEGACY_SYNC_NAMES)
+    ]
+    return errors
 
 
 def cmd_libuv_imports(variant: str) -> None:
@@ -1823,7 +1878,9 @@ def cmd_libuv_imports(variant: str) -> None:
     undefined = libuv_lib_undefined(dump)
     seen = sorted(undefined & LIBUV_LEGACY_IMPORTS)
     print(f"libuv-imports {variant}: inventory imports present: {seen or 'none'}")
-    errors = judge_libuv_imports(variant, undefined)
+    named = libuv_lib_names(lib.read_bytes(), LIBUV_LEGACY_SYNC_NAMES)
+    print(f"libuv-imports {variant}: sync names present: {sorted(named) or 'none'}")
+    errors = judge_libuv_imports(variant, undefined, named)
     if errors:
         sys.exit("error: " + "; ".join(errors))
     print(f"libuv-imports {variant}: pass ({lib})")
